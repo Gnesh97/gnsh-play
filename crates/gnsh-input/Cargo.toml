@@ -1,0 +1,15 @@
+[package]
+name = "gnsh-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gnsh-proto = { path = "../gnsh-proto" }
+anyhow.workspace = true
+egui.workspace = true
+tracing.workspace = true
+windows.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true

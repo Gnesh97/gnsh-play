@@ -1,0 +1,14 @@
+[package]
+name = "gnsh-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gnsh-chiaki-sys = { path = "../gnsh-chiaki-sys" }
+base64.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+windows.workspace = true

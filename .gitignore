@@ -11,7 +11,11 @@ Thumbs.db
 # Dependencies & Build Outputs
 node_modules/
 dist/
+/dist/
 build/
+/target/
+third_party/build/
+*.pdb
 
 # Logs
 *.log
