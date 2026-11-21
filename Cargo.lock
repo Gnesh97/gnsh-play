@@ -381,6 +381,8 @@ dependencies = [
  "base64",
  "crossbeam-channel",
  "gnsh-chiaki-sys",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
  "ureq",
