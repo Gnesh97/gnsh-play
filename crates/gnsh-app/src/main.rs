@@ -315,6 +315,7 @@ fn run_gui() -> Result<()> {
     let mut raw_input = egui::RawInput::default();
     let start_time = Instant::now();
     let mut was_streaming = false;
+    let mut prev_want_hdr = false;
     let mut last_present = Instant::now();
 
     loop {
@@ -365,9 +366,32 @@ fn run_gui() -> Result<()> {
         }
         was_streaming = is_streaming;
 
+        let want_hdr = matches!(&app.mode, AppMode::Streaming(s) if s.codec == VideoCodec::HevcHdr);
+        let hdr_mode_changed = want_hdr != prev_want_hdr;
+        if hdr_mode_changed
+            || (want_hdr && (summary.resized.is_some() || summary.toggle_fullscreen))
+        {
+            match renderer.set_hdr_output(want_hdr) {
+                Ok(active) => {
+                    if hdr_mode_changed {
+                        tracing::info!(
+                            want_hdr,
+                            hdr_output_active = active,
+                            "Updated D3D11 HDR output mode"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("D3D11 HDR output transition failed: {err:#}");
+                }
+            }
+            prev_want_hdr = want_hdr;
+        }
+
         let should_render = !is_streaming
             || app.settings.vsync
             || got_new_frame
+            || hdr_mode_changed
             || !raw_input.events.is_empty()
             || summary.resized.is_some()
             || summary.toggle_fullscreen
@@ -393,9 +417,10 @@ fn run_gui() -> Result<()> {
         };
         renderer.begin_frame(clear_rgba);
 
+        let sharpness = f32::from(app.settings.sharpness_pct.min(100)) / 100.0;
         if let AppMode::Streaming(ref stream) = app.mode
             && let Some(ref latest) = stream.current_frame
-            && let Err(err) = renderer.draw_video_frame(&latest.frame)
+            && let Err(err) = renderer.draw_video_frame(&latest.frame, sharpness)
         {
             tracing::warn!("draw_video_frame failed: {err:#}");
         }
@@ -405,13 +430,19 @@ fn run_gui() -> Result<()> {
                 &app.mode,
                 AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some() || s.osk_prompt.is_some()
             );
+        let hdr_output_active = renderer.is_hdr_output_active();
         if draw_egui {
             renderer.bind_backbuffer();
 
             let gamepad_name = gamepads.connected_name().map(str::to_owned);
             let device_for_connect = renderer.device().clone();
             let full_output = egui_ctx.run_ui(raw_input.take(), |ui| {
-                app.ui(ui, gamepad_name.as_deref(), &device_for_connect);
+                app.ui(
+                    ui,
+                    gamepad_name.as_deref(),
+                    &device_for_connect,
+                    hdr_output_active,
+                );
             });
 
             handle_platform_commands(&window, &full_output.platform_output.commands);
@@ -429,6 +460,7 @@ fn run_gui() -> Result<()> {
                 renderer.context(),
                 renderer.viewport_size(),
                 full_output.pixels_per_point,
+                hdr_output_active,
                 &clipped,
             ) {
                 tracing::warn!("egui paint failed: {err:#}");
@@ -459,6 +491,7 @@ fn run_gui() -> Result<()> {
     }
 
     app.stop_stream(&mut gamepads, None);
+    let _ = renderer.set_hdr_output(false);
     renderer.clear_video_cache();
     drop(app);
     drop(painter);
@@ -684,6 +717,7 @@ struct OskPrompt {
 struct ActiveStream {
     console_name: String,
     console_host: String,
+    codec: VideoCodec,
     session: Option<Ps5Session>,
     events_rx: Receiver<SessionEvent>,
     frame_sync: Arc<(Mutex<Option<LatestFrame>>, Condvar)>,
@@ -759,6 +793,7 @@ impl ActiveStream {
         let media_codec = match settings.codec {
             VideoCodec::H264 => MediaCodec::H264,
             VideoCodec::Hevc => MediaCodec::Hevc,
+            VideoCodec::HevcHdr => MediaCodec::HevcHdr,
         };
 
         let frame_sync = Arc::new((Mutex::new(None), Condvar::new()));
@@ -813,6 +848,7 @@ impl ActiveStream {
         Ok(Self {
             console_name: console.name.clone(),
             console_host: console.host.clone(),
+            codec: settings.codec,
             session: Some(session),
             events_rx: channels.events_rx,
             frame_sync,
@@ -1710,7 +1746,13 @@ impl AppState {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, gamepad_name: Option<&str>, device: &ID3D11Device) {
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        gamepad_name: Option<&str>,
+        device: &ID3D11Device,
+        hdr_output_active: bool,
+    ) {
         if let Some(idx) = self.pending_stream_connect.take() {
             self.begin_stream(idx, device.clone());
         }
@@ -1727,6 +1769,8 @@ impl AppState {
                     gamepad_name,
                     &mut self.settings.touchpad_touch,
                     &mut self.settings.vsync,
+                    &mut self.settings.sharpness_pct,
+                    hdr_output_active,
                 );
             }
         }
@@ -1845,6 +1889,14 @@ impl AppState {
 
                     ui.label(egui::RichText::new("Codec:").weak());
                     ui.selectable_value(&mut self.settings.codec, VideoCodec::Hevc, "HEVC");
+                    ui.selectable_value(
+                        &mut self.settings.codec,
+                        VideoCodec::HevcHdr,
+                        "HEVC HDR10",
+                    )
+                    .on_hover_text(
+                        "10-bit HEVC HDR10: native passthrough on Windows HDR displays, automatic ACES tone-mapping on SDR monitors.",
+                    );
                     ui.selectable_value(&mut self.settings.codec, VideoCodec::H264, "H264");
 
                     ui.separator();
@@ -1860,6 +1912,19 @@ impl AppState {
                         .text("Bitrate"),
                     )
                     .on_hover_text("PS5 Remote Play FEC limit: 2,000-100,000 kbps (100 Mbps max)");
+
+                    ui.scope(|ui| {
+                        ui.spacing_mut().slider_width = 70.0;
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.sharpness_pct, 0..=100)
+                                .clamping(egui::SliderClamping::Always)
+                                .suffix("%")
+                                .text("CAS"),
+                        )
+                        .on_hover_text(
+                            "Contrast Adaptive Sharpening (single-pass HLSL, 0% = off)",
+                        );
+                    });
 
                     ui.checkbox(&mut self.settings.vsync, "VSync");
                     ui.checkbox(&mut self.settings.touchpad_touch, "Touchpad Touch")
@@ -2420,6 +2485,8 @@ fn render_streaming_ui(
     gamepad_name: Option<&str>,
     touchpad_touch: &mut bool,
     vsync: &mut bool,
+    sharpness_pct: &mut u8,
+    hdr_output_active: bool,
 ) {
     if stream.show_hud {
         egui::Area::new(egui::Id::unique("stream_hud"))
@@ -2521,6 +2588,20 @@ fn render_streaming_ui(
                             ui.checkbox(vsync, "VSync").on_hover_text(
                                 "Off: lowest latency (decode-paced + tearing, 1000 Hz input). On: tear-free VSync (1-frame DXGI queue).",
                             );
+
+                            ui.separator();
+                            ui.scope(|ui| {
+                                ui.spacing_mut().slider_width = 70.0;
+                                ui.add(
+                                    egui::Slider::new(sharpness_pct, 0..=100)
+                                        .clamping(egui::SliderClamping::Always)
+                                        .suffix("%")
+                                        .text("CAS"),
+                                )
+                                .on_hover_text(
+                                    "Contrast Adaptive Sharpening (single-pass HLSL, 0% = off)",
+                                );
+                            });
                         });
 
                         let (decode_ms_text, decoder_badge) = match &stream.current_frame {
@@ -2551,6 +2632,21 @@ fn render_streaming_ui(
                             "Rumble"
                         };
 
+                        let hdr_badge = if stream.codec == VideoCodec::HevcHdr {
+                            if hdr_output_active {
+                                "  |  HDR10"
+                            } else {
+                                "  |  HDR->SDR"
+                            }
+                        } else {
+                            ""
+                        };
+                        let cas_badge = if *sharpness_pct > 0 {
+                            format!("  |  CAS: {}%", *sharpness_pct)
+                        } else {
+                            String::new()
+                        };
+
                         ui.label(
                             egui::RichText::new(format!(
                                 "{:.1} FPS  |  {:.1} Mbps  |  RTT: {:.1} ms  |  Loss: {:.1}%",
@@ -2564,10 +2660,12 @@ fn render_streaming_ui(
                         );
                         let telemetry_line = ui.label(
                             egui::RichText::new(format!(
-                                "Pipe: {}  |  Decode: {} ({})  |  UDP Buf: {}  |  Gamepad: {}  |  Haptics: {}",
+                                "Pipe: {}  |  Decode: {} ({}){}{}  |  UDP Buf: {}  |  Gamepad: {}  |  Haptics: {}",
                                 pipe_text,
                                 decode_ms_text,
                                 decoder_badge,
+                                hdr_badge,
+                                cas_badge,
                                 udp_buf_text,
                                 pad_label,
                                 haptics_label

@@ -22,24 +22,27 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM,
-    DXGI_FORMAT_R8G8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIDevice1,
-    IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1, IDXGISwapChain2,
+    IDXGIFactory2, IDXGIFactory5, IDXGIOutput6, IDXGISwapChain1, IDXGISwapChain2, IDXGISwapChain3,
 };
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::core::{BOOL, Interface as _, PCSTR, s};
 
 const VIDEO_VS_HLSL: &str = r#"
 cbuffer VideoParams : register(b0) {
-    float4 pos_scale; // xy = scale, zw = offset
-    float4 uv_rect;   // xy = active scale, zw = offset
-    float4 uv_clamp;  // xy = luma max uv, zw = chroma max uv
+    float4 pos_scale;    // xy = scale, zw = offset
+    float4 uv_rect;      // xy = active scale, zw = offset
+    float4 uv_clamp;     // xy = luma max uv, zw = chroma max uv
+    float4 sharp_params; // x = sharpness (0..1), y = 1/tex_w, z = 1/tex_h, w = color mode
 };
 
 struct VSOut {
@@ -67,7 +70,78 @@ VSOut VSMain(uint vid : SV_VertexID) {
 }
 "#;
 
-const NV12_ARRAY_PS_HLSL: &str = r#"
+const HLSL_COLOR_CAS_HELPERS: &str = r#"
+float3 cas_filter(float3 c, float3 n, float3 s, float3 w, float3 e, float sharpness) {
+    float3 min_c = min(c, min(min(n, s), min(w, e)));
+    float3 max_c = max(c, max(max(n, s), max(w, e)));
+    float3 amp = sqrt(saturate(min(min_c, 1.0 - max_c) / max(max_c, 1e-4)));
+    float peak = -1.0 / lerp(8.0, 5.0, saturate(sharpness));
+    float3 weight = amp * peak;
+    float3 sharp = saturate((c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight));
+    return lerp(c, sharp, saturate(sharpness));
+}
+
+float3 bt2020_yuv_to_pq(float y, float cb, float cr) {
+    float r = y + 1.4746 * cr;
+    float g = y - 0.1645531268 * cb - 0.5713531268 * cr;
+    float b = y + 1.8814 * cb;
+    return saturate(float3(r, g, b));
+}
+
+float3 bt709_yuv_to_srgb(float y, float cb, float cr) {
+    float r = y + 1.5748 * cr;
+    float g = y - 0.187324 * cb - 0.468124 * cr;
+    float b = y + 1.8556 * cb;
+    return saturate(float3(r, g, b));
+}
+
+float3 srgb_to_linear(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+    return (c <= 0.04045) ? lo : hi;
+}
+
+float3 linear_to_srgb(float3 c) {
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055;
+    return (c <= 0.0031308) ? lo : hi;
+}
+
+float3 pq_to_linear(float3 pq) {
+    float3 p = pow(max(pq, 0.0), 1.0 / 78.84375);
+    float3 num = max(p - 0.8359375, 0.0);
+    float3 den = max(18.8515625 - 18.6875 * p, 1e-6);
+    return pow(num / den, 1.0 / 0.1593017578125);
+}
+
+float3 linear_to_pq(float3 lin) {
+    float3 ym = pow(saturate(lin), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375);
+}
+
+float3 srgb_to_bt2020_pq(float3 srgb, float white_nits) {
+    float3 lin709 = srgb_to_linear(saturate(srgb));
+    float3 lin2020 = float3(
+        0.627404 * lin709.r + 0.329283 * lin709.g + 0.043313 * lin709.b,
+        0.069097 * lin709.r + 0.919540 * lin709.g + 0.011363 * lin709.b,
+        0.016391 * lin709.r + 0.088013 * lin709.g + 0.895596 * lin709.b
+    );
+    return linear_to_pq(lin2020 * (white_nits / 10000.0));
+}
+
+float3 pq_bt2020_to_sdr_srgb(float3 pq) {
+    float3 lin2020 = pq_to_linear(pq) * 40.0;
+    float3 lin709 = max(float3(
+         1.660491 * lin2020.r - 0.587641 * lin2020.g - 0.072850 * lin2020.b,
+        -0.124550 * lin2020.r + 1.132900 * lin2020.g - 0.008350 * lin2020.b,
+        -0.018151 * lin2020.r - 0.100579 * lin2020.g + 1.118730 * lin2020.b
+    ), 0.0);
+    float3 aces = (lin709 * (2.51 * lin709 + 0.03)) / (lin709 * (2.43 * lin709 + 0.59) + 0.14);
+    return saturate(linear_to_srgb(aces));
+}
+"#;
+
+const NV12_ARRAY_PS_BODY: &str = r#"
 Texture2DArray<float> texY  : register(t0);
 Texture2DArray<float2> texUV : register(t1);
 SamplerState sampLinear : register(s0);
@@ -75,6 +149,7 @@ cbuffer VideoParams : register(b0) {
     float4 pos_scale;
     float4 uv_rect;
     float4 uv_clamp;
+    float4 sharp_params;
 };
 
 struct PSIn {
@@ -82,16 +157,85 @@ struct PSIn {
     float2 uv  : TEXCOORD0;
 };
 
-float4 PSMain(PSIn i) : SV_TARGET {
-    float y_raw = texY.Sample(sampLinear, float3(min(i.uv, uv_clamp.xy), 0.0));
-    float2 uv_raw = texUV.Sample(sampLinear, float3(min(i.uv, uv_clamp.zw), 0.0));
+float3 sample_nv12(float2 uv) {
+    float2 uv_y = clamp(uv, float2(0.0, 0.0), uv_clamp.xy);
+    float2 uv_c = clamp(uv, float2(0.0, 0.0), uv_clamp.zw);
+    float y_raw = texY.SampleLevel(sampLinear, float3(uv_y, 0.0), 0.0);
+    float2 uv_raw = texUV.SampleLevel(sampLinear, float3(uv_c, 0.0), 0.0);
     float y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
     float cb = (uv_raw.x - 128.0 / 255.0) * (255.0 / 224.0);
     float cr = (uv_raw.y - 128.0 / 255.0) * (255.0 / 224.0);
-    float r = y + 1.5748 * cr;
-    float g = y - 0.187324 * cb - 0.468124 * cr;
-    float b = y + 1.8556 * cb;
-    return float4(saturate(float3(r, g, b)), 1.0);
+    return bt709_yuv_to_srgb(y, cb, cr);
+}
+
+float4 PSMain(PSIn i) : SV_TARGET {
+    float3 c = sample_nv12(i.uv);
+    [branch]
+    if (sharp_params.x > 0.001) {
+        float2 dx = float2(sharp_params.y, 0.0);
+        float2 dy = float2(0.0, sharp_params.z);
+        c = cas_filter(
+            c,
+            sample_nv12(i.uv - dy),
+            sample_nv12(i.uv + dy),
+            sample_nv12(i.uv - dx),
+            sample_nv12(i.uv + dx),
+            sharp_params.x
+        );
+    }
+    if (sharp_params.w > 0.5) {
+        c = srgb_to_bt2020_pq(c, 200.0);
+    }
+    return float4(c, 1.0);
+}
+"#;
+
+const P010_ARRAY_PS_BODY: &str = r#"
+Texture2DArray<float> texY  : register(t0);
+Texture2DArray<float2> texUV : register(t1);
+SamplerState sampLinear : register(s0);
+cbuffer VideoParams : register(b0) {
+    float4 pos_scale;
+    float4 uv_rect;
+    float4 uv_clamp;
+    float4 sharp_params;
+};
+
+struct PSIn {
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+float3 sample_p010(float2 uv) {
+    float2 uv_y = clamp(uv, float2(0.0, 0.0), uv_clamp.xy);
+    float2 uv_c = clamp(uv, float2(0.0, 0.0), uv_clamp.zw);
+    float y_raw = texY.SampleLevel(sampLinear, float3(uv_y, 0.0), 0.0);
+    float2 uv_raw = texUV.SampleLevel(sampLinear, float3(uv_c, 0.0), 0.0);
+    float y  = (y_raw    - 4096.0  / 65535.0) * (65535.0 / 56064.0);
+    float cb = (uv_raw.x - 32768.0 / 65535.0) * (65535.0 / 57344.0);
+    float cr = (uv_raw.y - 32768.0 / 65535.0) * (65535.0 / 57344.0);
+    return bt2020_yuv_to_pq(y, cb, cr);
+}
+
+float4 PSMain(PSIn i) : SV_TARGET {
+    float3 c = sample_p010(i.uv);
+    [branch]
+    if (sharp_params.x > 0.001) {
+        float2 dx = float2(sharp_params.y, 0.0);
+        float2 dy = float2(0.0, sharp_params.z);
+        c = cas_filter(
+            c,
+            sample_p010(i.uv - dy),
+            sample_p010(i.uv + dy),
+            sample_p010(i.uv - dx),
+            sample_p010(i.uv + dx),
+            sharp_params.x
+        );
+    }
+    if (sharp_params.w > 0.5) {
+        return float4(c, 1.0);
+    }
+    return float4(pq_bt2020_to_sdr_srgb(c), 1.0);
 }
 "#;
 
@@ -101,6 +245,8 @@ struct VideoParams {
     pos_scale: [f32; 4],
     uv_rect: [f32; 4],
     uv_clamp: [f32; 4],
+    // x = sharpness (0..=1), y = 1.0/tex_w, z = 1.0/tex_h, w = color mode flag
+    sharp_params: [f32; 4],
 }
 
 impl Default for VideoParams {
@@ -109,32 +255,69 @@ impl Default for VideoParams {
             pos_scale: [1.0, 1.0, 0.0, 0.0],
             uv_rect: [1.0, 1.0, 0.0, 0.0],
             uv_clamp: [1.0, 1.0, 1.0, 1.0],
+            sharp_params: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
 
-const YUV420_PS_HLSL: &str = r#"
+const YUV420_PS_BODY: &str = r#"
 Texture2D<float> texY : register(t0);
 Texture2D<float> texU : register(t1);
 Texture2D<float> texV : register(t2);
 SamplerState sampLinear : register(s0);
+cbuffer VideoParams : register(b0) {
+    float4 pos_scale;
+    float4 uv_rect;
+    float4 uv_clamp;
+    float4 sharp_params;
+};
 
 struct PSIn {
     float4 pos : SV_POSITION;
     float2 uv  : TEXCOORD0;
 };
 
-float4 PSMain(PSIn i) : SV_TARGET {
-    float y_raw = texY.Sample(sampLinear, i.uv);
-    float u_raw = texU.Sample(sampLinear, i.uv);
-    float v_raw = texV.Sample(sampLinear, i.uv);
+float3 sample_yuv420(float2 uv, bool is_hdr_src) {
+    float2 uvc = saturate(uv);
+    float y_raw = texY.SampleLevel(sampLinear, uvc, 0.0);
+    float u_raw = texU.SampleLevel(sampLinear, uvc, 0.0);
+    float v_raw = texV.SampleLevel(sampLinear, uvc, 0.0);
     float y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
     float cb = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
     float cr = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    float r = y + 1.5748 * cr;
-    float g = y - 0.187324 * cb - 0.468124 * cr;
-    float b = y + 1.8556 * cb;
-    return float4(saturate(float3(r, g, b)), 1.0);
+    if (is_hdr_src) {
+        return bt2020_yuv_to_pq(y, cb, cr);
+    }
+    return bt709_yuv_to_srgb(y, cb, cr);
+}
+
+float4 PSMain(PSIn i) : SV_TARGET {
+    // mode: 0 = SDR->SDR, 1 = HDR->SDR (ACES), 2 = HDR->HDR (PQ), 3 = SDR->HDR (200 nits)
+    bool is_hdr_src = (sharp_params.w > 0.5 && sharp_params.w < 2.5);
+    float3 c = sample_yuv420(i.uv, is_hdr_src);
+    [branch]
+    if (sharp_params.x > 0.001) {
+        float2 dx = float2(sharp_params.y, 0.0);
+        float2 dy = float2(0.0, sharp_params.z);
+        c = cas_filter(
+            c,
+            sample_yuv420(i.uv - dy, is_hdr_src),
+            sample_yuv420(i.uv + dy, is_hdr_src),
+            sample_yuv420(i.uv - dx, is_hdr_src),
+            sample_yuv420(i.uv + dx, is_hdr_src),
+            sharp_params.x
+        );
+    }
+    if (sharp_params.w > 2.5) {
+        return float4(srgb_to_bt2020_pq(c, 200.0), 1.0);
+    }
+    if (sharp_params.w > 1.5) {
+        return float4(c, 1.0);
+    }
+    if (sharp_params.w > 0.5) {
+        return float4(pq_bt2020_to_sdr_srgb(c), 1.0);
+    }
+    return float4(c, 1.0);
 }
 "#;
 
@@ -150,16 +333,28 @@ struct SwYuvTextures {
 }
 
 #[derive(Default)]
-struct Nv12SrvCache {
-    texture_key: (usize, u32, u32),
+struct D3d11SrvCache {
+    texture_key: (usize, u32, u32, i32),
     slices: HashMap<u32, (ID3D11ShaderResourceView, ID3D11ShaderResourceView)>,
 }
 
-impl Nv12SrvCache {
+impl D3d11SrvCache {
     fn clear(&mut self) {
-        self.texture_key = (0, 0, 0);
+        self.texture_key = (0, 0, 0, 0);
         self.slices.clear();
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VideoParamsKey {
+    fw: u32,
+    fh: u32,
+    tw: u32,
+    th: u32,
+    vw: u32,
+    vh: u32,
+    sharp_q: u32,
+    mode_bits: u32,
 }
 
 pub struct D3D11Renderer {
@@ -168,17 +363,20 @@ pub struct D3D11Renderer {
     swapchain: IDXGISwapChain1,
     rtv: Option<ID3D11RenderTargetView>,
     swapchain_flags: u32,
+    swapchain_format: DXGI_FORMAT,
+    hdr_output_active: bool,
     frame_latency_waitable: Option<HANDLE>,
     allow_tearing: bool,
     width: u32,
     height: u32,
     vs: ID3D11VertexShader,
     ps_nv12: ID3D11PixelShader,
+    ps_p010: ID3D11PixelShader,
     ps_yuv420: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     cb_params: ID3D11Buffer,
-    nv12_srv_cache: Nv12SrvCache,
-    last_video_params_key: Option<(u32, u32, u32, u32, u32, u32)>,
+    d3d11_srv_cache: D3d11SrvCache,
+    last_video_params_key: Option<VideoParamsKey>,
     sw_textures: Option<SwYuvTextures>,
 }
 
@@ -276,9 +474,14 @@ impl D3D11Renderer {
 
         let rtv = create_backbuffer_rtv(&device, &swapchain)?;
 
+        let nv12_src = format!("{HLSL_COLOR_CAS_HELPERS}\n{NV12_ARRAY_PS_BODY}");
+        let p010_src = format!("{HLSL_COLOR_CAS_HELPERS}\n{P010_ARRAY_PS_BODY}");
+        let yuv_src = format!("{HLSL_COLOR_CAS_HELPERS}\n{YUV420_PS_BODY}");
+
         let vs_blob = compile_hlsl(VIDEO_VS_HLSL, s!("VSMain"), s!("vs_5_0"))?;
-        let ps_nv12_blob = compile_hlsl(NV12_ARRAY_PS_HLSL, s!("PSMain"), s!("ps_5_0"))?;
-        let ps_yuv_blob = compile_hlsl(YUV420_PS_HLSL, s!("PSMain"), s!("ps_5_0"))?;
+        let ps_nv12_blob = compile_hlsl(&nv12_src, s!("PSMain"), s!("ps_5_0"))?;
+        let ps_p010_blob = compile_hlsl(&p010_src, s!("PSMain"), s!("ps_5_0"))?;
+        let ps_yuv_blob = compile_hlsl(&yuv_src, s!("PSMain"), s!("ps_5_0"))?;
 
         let vs = unsafe {
             let mut out = None;
@@ -289,6 +492,11 @@ impl D3D11Renderer {
             let mut out = None;
             device.CreatePixelShader(blob_slice(&ps_nv12_blob), None, Some(&mut out))?;
             out.context("CreatePixelShader(NV12) returned None")?
+        };
+        let ps_p010 = unsafe {
+            let mut out = None;
+            device.CreatePixelShader(blob_slice(&ps_p010_blob), None, Some(&mut out))?;
+            out.context("CreatePixelShader(P010) returned None")?
         };
         let ps_yuv420 = unsafe {
             let mut out = None;
@@ -334,16 +542,19 @@ impl D3D11Renderer {
             swapchain,
             rtv: Some(rtv),
             swapchain_flags,
+            swapchain_format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            hdr_output_active: false,
             frame_latency_waitable,
             allow_tearing,
             width: w,
             height: h,
             vs,
             ps_nv12,
+            ps_p010,
             ps_yuv420,
             sampler,
             cb_params,
-            nv12_srv_cache: Nv12SrvCache::default(),
+            d3d11_srv_cache: D3d11SrvCache::default(),
             last_video_params_key: None,
             sw_textures: None,
         })
@@ -379,13 +590,106 @@ impl D3D11Renderer {
         let flags = DXGI_SWAP_CHAIN_FLAG(self.swapchain_flags as i32);
         unsafe {
             self.swapchain
-                .ResizeBuffers(0, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, flags)?;
+                .ResizeBuffers(0, w, h, self.swapchain_format, flags)?;
         }
         self.rtv = Some(create_backbuffer_rtv(&self.device, &self.swapchain)?);
         self.width = w;
         self.height = h;
         self.last_video_params_key = None;
         Ok(())
+    }
+
+    /// Queries the DXGI output containing this swapchain to determine if Windows HDR is enabled.
+    pub fn is_display_hdr(&self) -> bool {
+        let Ok(output) = (unsafe { self.swapchain.GetContainingOutput() }) else {
+            return false;
+        };
+        let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+            return false;
+        };
+        let Ok(desc) = (unsafe { output6.GetDesc1() }) else {
+            return false;
+        };
+        desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+    }
+
+    /// Returns whether the swapchain is currently presenting native 10-bit ST.2084 HDR10 frames.
+    pub fn is_hdr_output_active(&self) -> bool {
+        self.hdr_output_active
+    }
+
+    /// Switches the swapchain between native 10-bit HDR10 PQ output (when supported) and 8-bit SDR.
+    pub fn set_hdr_output(&mut self, enable: bool) -> Result<bool> {
+        let target_hdr = enable && self.is_display_hdr();
+        if target_hdr == self.hdr_output_active {
+            return Ok(self.hdr_output_active);
+        }
+
+        let target_format = if target_hdr {
+            DXGI_FORMAT_R10G10B10A2_UNORM
+        } else {
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        };
+        let target_colorspace = if target_hdr {
+            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+        } else {
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+        };
+
+        unsafe {
+            self.context.OMSetRenderTargets(None, None);
+        }
+        self.rtv = None;
+
+        let flags = DXGI_SWAP_CHAIN_FLAG(self.swapchain_flags as i32);
+        let switched = (|| -> Result<()> {
+            unsafe {
+                self.swapchain
+                    .ResizeBuffers(0, self.width, self.height, target_format, flags)
+                    .context("ResizeBuffers for HDR output switch failed")?;
+                let sc3: IDXGISwapChain3 = self
+                    .swapchain
+                    .cast()
+                    .context("IDXGISwapChain3 unavailable for SetColorSpace1")?;
+                sc3.SetColorSpace1(target_colorspace)
+                    .context("SetColorSpace1 failed")?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = switched {
+            if target_hdr {
+                tracing::warn!("Enabling HDR10 swapchain failed, falling back to SDR: {err:#}");
+                unsafe {
+                    self.swapchain.ResizeBuffers(
+                        0,
+                        self.width,
+                        self.height,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        flags,
+                    )?;
+                    if let Ok(sc3) = self.swapchain.cast::<IDXGISwapChain3>() {
+                        let _ = sc3.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                    }
+                }
+                self.swapchain_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                self.hdr_output_active = false;
+                self.rtv = Some(create_backbuffer_rtv(&self.device, &self.swapchain)?);
+                self.last_video_params_key = None;
+                return Ok(false);
+            }
+            self.swapchain_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            self.hdr_output_active = false;
+            self.rtv = create_backbuffer_rtv(&self.device, &self.swapchain).ok();
+            self.last_video_params_key = None;
+            return Err(err);
+        }
+
+        self.swapchain_format = target_format;
+        self.hdr_output_active = target_hdr;
+        self.rtv = Some(create_backbuffer_rtv(&self.device, &self.swapchain)?);
+        self.last_video_params_key = None;
+        Ok(self.hdr_output_active)
     }
 
     /// Waits up to `timeout_ms` on DXGI's waitable frame-latency object to prevent swapchain queuing.
@@ -400,7 +704,7 @@ impl D3D11Renderer {
 
     /// Releases cached video SRVs and constant-buffer keys (called on stream shutdown).
     pub fn clear_video_cache(&mut self) {
-        self.nv12_srv_cache.clear();
+        self.d3d11_srv_cache.clear();
         self.last_video_params_key = None;
     }
 
@@ -431,24 +735,62 @@ impl D3D11Renderer {
         }
     }
 
-    pub fn draw_video_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
+    pub fn draw_video_frame(&mut self, frame: &DecodedFrame, sharpness: f32) -> Result<()> {
         self.bind_backbuffer();
 
-        let (fw, fh, tw, th) = match frame {
+        let sharp = sharpness.clamp(0.0, 1.0);
+        let (fw, fh, tw, th, d3d_format, color_mode): (
+            u32,
+            u32,
+            u32,
+            u32,
+            Option<DXGI_FORMAT>,
+            f32,
+        ) = match frame {
             DecodedFrame::D3D11(f) => {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 unsafe {
                     f.texture.GetDesc(&mut desc);
                 }
-                (f.width, f.height, desc.Width, desc.Height)
+                let mode = if self.hdr_output_active { 1.0 } else { 0.0 };
+                (
+                    f.width,
+                    f.height,
+                    desc.Width,
+                    desc.Height,
+                    Some(desc.Format),
+                    mode,
+                )
             }
-            DecodedFrame::SoftwareYuv420 { width, height, .. } => {
-                (*width, *height, *width, *height)
+            DecodedFrame::SoftwareYuv420 {
+                width,
+                height,
+                is_hdr,
+                ..
+            } => {
+                let mode = match (*is_hdr, self.hdr_output_active) {
+                    (false, false) => 0.0,
+                    (true, false) => 1.0,
+                    (true, true) => 2.0,
+                    (false, true) => 3.0,
+                };
+                (*width, *height, *width, *height, None, mode)
             }
         };
-        let key = (fw, fh, tw, th, self.width, self.height);
+        let sharp_q = (sharp * 1000.0).round() as u32;
+        let key = VideoParamsKey {
+            fw,
+            fh,
+            tw,
+            th,
+            vw: self.width,
+            vh: self.height,
+            sharp_q,
+            mode_bits: color_mode.to_bits(),
+        };
         if self.last_video_params_key != Some(key) {
-            let params = compute_video_params(fw, fh, tw, th, self.width, self.height);
+            let params =
+                compute_video_params(fw, fh, tw, th, self.width, self.height, sharp, color_mode);
             unsafe {
                 self.context.UpdateSubresource(
                     &self.cb_params,
@@ -474,7 +816,10 @@ impl D3D11Renderer {
         }
 
         match frame {
-            DecodedFrame::D3D11(d3d_frame) => self.draw_d3d11_nv12(d3d_frame, tw, th)?,
+            DecodedFrame::D3D11(d3d_frame) => {
+                let fmt = d3d_format.expect("D3D11 format populated");
+                self.draw_d3d11_frame(d3d_frame, tw, th, fmt)?;
+            }
             DecodedFrame::SoftwareYuv420 {
                 y,
                 u,
@@ -495,22 +840,35 @@ impl D3D11Renderer {
         Ok(())
     }
 
-    fn draw_d3d11_nv12(&mut self, frame: &D3D11Frame, tex_w: u32, tex_h: u32) -> Result<()> {
-        let texture_key = (frame.texture.as_raw() as usize, tex_w, tex_h);
-        if self.nv12_srv_cache.texture_key != texture_key {
-            self.nv12_srv_cache.slices.clear();
-            self.nv12_srv_cache.texture_key = texture_key;
+    fn draw_d3d11_frame(
+        &mut self,
+        frame: &D3D11Frame,
+        tex_w: u32,
+        tex_h: u32,
+        tex_format: DXGI_FORMAT,
+    ) -> Result<()> {
+        let is_p010 = tex_format == DXGI_FORMAT_P010;
+        let texture_key = (frame.texture.as_raw() as usize, tex_w, tex_h, tex_format.0);
+        if self.d3d11_srv_cache.texture_key != texture_key {
+            self.d3d11_srv_cache.slices.clear();
+            self.d3d11_srv_cache.texture_key = texture_key;
         }
 
+        let (y_srv_fmt, uv_srv_fmt) = if is_p010 {
+            (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
+        } else {
+            (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+        };
+
         let slice_index = frame.slice_index;
-        let (y_srv, uv_srv) = match self.nv12_srv_cache.slices.entry(slice_index) {
+        let (y_srv, uv_srv) = match self.d3d11_srv_cache.slices.entry(slice_index) {
             std::collections::hash_map::Entry::Occupied(entry) => {
                 let (y, uv) = entry.get();
                 (y.clone(), uv.clone())
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: DXGI_FORMAT_R8_UNORM,
+                    Format: y_srv_fmt,
                     ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
                     Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
                         Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
@@ -522,7 +880,7 @@ impl D3D11Renderer {
                     },
                 };
                 let uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: DXGI_FORMAT_R8G8_UNORM,
+                    Format: uv_srv_fmt,
                     ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
                     Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
                         Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
@@ -557,8 +915,13 @@ impl D3D11Renderer {
             }
         };
 
+        let ps = if is_p010 {
+            &self.ps_p010
+        } else {
+            &self.ps_nv12
+        };
         unsafe {
-            self.context.PSSetShader(&self.ps_nv12, None);
+            self.context.PSSetShader(ps, None);
             self.context
                 .PSSetShaderResources(0, Some(&[Some(y_srv), Some(uv_srv)]));
             self.context.Draw(4, 0);
@@ -623,7 +986,7 @@ impl D3D11Renderer {
 
 impl Drop for D3D11Renderer {
     fn drop(&mut self) {
-        self.nv12_srv_cache.clear();
+        self.d3d11_srv_cache.clear();
         if let Some(handle) = self.frame_latency_waitable.take()
             && !handle.is_invalid()
         {
@@ -789,6 +1152,7 @@ fn aspect_scale(frame_w: u32, frame_h: u32, view_w: u32, view_h: u32) -> [f32; 4
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_video_params(
     frame_w: u32,
     frame_h: u32,
@@ -796,6 +1160,8 @@ fn compute_video_params(
     tex_h: u32,
     view_w: u32,
     view_h: u32,
+    sharpness: f32,
+    color_mode: f32,
 ) -> VideoParams {
     let pos_scale = aspect_scale(frame_w, frame_h, view_w, view_h);
     let tw = tex_w.max(frame_w).max(1) as f32;
@@ -811,6 +1177,7 @@ fn compute_video_params(
             (fw - 1.0).max(0.0) / tw,
             (fh - 1.0).max(0.0) / th,
         ],
+        sharp_params: [sharpness.clamp(0.0, 1.0), 1.0 / tw, 1.0 / th, color_mode],
     }
 }
 
@@ -856,14 +1223,21 @@ mod tests {
 
     #[test]
     fn compiles_video_hlsl_shaders() {
+        let nv12_src = format!("{HLSL_COLOR_CAS_HELPERS}\n{NV12_ARRAY_PS_BODY}");
+        let p010_src = format!("{HLSL_COLOR_CAS_HELPERS}\n{P010_ARRAY_PS_BODY}");
+        let yuv_src = format!("{HLSL_COLOR_CAS_HELPERS}\n{YUV420_PS_BODY}");
+
         let vs = compile_hlsl(VIDEO_VS_HLSL, s!("VSMain"), s!("vs_5_0")).expect("VS compiles");
         let ps_nv12 =
-            compile_hlsl(NV12_ARRAY_PS_HLSL, s!("PSMain"), s!("ps_5_0")).expect("NV12 PS compiles");
+            compile_hlsl(&nv12_src, s!("PSMain"), s!("ps_5_0")).expect("NV12 PS compiles");
+        let ps_p010 =
+            compile_hlsl(&p010_src, s!("PSMain"), s!("ps_5_0")).expect("P010 PS compiles");
         let ps_yuv =
-            compile_hlsl(YUV420_PS_HLSL, s!("PSMain"), s!("ps_5_0")).expect("YUV420 PS compiles");
+            compile_hlsl(&yuv_src, s!("PSMain"), s!("ps_5_0")).expect("YUV420 PS compiles");
 
         assert!(!blob_slice(&vs).is_empty());
         assert!(!blob_slice(&ps_nv12).is_empty());
+        assert!(!blob_slice(&ps_p010).is_empty());
         assert!(!blob_slice(&ps_yuv).is_empty());
     }
 
@@ -877,14 +1251,19 @@ mod tests {
     }
 
     #[test]
-    fn computes_padded_surface_uv_crop() {
-        let hevc = compute_video_params(1920, 1080, 1920, 1152, 1920, 1080);
+    fn computes_padded_surface_uv_crop_and_sharp_params() {
+        let hevc = compute_video_params(1920, 1080, 1920, 1152, 1920, 1080, 1.4, 1.0);
         assert!((hevc.uv_rect[0] - 1.0).abs() < 1e-6);
         assert!((hevc.uv_rect[1] - (1080.0 / 1152.0)).abs() < 1e-6);
         assert!(hevc.uv_clamp[1] < hevc.uv_rect[1]);
         assert!(hevc.uv_clamp[3] < hevc.uv_clamp[1]);
+        assert!((hevc.sharp_params[0] - 1.0).abs() < 1e-6);
+        assert!((hevc.sharp_params[1] - (1.0 / 1920.0)).abs() < 1e-6);
+        assert!((hevc.sharp_params[2] - (1.0 / 1152.0)).abs() < 1e-6);
+        assert!((hevc.sharp_params[3] - 1.0).abs() < 1e-6);
 
-        let h264 = compute_video_params(1920, 1080, 1920, 1088, 1920, 1080);
+        let h264 = compute_video_params(1920, 1080, 1920, 1088, 1920, 1080, -0.2, 0.0);
         assert!((h264.uv_rect[1] - (1080.0 / 1088.0)).abs() < 1e-6);
+        assert!((h264.sharp_params[0] - 0.0).abs() < 1e-6);
     }
 }

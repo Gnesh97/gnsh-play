@@ -12,6 +12,7 @@ use windows::core::Interface as _;
 pub enum MediaCodec {
     H264,
     Hevc,
+    HevcHdr,
 }
 
 struct AvFrameGuard {
@@ -36,6 +37,7 @@ pub struct D3D11Frame {
     pub width: u32,
     pub height: u32,
     pub pts: i64,
+    pub is_hdr: bool,
     // Retains FFmpeg's AVBufferRef until the texture slice is finished rendering.
     _av_frame: AvFrameGuard,
 }
@@ -52,6 +54,7 @@ pub enum DecodedFrame {
         width: u32,
         height: u32,
         pts: i64,
+        is_hdr: bool,
     },
 }
 
@@ -61,6 +64,14 @@ impl DecodedFrame {
         match self {
             Self::D3D11(frame) => frame.pts,
             Self::SoftwareYuv420 { pts, .. } => *pts,
+        }
+    }
+
+    /// Returns whether this decoded frame carries an HDR10 signal.
+    pub fn is_hdr(&self) -> bool {
+        match self {
+            Self::D3D11(frame) => frame.is_hdr,
+            Self::SoftwareYuv420 { is_hdr, .. } => *is_hdr,
         }
     }
 }
@@ -174,7 +185,8 @@ impl VideoDecoder {
                 bail!("avcodec_receive_frame failed: {}", av_err_string(r));
             }
 
-            if let Some(decoded) = unsafe { extract_frame(self.frame)? } {
+            let is_hdr_codec = self.codec == MediaCodec::HevcHdr;
+            if let Some(decoded) = unsafe { extract_frame(self.frame, is_hdr_codec)? } {
                 self.decoded_any = true;
                 frames.push(decoded);
             }
@@ -187,7 +199,7 @@ impl VideoDecoder {
     fn open_internal(codec: MediaCodec, d3d11_device: Option<ID3D11Device>) -> Result<Self> {
         let codec_id = match codec {
             MediaCodec::H264 => ffi::AVCodecID_AV_CODEC_ID_H264,
-            MediaCodec::Hevc => ffi::AVCodecID_AV_CODEC_ID_HEVC,
+            MediaCodec::Hevc | MediaCodec::HevcHdr => ffi::AVCodecID_AV_CODEC_ID_HEVC,
         };
         let av_codec = unsafe { ffi::avcodec_find_decoder(codec_id) };
         if av_codec.is_null() {
@@ -338,7 +350,7 @@ unsafe extern "C" fn select_d3d11_format(
     }
 }
 
-unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> {
+unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<DecodedFrame>> {
     let fmt = unsafe { (*src).format };
     let width = unsafe { (*src).width.max(0) as u32 };
     let height = unsafe { (*src).height.max(0) as u32 };
@@ -364,6 +376,7 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
             width,
             height,
             pts,
+            is_hdr,
             _av_frame: guard,
         })));
     }
@@ -396,6 +409,7 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
             width,
             height,
             pts,
+            is_hdr,
         }));
     }
 
@@ -432,6 +446,76 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
             width,
             height,
             pts,
+            is_hdr,
+        }));
+    }
+
+    if fmt == ffi::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+        let (y_ptr, u_ptr, v_ptr, ys, us, vs) = unsafe {
+            (
+                (*src).data[0],
+                (*src).data[1],
+                (*src).data[2],
+                (*src).linesize[0] as usize,
+                (*src).linesize[1] as usize,
+                (*src).linesize[2] as usize,
+            )
+        };
+        let w = width as usize;
+        let h = height as usize;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let y = copy_plane_10le_to_u8(y_ptr, ys, w, h, 2);
+        let u = copy_plane_10le_to_u8(u_ptr, us, cw, ch, 2);
+        let v = copy_plane_10le_to_u8(v_ptr, vs, cw, ch, 2);
+        return Ok(Some(DecodedFrame::SoftwareYuv420 {
+            y,
+            u,
+            v,
+            y_stride: w,
+            u_stride: cw,
+            v_stride: cw,
+            width,
+            height,
+            pts,
+            is_hdr: true,
+        }));
+    }
+
+    if fmt == ffi::AVPixelFormat_AV_PIX_FMT_P010LE {
+        let (y_ptr, uv_ptr, ys, uvs) = unsafe {
+            (
+                (*src).data[0],
+                (*src).data[1],
+                (*src).linesize[0] as usize,
+                (*src).linesize[1] as usize,
+            )
+        };
+        let w = width as usize;
+        let h = height as usize;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let y = copy_plane_10le_to_u8(y_ptr, ys, w, h, 8);
+        let mut u = Vec::with_capacity(cw * ch);
+        let mut v = Vec::with_capacity(cw * ch);
+        for row in 0..ch {
+            let src_row = unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uvs), cw * 4) };
+            for quad in src_row.as_chunks::<4>().0 {
+                u.push((u16::from_le_bytes([quad[0], quad[1]]) >> 8) as u8);
+                v.push((u16::from_le_bytes([quad[2], quad[3]]) >> 8) as u8);
+            }
+        }
+        return Ok(Some(DecodedFrame::SoftwareYuv420 {
+            y,
+            u,
+            v,
+            y_stride: w,
+            u_stride: cw,
+            v_stride: cw,
+            width,
+            height,
+            pts,
+            is_hdr: true,
         }));
     }
 
@@ -444,6 +528,26 @@ fn copy_plane(src: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u
     for r in 0..rows {
         let src_row = unsafe { std::slice::from_raw_parts(src.add(r * stride), width) };
         out[r * width..(r + 1) * width].copy_from_slice(src_row);
+    }
+    out
+}
+
+/// Converts a 10-bit little-endian luma/chroma plane to 8-bit by right-shifting `shift` bits
+/// (`shift = 2` for LSB-aligned `YUV420P10LE`, `shift = 8` for MSB-aligned `P010LE`).
+fn copy_plane_10le_to_u8(
+    src: *const u8,
+    stride_bytes: usize,
+    width: usize,
+    rows: usize,
+    shift: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(width * rows);
+    for r in 0..rows {
+        let row_bytes = unsafe { std::slice::from_raw_parts(src.add(r * stride_bytes), width * 2) };
+        for pair in row_bytes.as_chunks::<2>().0 {
+            let sample = u16::from_le_bytes(*pair);
+            out.push((sample >> shift).min(255) as u8);
+        }
     }
     out
 }
@@ -513,5 +617,30 @@ mod tests {
             .expect("H.264 IDR decodes with explicit PTS");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].pts(), 42);
+        assert!(!frames[0].is_hdr());
+    }
+
+    #[test]
+    fn initializes_hevc_hdr_decoder_and_downshifts_10bit_planes() {
+        let mut decoder = VideoDecoder::new(MediaCodec::HevcHdr, None)
+            .expect("FFmpeg HEVC HDR10 decoder initializes");
+        assert!(!decoder.is_hw_active());
+        assert!(decoder.decode(&[]).expect("empty input ok").is_empty());
+
+        // YUV420P10LE (LSB 10-bit: 0..=1023) with 2-byte padding in stride_bytes.
+        let mut p10_buf = Vec::new();
+        for sample in [0_u16, 512, 1020, 0xFFFF] {
+            p10_buf.extend_from_slice(&sample.to_le_bytes());
+        }
+        let converted_lsb = copy_plane_10le_to_u8(p10_buf.as_ptr(), 8, 3, 1, 2);
+        assert_eq!(converted_lsb, vec![0, 128, 255]);
+
+        // P010LE (MSB 10-bit in high bits of u16).
+        let mut p010_buf = Vec::new();
+        for sample in [0_u16, 128_u16 << 8, 255_u16 << 8] {
+            p010_buf.extend_from_slice(&sample.to_le_bytes());
+        }
+        let converted_msb = copy_plane_10le_to_u8(p010_buf.as_ptr(), 6, 3, 1, 8);
+        assert_eq!(converted_msb, vec![0, 128, 255]);
     }
 }

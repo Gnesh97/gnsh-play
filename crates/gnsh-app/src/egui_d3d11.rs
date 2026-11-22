@@ -32,7 +32,8 @@ use windows::core::s;
 const EGUI_VS_HLSL: &str = r#"
 cbuffer ScreenParams : register(b0) {
     float2 screen_size;
-    float2 _pad;
+    float hdr_paper_white_nits;
+    float _pad;
 };
 
 struct VSIn {
@@ -64,6 +65,11 @@ VSOut VSMain(VSIn input) {
 const EGUI_PS_HLSL: &str = r#"
 Texture2D tex0 : register(t0);
 SamplerState samp0 : register(s0);
+cbuffer ScreenParams : register(b0) {
+    float2 screen_size;
+    float hdr_paper_white_nits;
+    float _pad;
+};
 
 struct PSIn {
     float4 pos   : SV_POSITION;
@@ -71,8 +77,32 @@ struct PSIn {
     float4 color : COLOR0;
 };
 
+float3 srgb_to_linear_egui(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+    return (c <= 0.04045) ? lo : hi;
+}
+
+float3 linear_to_pq_egui(float3 lin) {
+    float3 ym = pow(saturate(lin), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375);
+}
+
 float4 PSMain(PSIn input) : SV_TARGET {
-    return input.color * tex0.Sample(samp0, input.uv);
+    float4 col = input.color * tex0.Sample(samp0, input.uv);
+    if (hdr_paper_white_nits > 0.5) {
+        float a = col.a;
+        float3 srgb = (a > 1e-4) ? saturate(col.rgb / a) : float3(0.0, 0.0, 0.0);
+        float3 lin709 = srgb_to_linear_egui(srgb);
+        float3 lin2020 = float3(
+            0.627404 * lin709.r + 0.329283 * lin709.g + 0.043313 * lin709.b,
+            0.069097 * lin709.r + 0.919540 * lin709.g + 0.011363 * lin709.b,
+            0.016391 * lin709.r + 0.088013 * lin709.g + 0.895596 * lin709.b
+        );
+        float3 pq = linear_to_pq_egui(lin2020 * (hdr_paper_white_nits / 10000.0));
+        return float4(pq * a, a);
+    }
+    return col;
 }
 "#;
 
@@ -88,7 +118,8 @@ struct GpuVertex {
 #[derive(Clone, Copy)]
 struct ScreenParams {
     screen_size: [f32; 2],
-    _pad: [f32; 2],
+    hdr_paper_white_nits: f32,
+    _pad: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -251,7 +282,8 @@ impl EguiD3d11Painter {
 
         let init_params = ScreenParams {
             screen_size: [1.0, 1.0],
-            _pad: [0.0, 0.0],
+            hdr_paper_white_nits: 0.0,
+            _pad: 0.0,
         };
         let cb_desc = D3D11_BUFFER_DESC {
             ByteWidth: std::mem::size_of::<ScreenParams>() as u32,
@@ -380,6 +412,7 @@ impl EguiD3d11Painter {
         context: &ID3D11DeviceContext,
         screen_size_px: (u32, u32),
         pixels_per_point: f32,
+        hdr_output: bool,
         primitives: &[egui::ClippedPrimitive],
     ) -> Result<()> {
         if screen_size_px.0 == 0 || screen_size_px.1 == 0 || primitives.is_empty() {
@@ -473,7 +506,8 @@ impl EguiD3d11Painter {
 
         let params = ScreenParams {
             screen_size: [screen_size_px.0 as f32 / ppp, screen_size_px.1 as f32 / ppp],
-            _pad: [0.0, 0.0],
+            hdr_paper_white_nits: if hdr_output { 200.0 } else { 0.0 },
+            _pad: 0.0,
         };
         let viewport = D3D11_VIEWPORT {
             TopLeftX: 0.0,
@@ -521,9 +555,11 @@ impl EguiD3d11Painter {
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.IASetVertexBuffers(0, 1, Some(vb_bind.as_ptr()), Some(&stride), Some(&offset));
             context.IASetIndexBuffer(ib, DXGI_FORMAT_R32_UINT, 0);
+            let cb = [Some(self.cb_params.clone())];
             context.VSSetShader(&self.vs, None);
-            context.VSSetConstantBuffers(0, Some(&[Some(self.cb_params.clone())]));
+            context.VSSetConstantBuffers(0, Some(&cb));
             context.PSSetShader(&self.ps, None);
+            context.PSSetConstantBuffers(0, Some(&cb));
             context.RSSetState(&self.rasterizer_state);
             context.OMSetBlendState(&self.blend_state, None, u32::MAX);
             context.OMSetDepthStencilState(&self.depth_stencil_state, 0);

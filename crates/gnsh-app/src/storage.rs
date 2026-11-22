@@ -217,22 +217,26 @@ mod tests {
 
         let custom = StoredSettings {
             preset: VideoPreset::P720Fps60,
-            codec: VideoCodec::H264,
+            codec: VideoCodec::HevcHdr,
             bitrate_kbps: 500_000,
             vsync: false,
             touchpad_touch: true,
+            sharpness_pct: 250,
         };
         store.save(&custom).expect("save custom");
         let loaded = store.load().expect("load custom");
         assert_eq!(loaded.preset, VideoPreset::P720Fps60);
-        assert_eq!(loaded.codec, VideoCodec::H264);
+        assert_eq!(loaded.codec, VideoCodec::HevcHdr);
         assert_eq!(loaded.bitrate_kbps, 100_000);
         assert!(!loaded.vsync);
         assert!(loaded.touchpad_touch);
+        assert_eq!(loaded.sharpness_pct, 100);
 
-        std::fs::write(&path, r#"{"bitrate_kbps": 999999}"#).expect("write unclamped json");
+        std::fs::write(&path, r#"{"bitrate_kbps": 999999, "sharpness_pct": 180}"#)
+            .expect("write unclamped json");
         let clamped = store.load().expect("load clamped");
         assert_eq!(clamped.bitrate_kbps, 100_000);
+        assert_eq!(clamped.sharpness_pct, 100);
         assert_eq!(clamped.preset, VideoPreset::P1080Fps60);
         assert_eq!(clamped.codec, VideoCodec::Hevc);
 
@@ -249,6 +253,7 @@ pub struct StoredSettings {
     pub bitrate_kbps: u32,
     pub vsync: bool,
     pub touchpad_touch: bool,
+    pub sharpness_pct: u8,
 }
 
 impl Default for StoredSettings {
@@ -259,6 +264,7 @@ impl Default for StoredSettings {
             bitrate_kbps: 30_000,
             vsync: true,
             touchpad_touch: false,
+            sharpness_pct: 0,
         }
     }
 }
@@ -290,6 +296,7 @@ impl SettingsStore {
         let mut parsed: StoredSettings =
             serde_json::from_str(&raw).context("failed parsing settings.json")?;
         parsed.bitrate_kbps = clamp_bitrate_kbps(parsed.bitrate_kbps);
+        parsed.sharpness_pct = parsed.sharpness_pct.min(100);
         Ok(parsed)
     }
 
@@ -300,6 +307,7 @@ impl SettingsStore {
         }
         let mut clamped = settings.clone();
         clamped.bitrate_kbps = clamp_bitrate_kbps(clamped.bitrate_kbps);
+        clamped.sharpness_pct = clamped.sharpness_pct.min(100);
         let json = serde_json::to_string_pretty(&clamped)?;
         std::fs::write(&self.path, json)
             .with_context(|| format!("failed writing {}", self.path.display()))?;

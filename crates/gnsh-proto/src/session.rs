@@ -4,9 +4,9 @@ use crate::{ProtoError, Result, check_chiaki, init_lib};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gnsh_chiaki_sys::{
     ChiakiAudioHeader, ChiakiAudioSink, ChiakiCodec_CHIAKI_CODEC_H264,
-    ChiakiCodec_CHIAKI_CODEC_H265, ChiakiConnectInfo, ChiakiConnectVideoProfile, ChiakiEvent,
-    ChiakiEventType_CHIAKI_EVENT_CONNECTED, ChiakiEventType_CHIAKI_EVENT_KEYBOARD_OPEN,
-    ChiakiEventType_CHIAKI_EVENT_KEYBOARD_REMOTE_CLOSE,
+    ChiakiCodec_CHIAKI_CODEC_H265, ChiakiCodec_CHIAKI_CODEC_H265_HDR, ChiakiConnectInfo,
+    ChiakiConnectVideoProfile, ChiakiEvent, ChiakiEventType_CHIAKI_EVENT_CONNECTED,
+    ChiakiEventType_CHIAKI_EVENT_KEYBOARD_OPEN, ChiakiEventType_CHIAKI_EVENT_KEYBOARD_REMOTE_CLOSE,
     ChiakiEventType_CHIAKI_EVENT_KEYBOARD_TEXT_CHANGE, ChiakiEventType_CHIAKI_EVENT_LED_COLOR,
     ChiakiEventType_CHIAKI_EVENT_LOGIN_PIN_REQUEST, ChiakiEventType_CHIAKI_EVENT_NICKNAME_RECEIVED,
     ChiakiEventType_CHIAKI_EVENT_QUIT, ChiakiEventType_CHIAKI_EVENT_RUMBLE,
@@ -90,6 +90,7 @@ pub fn clamp_bitrate_kbps(kbps: u32) -> u32 {
 pub enum VideoCodec {
     H264,
     Hevc,
+    HevcHdr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +244,7 @@ impl Ps5Session {
         video_profile.codec = match config.codec {
             VideoCodec::H264 => ChiakiCodec_CHIAKI_CODEC_H264,
             VideoCodec::Hevc => ChiakiCodec_CHIAKI_CODEC_H265,
+            VideoCodec::HevcHdr => ChiakiCodec_CHIAKI_CODEC_H265_HDR,
         };
         if config.bitrate_kbps > 0 {
             video_profile.bitrate = clamp_bitrate_kbps(config.bitrate_kbps);
