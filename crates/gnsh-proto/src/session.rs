@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -154,6 +154,7 @@ struct SessionCallbacksCtx {
     audio_channels: AtomicU32,
     audio_rate: AtomicU32,
     video_bytes_total: AtomicU64,
+    last_haptics_rumble: AtomicU16,
 }
 
 pub struct Ps5Session {
@@ -186,6 +187,7 @@ impl Ps5Session {
             audio_channels: AtomicU32::new(2),
             audio_rate: AtomicU32::new(48_000),
             video_bytes_total: AtomicU64::new(0),
+            last_haptics_rumble: AtomicU16::new(0),
         }));
 
         let mut video_profile = ChiakiConnectVideoProfile::default();
@@ -252,6 +254,13 @@ impl Ps5Session {
             let mut audio_sink = ChiakiAudioSink::default();
             chiaki_opus_decoder_get_sink(opus_decoder.as_mut(), &mut audio_sink);
             session.audio_sink = audio_sink;
+            if config.enable_dualsense {
+                session.haptics_sink = ChiakiAudioSink {
+                    user: ctx_ptr.cast(),
+                    header_cb: None,
+                    frame_cb: Some(haptics_frame_cb),
+                };
+            }
             session.video_sample_cb = Some(video_sample_cb);
             session.video_sample_cb_user = ctx_ptr.cast();
             session.event_cb = Some(event_cb);
@@ -611,6 +620,52 @@ unsafe extern "C" fn opus_frame_cb(buf: *mut i16, samples_count: usize, user: *m
     });
 }
 
+const HAPTIC_RUMBLE_MIN_STRENGTH: u32 = 100;
+
+/// Converts signed 16-bit stereo DualSense haptic PCM audio into coarse left/right rumble levels.
+pub fn haptics_pcm_to_rumble(buf: &[u8]) -> Option<(u8, u8)> {
+    if buf.len() < 4 || !buf.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut sum_l: u64 = 0;
+    let mut sum_r: u64 = 0;
+    let mut count: u64 = 0;
+    for &[l0, l1, r0, r1] in buf.as_chunks::<4>().0 {
+        let l = i16::from_le_bytes([l0, l1]);
+        let r = i16::from_le_bytes([r0, r1]);
+        sum_l += u64::from(i32::from(l).unsigned_abs()) * 2;
+        sum_r += u64::from(i32::from(r).unsigned_abs()) * 2;
+        count += 1;
+    }
+    let scale_channel = |sum: u64| -> u8 {
+        let avg = (sum / count) as u32;
+        if avg <= HAPTIC_RUMBLE_MIN_STRENGTH {
+            0
+        } else {
+            (avg.min(65_535) >> 8).max(2) as u8
+        }
+    };
+    Some((scale_channel(sum_l), scale_channel(sum_r)))
+}
+
+unsafe extern "C" fn haptics_frame_cb(buf: *mut u8, buf_size: usize, user: *mut c_void) {
+    if buf.is_null() || buf_size < 4 || user.is_null() {
+        return;
+    }
+    // SAFETY: libchiaki invokes haptics_sink.frame_cb synchronously with a valid buffer of buf_size
+    // bytes while SessionCallbacksCtx stays pinned until chiaki_session_join completes in Drop.
+    let ctx = unsafe { &*(user.cast::<SessionCallbacksCtx>()) };
+    let slice = unsafe { std::slice::from_raw_parts(buf, buf_size) };
+    let Some((left, right)) = haptics_pcm_to_rumble(slice) else {
+        return;
+    };
+    let packed = (u16::from(left) << 8) | u16::from(right);
+    let prev = ctx.last_haptics_rumble.swap(packed, Ordering::Relaxed);
+    if packed != 0 || prev != 0 {
+        let _ = ctx.event_tx.try_send(SessionEvent::Rumble { left, right });
+    }
+}
+
 unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
     if event.is_null() || user.is_null() {
         return;
@@ -743,5 +798,25 @@ mod tests {
             (actual_max - 0.05).abs() < 1e-6,
             "unexpected packet_loss_max: {actual_max}"
         );
+    }
+
+    #[test]
+    fn converts_dualsense_haptics_pcm_to_stereo_rumble() {
+        assert_eq!(haptics_pcm_to_rumble(&[]), None);
+        assert_eq!(haptics_pcm_to_rumble(&[0, 1, 2]), None);
+
+        // Sub-threshold noise below HAPTIC_RUMBLE_MIN_STRENGTH maps cleanly to zero.
+        let mut quiet = Vec::with_capacity(8);
+        quiet.extend_from_slice(&40_i16.to_le_bytes());
+        quiet.extend_from_slice(&(-40_i16).to_le_bytes());
+        assert_eq!(haptics_pcm_to_rumble(&quiet), Some((0, 0)));
+
+        // Asymmetric stereo waveform drives independent left/right motor levels.
+        let mut burst = Vec::with_capacity(8);
+        burst.extend_from_slice(&20_000_i16.to_le_bytes());
+        burst.extend_from_slice(&(-4_000_i16).to_le_bytes());
+        burst.extend_from_slice(&20_000_i16.to_le_bytes());
+        burst.extend_from_slice(&(-4_000_i16).to_le_bytes());
+        assert_eq!(haptics_pcm_to_rumble(&burst), Some((156, 31)));
     }
 }

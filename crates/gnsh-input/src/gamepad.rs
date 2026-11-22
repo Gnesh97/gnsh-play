@@ -294,11 +294,26 @@ impl GamepadManager {
         })
     }
 
-    /// Triggers low/high-frequency rumble motors on the active gamepad for 500 ms.
+    /// Triggers low/high-frequency rumble motors on the active gamepad (500 ms fallback or DS5 HID).
     pub fn set_rumble(&self, left: u8, right: u8) {
         let Some(gp) = self.active.as_ref() else {
             return;
         };
+        if gp.is_dualsense {
+            let packet = build_dualsense_rumble_packet(left, right);
+            // SAFETY: gp.ptr is an open SDL_Gamepad* owned by self.active, and packet points to
+            // a 47-byte stack-allocated DualSense effect state buffer valid for the call.
+            let ok = unsafe {
+                ffi::SDL_SendGamepadEffect(gp.ptr, packet.as_ptr().cast(), packet.len() as c_int)
+            };
+            if !ok {
+                tracing::debug!(
+                    "SDL_SendGamepadEffect(rumble) failed: {}",
+                    crate::sdl_error()
+                );
+            }
+            return;
+        }
         let ok = unsafe {
             ffi::SDL_RumbleGamepad(gp.ptr, u16::from(left) * 257, u16::from(right) * 257, 500)
         };
@@ -407,6 +422,7 @@ impl GamepadManager {
     }
 
     fn close_active(&mut self) {
+        self.set_rumble(0, 0);
         self.clear_trigger_effects();
         self.touch_tracker.reset();
         if let Some(gp) = self.active.take()
@@ -502,6 +518,17 @@ pub fn build_dualsense_trigger_effect_packet(
     buf
 }
 
+/// Encodes Sony DualSense 47-byte rumble HID state matching `chiaki-ng`'s `SetDualSenseRumble`.
+pub fn build_dualsense_rumble_packet(left: u8, right: u8) -> [u8; 47] {
+    let mut buf = [0u8; 47];
+    buf[0] = 0x02;
+    buf[1] = 0x40;
+    buf[2] = right;
+    buf[3] = left;
+    buf[38] = 0x04;
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +545,18 @@ mod tests {
         assert_eq!(&packet[11..21], &right);
         assert_eq!(packet[21], 0x21);
         assert_eq!(&packet[22..32], &left);
+    }
+
+    #[test]
+    fn builds_47_byte_dualsense_rumble_packet() {
+        let packet = build_dualsense_rumble_packet(180, 90);
+        assert_eq!(packet.len(), 47);
+        assert_eq!(packet[0], 0x02);
+        assert_eq!(packet[1], 0x40);
+        assert_eq!(packet[2], 90);
+        assert_eq!(packet[3], 180);
+        assert_eq!(packet[36], 0x00);
+        assert_eq!(packet[38], 0x04);
     }
 
     #[test]

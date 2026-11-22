@@ -557,6 +557,7 @@ struct ActiveStream {
     last_idr_request: Instant,
     last_seen_lost: u64,
     packet_loss_notice_until: Option<Instant>,
+    rumble_active_until: Option<Instant>,
 }
 
 impl ActiveStream {
@@ -651,6 +652,7 @@ impl ActiveStream {
             last_idr_request: Instant::now() - IDR_COOLDOWN,
             last_seen_lost: 0,
             packet_loss_notice_until: None,
+            rumble_active_until: None,
         })
     }
 
@@ -1075,6 +1077,11 @@ impl AppState {
                     }
                     SessionEvent::Rumble { left, right } => {
                         gamepads.set_rumble(left, right);
+                        stream.rumble_active_until = if left > 0 || right > 0 {
+                            Some(Instant::now() + Duration::from_millis(250))
+                        } else {
+                            None
+                        };
                     }
                     SessionEvent::Led { r, g, b } => {
                         gamepads.set_led(r, g, b);
@@ -1109,6 +1116,14 @@ impl AppState {
             }
 
             if stream_quit_banner.is_none() {
+                if stream
+                    .rumble_active_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    gamepads.set_rumble(0, 0);
+                    stream.rumble_active_until = None;
+                }
+
                 let lost_total = stream.frames_lost_total.load(Ordering::Relaxed);
                 if lost_total > stream.last_seen_lost {
                     stream.last_seen_lost = lost_total;

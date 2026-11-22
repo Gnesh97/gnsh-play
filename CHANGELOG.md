@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Wired DualSense haptic PCM streams (`session.haptics_sink`) to rumble conversion in [`crates/gnsh-proto/src/session.rs`](crates/gnsh-proto/src/session.rs), switched PS5 rumble commands to Sony's 47-byte `DS5EffectsState_t` HID packet (`SDL_SendGamepadEffect`) in [`crates/gnsh-input/src/gamepad.rs`](crates/gnsh-input/src/gamepad.rs), and added a 250 ms idle auto-stop watchdog in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs) so controller vibration works in PS5 DualSense games (`32` workspace tests passing).
+
 ## [0.1.0] - 2026-11-22
 
 ### Added
