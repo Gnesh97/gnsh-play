@@ -96,45 +96,45 @@ fn print_usage() {
     );
 }
 
-struct TeeLogMakeWriter {
-    file: Option<Arc<Mutex<std::fs::File>>>,
+struct AsyncLogMakeWriter {
+    tx: crossbeam_channel::Sender<Vec<u8>>,
 }
 
-struct TeeLogWriter {
-    file: Option<Arc<Mutex<std::fs::File>>>,
-    stderr: std::io::Stderr,
+struct AsyncLogWriter {
+    tx: crossbeam_channel::Sender<Vec<u8>>,
+    buf: Vec<u8>,
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeLogMakeWriter {
-    type Writer = TeeLogWriter;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AsyncLogMakeWriter {
+    type Writer = AsyncLogWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        TeeLogWriter {
-            file: self.file.as_ref().map(Arc::clone),
-            stderr: std::io::stderr(),
+        AsyncLogWriter {
+            tx: self.tx.clone(),
+            buf: Vec::with_capacity(256),
         }
     }
 }
 
-impl std::io::Write for TeeLogWriter {
+impl std::io::Write for AsyncLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = self.stderr.write_all(buf);
-        if let Some(ref lock) = self.file
-            && let Ok(mut file) = lock.lock()
-        {
-            let _ = file.write_all(buf);
-        }
+        self.buf.extend_from_slice(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let _ = self.stderr.flush();
-        if let Some(ref lock) = self.file
-            && let Ok(mut file) = lock.lock()
-        {
-            let _ = file.flush();
+        if !self.buf.is_empty() {
+            let _ = self.tx.try_send(std::mem::take(&mut self.buf));
         }
         Ok(())
+    }
+}
+
+impl Drop for AsyncLogWriter {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            let _ = self.tx.try_send(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -145,7 +145,7 @@ fn default_log_path() -> PathBuf {
     base.join("gnsh-play").join("gnsh-play.log")
 }
 
-/// Initializes stderr + `%APPDATA%\gnsh-play\gnsh-play.log` tracing output and panic capture.
+/// Initializes non-blocking stderr + `%APPDATA%\gnsh-play\gnsh-play.log` tracing and panic capture.
 fn init_logging() -> PathBuf {
     let log_path = default_log_path();
     if let Some(parent) = log_path.parent() {
@@ -158,21 +158,32 @@ fn init_logging() -> PathBuf {
         let _ = std::fs::File::create(&log_path);
     }
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok()
-        .map(|f| Arc::new(Mutex::new(f)));
+    // Offload log I/O off time-critical UDP threads so console/disk latency never stalls Takion receive.
+    let (log_tx, log_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+    let writer_path = log_path.clone();
+    let _ = thread::Builder::new()
+        .name("gnsh-log-writer".into())
+        .spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&writer_path)
+                .ok();
+            let mut stderr = std::io::stderr();
+            while let Ok(chunk) = log_rx.recv() {
+                let _ = stderr.write_all(&chunk);
+                if let Some(ref mut f) = file {
+                    let _ = f.write_all(&chunk);
+                }
+            }
+        });
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_ansi(false)
-        .with_writer(TeeLogMakeWriter {
-            file: file.as_ref().map(Arc::clone),
-        })
+        .with_writer(AsyncLogMakeWriter { tx: log_tx })
         .try_init();
 
     let panic_path = log_path.clone();
@@ -617,6 +628,13 @@ impl ActiveStream {
     }
 
     fn shutdown(&mut self) {
+        if self.session.is_none()
+            && self.video_thread.is_none()
+            && self.audio_thread.is_none()
+            && self.current_frame.is_none()
+        {
+            return;
+        }
         tracing::info!(host = %self.console_host, "Shutting down active stream session");
         self.stop_flag.store(true, Ordering::Relaxed);
         // Drop queued D3D11VA/AVFrame surfaces before joining the decode worker and destroying its context.

@@ -38,6 +38,10 @@ impl ChiakiLogger {
     }
 }
 
+fn is_per_unit_missing_warning(msg: &str) -> bool {
+    msg.starts_with("Missing unit ")
+}
+
 unsafe extern "C" fn log_callback(level: ChiakiLogLevel, msg: *const c_char, _user: *mut c_void) {
     if msg.is_null() {
         return;
@@ -47,7 +51,11 @@ unsafe extern "C" fn log_callback(level: ChiakiLogLevel, msg: *const c_char, _us
     match level {
         x if x == ChiakiLogLevel_CHIAKI_LOG_ERROR => tracing::error!(target: "chiaki", "{trimmed}"),
         x if x == ChiakiLogLevel_CHIAKI_LOG_WARNING => {
-            tracing::warn!(target: "chiaki", "{trimmed}")
+            if is_per_unit_missing_warning(trimmed) {
+                tracing::debug!(target: "chiaki", "{trimmed}");
+            } else {
+                tracing::warn!(target: "chiaki", "{trimmed}");
+            }
         }
         x if x == ChiakiLogLevel_CHIAKI_LOG_INFO => tracing::info!(target: "chiaki", "{trimmed}"),
         x if x == ChiakiLogLevel_CHIAKI_LOG_DEBUG => {
@@ -57,5 +65,16 @@ unsafe extern "C" fn log_callback(level: ChiakiLogLevel, msg: *const c_char, _us
             tracing::trace!(target: "chiaki", "{trimmed}")
         }
         _ => tracing::debug!(target: "chiaki", "{trimmed}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_per_unit_missing_warning() {
+        assert!(is_per_unit_missing_warning("Missing unit 0x66"));
+        assert!(!is_per_unit_missing_warning("FEC failed"));
     }
 }
