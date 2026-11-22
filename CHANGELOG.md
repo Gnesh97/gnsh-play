@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Implemented 4-channel USB DualSense voice-coil haptics output (`HapticsAudioOutput` in [`crates/gnsh-media/src/audio.rs`](crates/gnsh-media/src/audio.rs)) with 3 kHz stereo-to-rear-channel remixing, SDL3 hotplug re-detection, and automatic motor-rumble fallback when no 4-channel USB endpoint is present.
+- Implemented Opus uplink microphone streaming (`ChiakiOpusEncoder` + `Ps5Session::set_mic_muted` / `send_mic_pcm` in [`crates/gnsh-proto/src/session.rs`](crates/gnsh-proto/src/session.rs)), 48 kHz stereo `MicCapture` in [`crates/gnsh-media/src/audio.rs`](crates/gnsh-media/src/audio.rs), DualSense mute button (`MISC1`) + orange mic LED (`DS5EffectsState_t`) in [`crates/gnsh-input/src/gamepad.rs`](crates/gnsh-input/src/gamepad.rs), `Ctrl+M` shortcut in [`crates/gnsh-input/src/window.rs`](crates/gnsh-input/src/window.rs), and HUD mute button + haptics mode indicator in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs).
+- Added RAII Win32 `SleepInhibitor` (`SetThreadExecutionState` with `ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED`) in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs) so Windows display/sleep timers pause while streaming.
+
 ### Fixed
 - Wired DualSense haptic PCM streams (`session.haptics_sink`) to rumble conversion in [`crates/gnsh-proto/src/session.rs`](crates/gnsh-proto/src/session.rs), switched PS5 rumble commands to Sony's 47-byte `DS5EffectsState_t` HID packet (`SDL_SendGamepadEffect`) in [`crates/gnsh-input/src/gamepad.rs`](crates/gnsh-input/src/gamepad.rs), and added a 250 ms idle auto-stop watchdog in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs) so controller vibration works in PS5 DualSense games (`32` workspace tests passing).
 

@@ -12,6 +12,6 @@ pub(crate) mod ffi {
 }
 pub mod video_decoder;
 
-pub use audio::AudioOutput;
+pub use audio::{AudioOutput, HapticsAudioOutput, MicCapture};
 pub use d3d11_renderer::D3D11Renderer;
 pub use video_decoder::{D3D11Frame, DecodedFrame, MediaCodec, VideoDecoder};

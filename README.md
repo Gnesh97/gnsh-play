@@ -6,8 +6,8 @@ Native Windows x64 PlayStation 5 Remote Play client built in Rust (`AGPL-3.0-onl
 
 - **LAN PS5 Discovery & Wake-Up**: DDP subnet broadcast discovery and standby wake-up via `libchiaki` (`gnsh-proto`), plus `4 MiB` runtime `SO_RCVBUF` socket tuning (`UDP_RECV_BUF_BYTES`).
 - **PSN Account ID & 8-Digit PIN Linking**: Browser OAuth redirect URL helper (or direct Base64 Account ID) + PS5 registration flow persisted in Windows DPAPI encrypted storage (`%APPDATA%\gnsh-play\consoles.json`).
-- **Low-Latency Media Pipeline**: FFmpeg `D3D11VA` zero-copy hardware H.264/HEVC video decoding (with padded surface UV crop, `EAGAIN` drain-and-retry, and automatic `YUV420P`/`NV12` software fallback), native DXGI flip-model Direct3D 11 shader rendering, and `chiaki_opus_decoder` + SDL3 latency-capped 48 kHz S16 stereo audio (`gnsh-media`).
-- **Native Input & DualSense Features**: SDL3 windowing + Win32 `HWND` hosting, `egui` 0.37 Direct3D 11 overlay UI, and `SDL_Gamepad` polling with stick deadzones, L2/R2 analog triggers, **DualSense adaptive triggers** (`SDL_SendGamepadEffect`), click-only default + capacitive toggle touchpad (`Touchpad Touch`), gyro/accel sensors, rumble, and lightbar LED feedback (`gnsh-input`, `gnsh-app`).
+- **Low-Latency Media Pipeline**: FFmpeg `D3D11VA` zero-copy hardware H.264/HEVC video decoding (with padded surface UV crop, `EAGAIN` drain-and-retry, and automatic `YUV420P`/`NV12` software fallback), native DXGI flip-model Direct3D 11 shader rendering, `chiaki_opus_decoder` + SDL3 latency-capped 48 kHz S16 stereo playback, **4-channel USB DualSense audio haptics** (with automatic motor-rumble fallback), and **Opus microphone uplink** (`gnsh-media`, `gnsh-proto`).
+- **Native Input, DualSense Features & Keep-Awake**: SDL3 windowing + Win32 `HWND` hosting, `egui` 0.37 Direct3D 11 overlay UI, and `SDL_Gamepad` polling with stick deadzones, L2/R2 analog triggers, **DualSense adaptive triggers & orange mic LED** (`SDL_SendGamepadEffect`), DualSense mute button / `Ctrl+M` mic toggle, click-only default + capacitive toggle touchpad (`Touchpad Touch`), gyro/accel sensors, rumble, lightbar LED feedback, and automatic Win32 display/sleep keep-awake (`SetThreadExecutionState`) while streaming (`gnsh-input`, `gnsh-app`).
 - **Persistent Settings, Telemetry & File Logging**: Saves stream preferences (`preset`, `codec`, `bitrate_kbps` clamped `2_000..=100_000`, `vsync`, `touchpad_touch`) to `%APPDATA%\gnsh-play\settings.json`, renders live HUD telemetry (`FPS`, rolling `Mbps`, live Win32 ICMP `RTT`, 200 ms × 10 `Loss %`, `UDP Buf KiB`), and writes non-blocking logs + panic traces to `%APPDATA%\gnsh-play\gnsh-play.log`.
 - **Console-less Standalone Distribution**: Release builds use `windows_subsystem = "windows"` (no console window on double-click) while restoring CLI output via `AttachConsole` for `--help` / `--discover`, staged with resolved MinGW64 runtime DLLs by `scripts/stage-dist.ps1`.
 
@@ -17,7 +17,7 @@ Native Windows x64 PlayStation 5 Remote Play client built in Rust (`AGPL-3.0-onl
 | :--- | :--- |
 | [`crates/gnsh-chiaki-sys`](crates/gnsh-chiaki-sys) | Raw bindgen FFI bindings to static `third_party/chiaki-ng` (`libchiaki.a`) |
 | [`crates/gnsh-proto`](crates/gnsh-proto) | Safe Rust wrapper for LAN discovery, wake-up, PSN OAuth exchange, PIN registration, controller state, and `Ps5Session` |
-| [`crates/gnsh-media`](crates/gnsh-media) | FFmpeg `D3D11VA`/SW `VideoDecoder`, DXGI/D3D11 HLSL `D3D11Renderer`, and SDL3 `AudioOutput` |
+| [`crates/gnsh-media`](crates/gnsh-media) | FFmpeg `D3D11VA`/SW `VideoDecoder`, DXGI/D3D11 HLSL `D3D11Renderer`, and SDL3 `AudioOutput` / `HapticsAudioOutput` / `MicCapture` |
 | [`crates/gnsh-input`](crates/gnsh-input) | SDL3 windowing, Win32 `HWND`/clipboard integration, `egui` event translation, and `GamepadManager` |
 | [`crates/gnsh-app`](crates/gnsh-app) | `gnsh-play` CLI/GUI application (`main.rs`), D3D11 `egui` painter (`egui_d3d11.rs`), and DPAPI storage (`storage.rs`) |
 | [`scripts/stage-dist.ps1`](scripts/stage-dist.ps1) | Release build and standalone `dist/` DLL staging script |
@@ -57,8 +57,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\stage-dist.ps1
 
 ### Shortcuts & Controls
 
-- **`F3`**: Toggle the streaming HUD overlay (`FPS`, rolling `Mbps`, live `RTT`, `Loss %`, decode latency, `D3D11VA`/`SW` backend indicator, `UDP Buf`, active gamepad, `Touchpad Touch`, Disconnect)
+- **`F3`**: Toggle the streaming HUD overlay (`FPS`, rolling `Mbps`, live `RTT`, `Loss %`, decode latency, `D3D11VA`/`SW` backend indicator, `UDP Buf`, active gamepad, `Haptics` mode, `Mic` mute button, `Touchpad Touch`, Disconnect)
 - **`F11`**: Toggle fullscreen mode
+- **`Ctrl+M` / DualSense Mute Button**: Toggle uplink microphone mute state (syncs controller orange mic LED)
 - **`Escape`**: Close open modal or disconnect active stream
 
 ## License & Attribution

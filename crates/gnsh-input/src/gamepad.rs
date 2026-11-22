@@ -183,6 +183,8 @@ struct ActiveGamepad {
 pub struct GamepadManager {
     active: Option<ActiveGamepad>,
     touch_tracker: TouchpadTracker,
+    mic_btn_down: bool,
+    mic_toggle_pending: bool,
 }
 
 impl GamepadManager {
@@ -192,6 +194,8 @@ impl GamepadManager {
         let mut manager = Self {
             active: None,
             touch_tracker: TouchpadTracker::default(),
+            mic_btn_down: false,
+            mic_toggle_pending: false,
         };
         manager.open_first_available(None);
         Ok(manager)
@@ -222,14 +226,35 @@ impl GamepadManager {
         self.active.as_ref().map(|gp| gp.name.as_str())
     }
 
+    /// Returns `true` once when the DualSense mute button was newly pressed since the last check.
+    pub fn take_mic_toggle(&mut self) -> bool {
+        std::mem::take(&mut self.mic_toggle_pending)
+    }
+
     /// Polls buttons, deadzoned sticks, triggers, touchpad fingers, gyro, and accel.
     ///
     /// When `allow_capacitive_touch` is `false`, finger coordinates are only forwarded while the
     /// physical touchpad click button is held (workaround for Remote Play touch-as-click issues).
     pub fn poll_state(&mut self, allow_capacitive_touch: bool) -> Option<ControllerState> {
-        let gp_ptr = self.active.as_ref()?.ptr;
+        let (gp_ptr, is_dualsense) = {
+            let gp = self.active.as_ref()?;
+            (gp.ptr, gp.is_dualsense)
+        };
         if !unsafe { ffi::SDL_GamepadConnected(gp_ptr) } {
             return None;
+        }
+
+        if is_dualsense {
+            // SAFETY: gp_ptr is a connected DualSense SDL_Gamepad* owned by self.active.
+            let mic_down = unsafe {
+                ffi::SDL_GetGamepadButton(gp_ptr, ffi::SDL_GamepadButton_SDL_GAMEPAD_BUTTON_MISC1)
+            };
+            if mic_down && !self.mic_btn_down {
+                self.mic_toggle_pending = true;
+            }
+            self.mic_btn_down = mic_down;
+        } else {
+            self.mic_btn_down = false;
         }
 
         let buttons = map_sdl_buttons(|btn| unsafe { ffi::SDL_GetGamepadButton(gp_ptr, btn) });
@@ -301,17 +326,7 @@ impl GamepadManager {
         };
         if gp.is_dualsense {
             let packet = build_dualsense_rumble_packet(left, right);
-            // SAFETY: gp.ptr is an open SDL_Gamepad* owned by self.active, and packet points to
-            // a 47-byte stack-allocated DualSense effect state buffer valid for the call.
-            let ok = unsafe {
-                ffi::SDL_SendGamepadEffect(gp.ptr, packet.as_ptr().cast(), packet.len() as c_int)
-            };
-            if !ok {
-                tracing::debug!(
-                    "SDL_SendGamepadEffect(rumble) failed: {}",
-                    crate::sdl_error()
-                );
-            }
+            self.send_dualsense_effect(&packet, "rumble");
             return;
         }
         let ok = unsafe {
@@ -333,6 +348,12 @@ impl GamepadManager {
         }
     }
 
+    /// Updates the DualSense orange microphone mute LED when a PS5 controller is active.
+    pub fn set_mic_led(&self, muted: bool) {
+        let packet = build_dualsense_mic_led_packet(muted);
+        self.send_dualsense_effect(&packet, "mic_led");
+    }
+
     /// Sends DualSense adaptive trigger effects (`L2`/`R2`) via SDL3 when a PS5 controller is active.
     pub fn set_trigger_effects(
         &self,
@@ -341,26 +362,33 @@ impl GamepadManager {
         type_right: u8,
         right: &[u8; 10],
     ) {
+        let packet = build_dualsense_trigger_effect_packet(type_left, left, type_right, right);
+        self.send_dualsense_effect(&packet, "trigger_effects");
+    }
+
+    /// Resets left and right DualSense adaptive triggers back to off (`0x05`).
+    pub fn clear_trigger_effects(&self) {
+        self.set_trigger_effects(0x05, &[0u8; 10], 0x05, &[0u8; 10]);
+    }
+
+    fn send_dualsense_effect(&self, packet: &[u8; 47], label: &str) {
         let Some(gp) = self.active.as_ref() else {
             return;
         };
         if !gp.is_dualsense {
             return;
         }
-        let packet = build_dualsense_trigger_effect_packet(type_left, left, type_right, right);
         // SAFETY: gp.ptr is an open SDL_Gamepad* owned by self.active, and packet points to a
         // 47-byte stack-allocated DualSense effect state buffer valid for the duration of the call.
         let ok = unsafe {
             ffi::SDL_SendGamepadEffect(gp.ptr, packet.as_ptr().cast(), packet.len() as c_int)
         };
         if !ok {
-            tracing::debug!("SDL_SendGamepadEffect failed: {}", crate::sdl_error());
+            tracing::debug!(
+                "SDL_SendGamepadEffect({label}) failed: {}",
+                crate::sdl_error()
+            );
         }
-    }
-
-    /// Resets left and right DualSense adaptive triggers back to off (`0x05`).
-    pub fn clear_trigger_effects(&self) {
-        self.set_trigger_effects(0x05, &[0u8; 10], 0x05, &[0u8; 10]);
     }
 
     fn open_first_available(&mut self, skip_id: Option<u32>) {
@@ -412,6 +440,8 @@ impl GamepadManager {
 
         tracing::info!("Opened gamepad: {name} (id={instance_id}, dualsense={is_dualsense})");
         self.touch_tracker.reset();
+        self.mic_btn_down = false;
+        self.mic_toggle_pending = false;
         self.active = Some(ActiveGamepad {
             ptr,
             instance_id,
@@ -424,7 +454,10 @@ impl GamepadManager {
     fn close_active(&mut self) {
         self.set_rumble(0, 0);
         self.clear_trigger_effects();
+        self.set_mic_led(false);
         self.touch_tracker.reset();
+        self.mic_btn_down = false;
+        self.mic_toggle_pending = false;
         if let Some(gp) = self.active.take()
             && !gp.ptr.is_null()
         {
@@ -529,6 +562,15 @@ pub fn build_dualsense_rumble_packet(left: u8, right: u8) -> [u8; 47] {
     buf
 }
 
+/// Encodes Sony DualSense 47-byte microphone LED & mute-bits HID packet (`DS5EffectsState_t`).
+pub fn build_dualsense_mic_led_packet(muted: bool) -> [u8; 47] {
+    let mut buf = [0u8; 47];
+    buf[1] = 0x01 | 0x02;
+    buf[8] = u8::from(muted);
+    buf[9] = if muted { 0x08 } else { 0x00 };
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +599,21 @@ mod tests {
         assert_eq!(packet[3], 180);
         assert_eq!(packet[36], 0x00);
         assert_eq!(packet[38], 0x04);
+    }
+
+    #[test]
+    fn builds_47_byte_dualsense_mic_led_packet() {
+        let muted = build_dualsense_mic_led_packet(true);
+        assert_eq!(muted.len(), 47);
+        assert_eq!(muted[1], 0x03);
+        assert_eq!(muted[8], 0x01);
+        assert_eq!(muted[9], 0x08);
+
+        let live = build_dualsense_mic_led_packet(false);
+        assert_eq!(live.len(), 47);
+        assert_eq!(live[1], 0x03);
+        assert_eq!(live[8], 0x00);
+        assert_eq!(live[9], 0x00);
     }
 
     #[test]

@@ -3,27 +3,30 @@ use crate::log::ChiakiLogger;
 use crate::{ProtoError, Result, check_chiaki, init_lib};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gnsh_chiaki_sys::{
-    ChiakiAudioSink, ChiakiCodec_CHIAKI_CODEC_H264, ChiakiCodec_CHIAKI_CODEC_H265,
-    ChiakiConnectInfo, ChiakiConnectVideoProfile, ChiakiEvent,
+    ChiakiAudioHeader, ChiakiAudioSink, ChiakiCodec_CHIAKI_CODEC_H264,
+    ChiakiCodec_CHIAKI_CODEC_H265, ChiakiConnectInfo, ChiakiConnectVideoProfile, ChiakiEvent,
     ChiakiEventType_CHIAKI_EVENT_CONNECTED, ChiakiEventType_CHIAKI_EVENT_LED_COLOR,
     ChiakiEventType_CHIAKI_EVENT_LOGIN_PIN_REQUEST, ChiakiEventType_CHIAKI_EVENT_NICKNAME_RECEIVED,
     ChiakiEventType_CHIAKI_EVENT_QUIT, ChiakiEventType_CHIAKI_EVENT_RUMBLE,
-    ChiakiEventType_CHIAKI_EVENT_TRIGGER_EFFECTS, ChiakiOpusDecoder,
+    ChiakiEventType_CHIAKI_EVENT_TRIGGER_EFFECTS, ChiakiOpusDecoder, ChiakiOpusEncoder,
     ChiakiQuitReason_CHIAKI_QUIT_REASON_STOPPED,
     ChiakiQuitReason_CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN, ChiakiSession,
     ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_60,
     ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_720p,
     ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_1080p,
     chiaki_connect_video_profile_preset, chiaki_opus_decoder_fini, chiaki_opus_decoder_get_sink,
-    chiaki_opus_decoder_init, chiaki_quit_reason_string, chiaki_session_fini, chiaki_session_init,
+    chiaki_opus_decoder_init, chiaki_opus_encoder_fini, chiaki_opus_encoder_frame,
+    chiaki_opus_encoder_header, chiaki_opus_encoder_init, chiaki_quit_reason_string,
+    chiaki_session_connect_microphone, chiaki_session_fini, chiaki_session_init,
     chiaki_session_join, chiaki_session_request_idr, chiaki_session_set_controller_state,
     chiaki_session_set_login_pin, chiaki_session_start, chiaki_session_stop,
+    chiaki_session_toggle_microphone,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -31,6 +34,10 @@ use std::time::{Duration, Instant};
 pub const MIN_BITRATE_KBPS: u32 = 2_000;
 pub const MAX_BITRATE_KBPS: u32 = 100_000;
 pub const UDP_RECV_BUF_BYTES: i32 = 4 * 1024 * 1024;
+pub const MIC_SAMPLE_RATE: u32 = 48_000;
+pub const MIC_CHANNELS: u8 = 2;
+pub const MIC_FRAME_SAMPLES: u32 = 480;
+pub const MIC_FRAME_PCM_LEN: usize = 960;
 
 const SOL_SOCKET: i32 = 0xFFFF;
 const SO_RCVBUF: i32 = 0x1002;
@@ -114,6 +121,11 @@ pub struct AudioPcmFrame {
 }
 
 #[derive(Debug, Clone)]
+pub struct HapticsPcmFrame {
+    pub samples: Vec<i16>,
+}
+
+#[derive(Debug, Clone)]
 pub enum SessionEvent {
     Connected,
     Quit {
@@ -144,13 +156,16 @@ pub enum SessionEvent {
 pub struct SessionChannels {
     pub video_rx: Receiver<VideoPacket>,
     pub audio_rx: Receiver<AudioPcmFrame>,
+    pub haptics_rx: Receiver<HapticsPcmFrame>,
     pub events_rx: Receiver<SessionEvent>,
 }
 
 struct SessionCallbacksCtx {
     video_tx: Sender<VideoPacket>,
     audio_tx: Sender<AudioPcmFrame>,
+    haptics_tx: Sender<HapticsPcmFrame>,
     event_tx: Sender<SessionEvent>,
+    usb_haptics_active: Arc<AtomicBool>,
     audio_channels: AtomicU32,
     audio_rate: AtomicU32,
     video_bytes_total: AtomicU64,
@@ -160,9 +175,13 @@ struct SessionCallbacksCtx {
 pub struct Ps5Session {
     session: Box<ChiakiSession>,
     opus_decoder: Box<ChiakiOpusDecoder>,
+    opus_encoder: Box<ChiakiOpusEncoder>,
     _logger: ChiakiLogger,
     ctx: *mut SessionCallbacksCtx,
     rtt_probe: RttProbe,
+    usb_haptics_active: Arc<AtomicBool>,
+    mic_connected: bool,
+    mic_muted: bool,
     started: bool,
 }
 
@@ -178,12 +197,16 @@ impl Ps5Session {
 
         let (video_tx, video_rx) = crossbeam_channel::bounded(32);
         let (audio_tx, audio_rx) = crossbeam_channel::bounded(32);
+        let (haptics_tx, haptics_rx) = crossbeam_channel::bounded(16);
         let (event_tx, events_rx) = crossbeam_channel::bounded(64);
+        let usb_haptics_active = Arc::new(AtomicBool::new(false));
 
         let ctx_ptr = Box::into_raw(Box::new(SessionCallbacksCtx {
             video_tx,
             audio_tx,
+            haptics_tx,
             event_tx,
+            usb_haptics_active: Arc::clone(&usb_haptics_active),
             audio_channels: AtomicU32::new(2),
             audio_rate: AtomicU32::new(48_000),
             video_bytes_total: AtomicU64::new(0),
@@ -245,6 +268,7 @@ impl Ps5Session {
         }
 
         let mut opus_decoder = Box::new(ChiakiOpusDecoder::default());
+        let mut opus_encoder = Box::new(ChiakiOpusEncoder::default());
         unsafe {
             chiaki_opus_decoder_init(opus_decoder.as_mut(), logger.as_mut_ptr());
             opus_decoder.settings_cb = Some(opus_settings_cb);
@@ -254,6 +278,18 @@ impl Ps5Session {
             let mut audio_sink = ChiakiAudioSink::default();
             chiaki_opus_decoder_get_sink(opus_decoder.as_mut(), &mut audio_sink);
             session.audio_sink = audio_sink;
+
+            chiaki_opus_encoder_init(opus_encoder.as_mut(), logger.as_mut_ptr());
+            let mut mic_header = ChiakiAudioHeader {
+                channels: MIC_CHANNELS,
+                bits: 16,
+                rate: MIC_SAMPLE_RATE,
+                frame_size: MIC_FRAME_SAMPLES,
+                ..Default::default()
+            };
+            // SAFETY: opus_encoder was initialized above and session was initialized by chiaki_session_init.
+            chiaki_opus_encoder_header(&mut mic_header, opus_encoder.as_mut(), session.as_mut());
+
             if config.enable_dualsense {
                 session.haptics_sink = ChiakiAudioSink {
                     user: ctx_ptr.cast(),
@@ -270,6 +306,7 @@ impl Ps5Session {
         let start_err = unsafe { chiaki_session_start(session.as_mut()) };
         if start_err != gnsh_chiaki_sys::ChiakiErrorCode_CHIAKI_ERR_SUCCESS {
             unsafe {
+                chiaki_opus_encoder_fini(opus_encoder.as_mut());
                 chiaki_session_fini(session.as_mut());
                 chiaki_opus_decoder_fini(opus_decoder.as_mut());
                 drop(Box::from_raw(ctx_ptr));
@@ -281,17 +318,58 @@ impl Ps5Session {
         let handle = Self {
             session,
             opus_decoder,
+            opus_encoder,
             _logger: logger,
             ctx: ctx_ptr,
             rtt_probe,
+            usb_haptics_active,
+            mic_connected: false,
+            mic_muted: true,
             started: true,
         };
         let channels = SessionChannels {
             video_rx,
             audio_rx,
+            haptics_rx,
             events_rx,
         };
         Ok((handle, channels))
+    }
+
+    /// Returns the shared flag indicating whether 4-channel USB DualSense haptics output is active.
+    pub fn usb_haptics_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.usb_haptics_active)
+    }
+
+    /// Returns whether the Remote Play uplink microphone is currently muted.
+    pub fn is_mic_muted(&self) -> bool {
+        self.mic_muted
+    }
+
+    /// Connects the PS5 microphone stream if needed and updates mute state.
+    pub fn set_mic_muted(&mut self, muted: bool) -> Result<()> {
+        if !muted && !self.mic_connected {
+            // SAFETY: self.session is a live, started ChiakiSession owned by Ps5Session.
+            check_chiaki(unsafe { chiaki_session_connect_microphone(self.session.as_mut()) })?;
+            self.mic_connected = true;
+        }
+        // SAFETY: libchiaki's ctrl_message_toggle_microphone interprets true as unmute (byte[2]=1)
+        // and false as mute (byte[2]=0), so pass !muted to align with caller semantics.
+        check_chiaki(unsafe { chiaki_session_toggle_microphone(self.session.as_mut(), !muted) })?;
+        self.mic_muted = muted;
+        Ok(())
+    }
+
+    /// Encodes and transmits one 10 ms stereo 48 kHz PCM microphone frame when unmuted.
+    pub fn send_mic_pcm(&mut self, pcm: &mut [i16; MIC_FRAME_PCM_LEN]) {
+        if !self.mic_connected || self.mic_muted {
+            return;
+        }
+        // SAFETY: pcm has exact length 960 (480 stereo samples @ 48 kHz) matching mic_header,
+        // and self.opus_encoder remains initialized for the lifetime of self.session.
+        unsafe {
+            chiaki_opus_encoder_frame(pcm.as_mut_ptr(), self.opus_encoder.as_mut());
+        }
     }
 
     pub fn send_controller_state(&mut self, state: &ControllerState) -> Result<()> {
@@ -560,6 +638,7 @@ impl Drop for Ps5Session {
             self.started = false;
         }
         unsafe {
+            chiaki_opus_encoder_fini(self.opus_encoder.as_mut());
             chiaki_session_fini(self.session.as_mut());
             chiaki_opus_decoder_fini(self.opus_decoder.as_mut());
             if !self.ctx.is_null() {
@@ -648,14 +727,37 @@ pub fn haptics_pcm_to_rumble(buf: &[u8]) -> Option<(u8, u8)> {
     Some((scale_channel(sum_l), scale_channel(sum_r)))
 }
 
+/// Decodes little-endian signed 16-bit stereo haptics bytes into interleaved `i16` samples.
+pub fn haptics_bytes_to_i16(buf: &[u8]) -> Option<Vec<i16>> {
+    if buf.len() < 4 || !buf.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut samples = Vec::with_capacity(buf.len() / 2);
+    for &[lo, hi] in buf.as_chunks::<2>().0 {
+        samples.push(i16::from_le_bytes([lo, hi]));
+    }
+    Some(samples)
+}
+
 unsafe extern "C" fn haptics_frame_cb(buf: *mut u8, buf_size: usize, user: *mut c_void) {
-    if buf.is_null() || buf_size < 4 || user.is_null() {
+    if buf.is_null() || buf_size < 4 || !buf_size.is_multiple_of(4) || user.is_null() {
         return;
     }
     // SAFETY: libchiaki invokes haptics_sink.frame_cb synchronously with a valid buffer of buf_size
     // bytes while SessionCallbacksCtx stays pinned until chiaki_session_join completes in Drop.
     let ctx = unsafe { &*(user.cast::<SessionCallbacksCtx>()) };
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_size) };
+    if ctx.usb_haptics_active.load(Ordering::Relaxed) {
+        if let Some(samples) = haptics_bytes_to_i16(slice) {
+            let _ = ctx.haptics_tx.try_send(HapticsPcmFrame { samples });
+        }
+        if ctx.last_haptics_rumble.swap(0, Ordering::Relaxed) != 0 {
+            let _ = ctx
+                .event_tx
+                .try_send(SessionEvent::Rumble { left: 0, right: 0 });
+        }
+        return;
+    }
     let Some((left, right)) = haptics_pcm_to_rumble(slice) else {
         return;
     };
@@ -818,5 +920,17 @@ mod tests {
         burst.extend_from_slice(&20_000_i16.to_le_bytes());
         burst.extend_from_slice(&(-4_000_i16).to_le_bytes());
         assert_eq!(haptics_pcm_to_rumble(&burst), Some((156, 31)));
+    }
+
+    #[test]
+    fn haptics_bytes_to_i16_decodes_le_pairs_and_rejects_unaligned() {
+        assert_eq!(haptics_bytes_to_i16(&[]), None);
+        assert_eq!(haptics_bytes_to_i16(&[1, 2, 3]), None);
+        assert_eq!(haptics_bytes_to_i16(&[1, 2, 3, 4, 5]), None);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(-1234_i16).to_le_bytes());
+        bytes.extend_from_slice(&5678_i16.to_le_bytes());
+        assert_eq!(haptics_bytes_to_i16(&bytes), Some(vec![-1234, 5678]));
     }
 }

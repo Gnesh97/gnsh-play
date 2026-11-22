@@ -4,10 +4,13 @@ mod egui_d3d11;
 mod storage;
 
 use anyhow::{Context as _, Result};
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, select};
 use egui_d3d11::EguiD3d11Painter;
 use gnsh_input::{AppWindow, GamepadManager};
-use gnsh_media::{AudioOutput, D3D11Renderer, DecodedFrame, MediaCodec, VideoDecoder};
+use gnsh_media::{
+    AudioOutput, D3D11Renderer, DecodedFrame, HapticsAudioOutput, MediaCodec, MicCapture,
+    VideoDecoder,
+};
 use gnsh_proto::{
     ConsoleState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, Ps5Session,
     Ps5SessionConfig, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES, VideoCodec, VideoPreset,
@@ -24,6 +27,9 @@ use std::time::{Duration, Instant};
 use storage::{ConsoleStore, SavedConsole, SettingsStore, StoredSettings};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::HSTRING;
@@ -320,7 +326,16 @@ fn run_gui() -> Result<()> {
             )));
         }
 
-        app.handle_shortcuts(summary.toggle_hud, summary.escape_pressed);
+        app.handle_shortcuts(
+            summary.toggle_hud,
+            summary.escape_pressed,
+            summary.toggle_mic,
+        );
+        if summary.audio_devices_changed
+            && let AppMode::Streaming(ref stream) = app.mode
+        {
+            stream.haptics_recheck.store(true, Ordering::Release);
+        }
         app.poll_background(&mut gamepads);
 
         raw_input.time = Some(start_time.elapsed().as_secs_f64());
@@ -515,6 +530,34 @@ impl RegisterModal {
     }
 }
 
+struct SleepInhibitor;
+
+impl SleepInhibitor {
+    fn acquire() -> Self {
+        // SAFETY: SetThreadExecutionState updates only the calling UI thread's idle-timer state
+        // until Drop restores ES_CONTINUOUS.
+        let prev = unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+        };
+        tracing::debug!(
+            prev_flags = prev.0,
+            "Acquired Win32 display/sleep inhibitor"
+        );
+        Self
+    }
+}
+
+impl Drop for SleepInhibitor {
+    fn drop(&mut self) {
+        // SAFETY: Restores default display/sleep policy on the UI thread after stream shutdown.
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        tracing::debug!(
+            prev_flags = prev.0,
+            "Released Win32 display/sleep inhibitor"
+        );
+    }
+}
+
 struct LatestFrame {
     frame: DecodedFrame,
     decode_ms: f32,
@@ -540,6 +583,14 @@ struct ActiveStream {
     stop_flag: Arc<AtomicBool>,
     video_thread: Option<JoinHandle<()>>,
     audio_thread: Option<JoinHandle<()>>,
+    usb_haptics_active: Arc<AtomicBool>,
+    haptics_recheck: Arc<AtomicBool>,
+    haptics_device_label: Arc<Mutex<Option<String>>>,
+    mic_capture: Option<MicCapture>,
+    mic_muted: bool,
+    mic_toggle_requested: bool,
+    mic_error: Option<String>,
+    _sleep_inhibitor: SleepInhibitor,
     connected: bool,
     show_hud: bool,
     disconnect_requested: bool,
@@ -597,6 +648,10 @@ impl ActiveStream {
         let idr_needed = Arc::new(AtomicBool::new(false));
         let video_init_error = Arc::new(Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let usb_haptics_active = session.usb_haptics_flag();
+        let haptics_recheck = Arc::new(AtomicBool::new(false));
+        let haptics_device_label = Arc::new(Mutex::new(None));
+        let sleep_inhibitor = SleepInhibitor::acquire();
 
         let video_args = VideoWorkerArgs {
             codec: media_codec,
@@ -615,10 +670,23 @@ impl ActiveStream {
             .context("failed spawning video decode thread")?;
 
         let audio_rx = channels.audio_rx;
+        let haptics_rx = channels.haptics_rx;
+        let audio_usb_active = Arc::clone(&usb_haptics_active);
+        let audio_haptics_recheck = Arc::clone(&haptics_recheck);
+        let audio_haptics_label = Arc::clone(&haptics_device_label);
         let audio_stop = Arc::clone(&stop_flag);
         let audio_thread = thread::Builder::new()
             .name("gnsh-audio-out".into())
-            .spawn(move || run_audio_output_loop(audio_rx, audio_stop))
+            .spawn(move || {
+                run_audio_output_loop(
+                    audio_rx,
+                    haptics_rx,
+                    audio_usb_active,
+                    audio_haptics_recheck,
+                    audio_haptics_label,
+                    audio_stop,
+                )
+            })
             .context("failed spawning audio output thread")?;
 
         Ok(Self {
@@ -635,6 +703,14 @@ impl ActiveStream {
             stop_flag,
             video_thread: Some(video_thread),
             audio_thread: Some(audio_thread),
+            usb_haptics_active,
+            haptics_recheck,
+            haptics_device_label,
+            mic_capture: None,
+            mic_muted: true,
+            mic_toggle_requested: false,
+            mic_error: None,
+            _sleep_inhibitor: sleep_inhibitor,
             connected: false,
             show_hud: true,
             disconnect_requested: false,
@@ -656,16 +732,60 @@ impl ActiveStream {
         })
     }
 
+    fn toggle_mic(&mut self, gamepads: &GamepadManager) {
+        if !self.connected {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let target_muted = !self.mic_muted;
+        if !target_muted && self.mic_capture.is_none() {
+            match MicCapture::new_default() {
+                Ok(cap) => self.mic_capture = Some(cap),
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    tracing::warn!("Microphone initialization failed: {msg}");
+                    self.mic_error = Some(msg);
+                    return;
+                }
+            }
+        }
+        if let Some(cap) = self.mic_capture.as_mut()
+            && let Err(err) = cap.set_muted(target_muted)
+        {
+            let msg = format!("{err:#}");
+            tracing::warn!("Microphone capture state update failed: {msg}");
+            self.mic_error = Some(msg);
+            return;
+        }
+        if let Err(err) = session.set_mic_muted(target_muted) {
+            let msg = format!("{err:#}");
+            tracing::warn!("PS5 microphone state update failed: {msg}");
+            if let Some(cap) = self.mic_capture.as_mut() {
+                let _ = cap.set_muted(true);
+            }
+            self.mic_error = Some(msg);
+            return;
+        }
+        self.mic_muted = target_muted;
+        self.mic_error = None;
+        gamepads.set_mic_led(target_muted);
+        tracing::info!(muted = target_muted, "Stream microphone state changed");
+    }
+
     fn shutdown(&mut self) {
         if self.session.is_none()
             && self.video_thread.is_none()
             && self.audio_thread.is_none()
+            && self.mic_capture.is_none()
             && self.current_frame.is_none()
         {
             return;
         }
         tracing::info!(host = %self.console_host, "Shutting down active stream session");
         self.stop_flag.store(true, Ordering::Relaxed);
+        self.mic_capture = None;
         // Drop queued D3D11VA/AVFrame surfaces before joining the decode worker and destroying its context.
         self.current_frame = None;
         if let Ok(mut guard) = self.shared_latest.lock() {
@@ -790,8 +910,37 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
     }
 }
 
+fn refresh_usb_haptics(
+    haptics: &mut Option<HapticsAudioOutput>,
+    usb_haptics_active: &AtomicBool,
+    haptics_device_label: &Mutex<Option<String>>,
+) {
+    let prev_active = haptics.is_some();
+    *haptics = None;
+    *haptics = HapticsAudioOutput::try_open_dualsense();
+    let active = haptics.is_some();
+    usb_haptics_active.store(active, Ordering::Release);
+    if let Ok(mut guard) = haptics_device_label.lock() {
+        *guard = haptics.as_ref().map(|h| h.device_name().to_string());
+    }
+    if let Some(hap) = haptics.as_ref() {
+        tracing::info!(
+            device = %hap.device_name(),
+            "DualSense USB 4-channel haptics active"
+        );
+    } else if prev_active {
+        tracing::info!("DualSense USB audio removed, falling back to motor rumble haptics");
+    } else {
+        tracing::debug!("No 4-channel DualSense USB audio found; using motor rumble haptics");
+    }
+}
+
 fn run_audio_output_loop(
     audio_rx: Receiver<gnsh_proto::AudioPcmFrame>,
+    haptics_rx: Receiver<gnsh_proto::HapticsPcmFrame>,
+    usb_haptics_active: Arc<AtomicBool>,
+    haptics_recheck: Arc<AtomicBool>,
+    haptics_device_label: Arc<Mutex<Option<String>>>,
     stop_flag: Arc<AtomicBool>,
 ) {
     let mut audio = match AudioOutput::new(2, 48_000) {
@@ -802,20 +951,48 @@ fn run_audio_output_loop(
         }
     };
 
+    let mut haptics: Option<HapticsAudioOutput> = None;
+    refresh_usb_haptics(&mut haptics, &usb_haptics_active, &haptics_device_label);
+
     while !stop_flag.load(Ordering::Relaxed) {
-        match audio_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(frame) => {
-                if let Some(out) = audio.as_mut()
-                    && let Err(err) =
-                        out.push_pcm(&frame.samples, frame.channels, frame.sample_rate)
-                {
-                    tracing::warn!("Audio push_pcm failed: {err:#}");
+        if haptics_recheck.swap(false, Ordering::AcqRel) {
+            refresh_usb_haptics(&mut haptics, &usb_haptics_active, &haptics_device_label);
+        }
+
+        select! {
+            recv(audio_rx) -> msg => match msg {
+                Ok(frame) => {
+                    if let Some(out) = audio.as_mut()
+                        && let Err(err) =
+                            out.push_pcm(&frame.samples, frame.channels, frame.sample_rate)
+                    {
+                        tracing::warn!("Audio push_pcm failed: {err:#}");
+                    }
                 }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+                Err(_) => break,
+            },
+            recv(haptics_rx) -> msg => match msg {
+                Ok(frame) => {
+                    if let Some(hap) = haptics.as_mut()
+                        && let Err(err) = hap.push_stereo_3khz(&frame.samples)
+                    {
+                        tracing::warn!(
+                            "DualSense USB haptics push failed, falling back to rumble: {err:#}"
+                        );
+                        haptics = None;
+                        usb_haptics_active.store(false, Ordering::Release);
+                        if let Ok(mut guard) = haptics_device_label.lock() {
+                            *guard = None;
+                        }
+                    }
+                }
+                Err(_) => break,
+            },
+            default(Duration::from_millis(50)) => {}
         }
     }
+
+    usb_haptics_active.store(false, Ordering::Release);
 }
 
 enum AppMode {
@@ -910,7 +1087,7 @@ impl AppState {
         self.wake_rx = Some(rx);
     }
 
-    fn handle_shortcuts(&mut self, toggle_hud: bool, escape_pressed: bool) {
+    fn handle_shortcuts(&mut self, toggle_hud: bool, escape_pressed: bool, toggle_mic: bool) {
         match &mut self.mode {
             AppMode::Home => {
                 if escape_pressed && self.register_modal.is_some() {
@@ -920,6 +1097,9 @@ impl AppState {
             AppMode::Streaming(stream) => {
                 if toggle_hud {
                     stream.show_hud = !stream.show_hud;
+                }
+                if toggle_mic {
+                    stream.mic_toggle_requested = true;
                 }
                 if escape_pressed {
                     stream.disconnect_requested = true;
@@ -1055,6 +1235,7 @@ impl AppState {
                     SessionEvent::Connected => {
                         stream.connected = true;
                         tracing::info!(host = %stream.console_host, "Stream session connected");
+                        gamepads.set_mic_led(stream.mic_muted);
                         if let Some(session) = stream.session.as_mut() {
                             match session.tune_udp_recv_buffer(UDP_RECV_BUF_BYTES) {
                                 Ok(actual) => {
@@ -1116,6 +1297,20 @@ impl AppState {
             }
 
             if stream_quit_banner.is_none() {
+                let gamepad_mic_toggle = gamepads.take_mic_toggle();
+                let ui_mic_toggle = std::mem::take(&mut stream.mic_toggle_requested);
+                if gamepad_mic_toggle || ui_mic_toggle {
+                    stream.toggle_mic(gamepads);
+                }
+
+                if stream.connected
+                    && !stream.mic_muted
+                    && let Some(cap) = stream.mic_capture.as_mut()
+                    && let Some(session) = stream.session.as_mut()
+                {
+                    cap.drain_frames(|pcm| session.send_mic_pcm(pcm));
+                }
+
                 if stream
                     .rumble_active_until
                     .is_some_and(|until| Instant::now() >= until)
@@ -1247,6 +1442,7 @@ impl AppState {
             stream.shutdown();
             gamepads.set_rumble(0, 0);
             gamepads.set_led(0, 0, 0);
+            gamepads.set_mic_led(false);
             gamepads.clear_trigger_effects();
             if let Some(b) = banner {
                 self.status_banner = Some(b);
@@ -2009,6 +2205,32 @@ fn render_streaming_ui(
                             }
 
                             ui.separator();
+
+                            let (mic_label, mic_fill) = if stream.mic_muted {
+                                ("Mic: Muted", egui::Color32::from_rgb(56, 66, 86))
+                            } else {
+                                ("Mic: LIVE", egui::Color32::from_rgb(38, 134, 82))
+                            };
+                            let mic_btn = ui
+                                .add_enabled(
+                                    stream.connected,
+                                    egui::Button::new(
+                                        egui::RichText::new(mic_label)
+                                            .small()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(mic_fill),
+                                )
+                                .on_hover_text(
+                                    stream.mic_error.as_deref().unwrap_or(
+                                        "Toggle microphone uplink (Ctrl+M or DualSense Mute button).",
+                                    ),
+                                );
+                            if mic_btn.clicked() {
+                                stream.mic_toggle_requested = true;
+                            }
+
+                            ui.separator();
                             ui.checkbox(touchpad_touch, "Touchpad Touch")
                                 .on_hover_text("Off: click-only. On: capacitive touch/swipe.");
                         });
@@ -2026,6 +2248,11 @@ fn render_streaming_ui(
                             Some(kib) => format!("{kib} KiB"),
                             None => "default".to_string(),
                         };
+                        let haptics_label = if stream.usb_haptics_active.load(Ordering::Relaxed) {
+                            "DualSense USB (4ch)"
+                        } else {
+                            "Rumble"
+                        };
 
                         ui.label(
                             egui::RichText::new(format!(
@@ -2038,14 +2265,19 @@ fn render_streaming_ui(
                             .small()
                             .color(egui::Color32::from_rgb(206, 216, 234)),
                         );
-                        ui.label(
+                        let telemetry_line = ui.label(
                             egui::RichText::new(format!(
-                                "Decode: {} ({})  |  UDP Buf: {}  |  Gamepad: {}",
-                                decode_ms_text, decoder_badge, udp_buf_text, pad_label
+                                "Decode: {} ({})  |  UDP Buf: {}  |  Gamepad: {}  |  Haptics: {}",
+                                decode_ms_text, decoder_badge, udp_buf_text, pad_label, haptics_label
                             ))
                             .small()
                             .color(egui::Color32::from_rgb(184, 196, 218)),
                         );
+                        if let Ok(guard) = stream.haptics_device_label.lock()
+                            && let Some(ref dev_name) = *guard
+                        {
+                            telemetry_line.on_hover_text(format!("USB haptics device: {dev_name}"));
+                        }
 
                         if lost_total > 0 {
                             let recent_loss = stream
@@ -2065,7 +2297,7 @@ fn render_streaming_ui(
 
                         ui.label(
                             egui::RichText::new(
-                                "F3: Toggle HUD   |   F11: Fullscreen   |   Esc: Disconnect",
+                                "F3: Toggle HUD   |   F11: Fullscreen   |   Ctrl+M: Toggle Mic   |   Esc: Disconnect",
                             )
                             .small()
                             .weak(),

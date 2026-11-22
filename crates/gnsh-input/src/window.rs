@@ -13,6 +13,8 @@ pub struct WindowEventSummary {
     pub toggle_fullscreen: bool,
     pub toggle_hud: bool,
     pub escape_pressed: bool,
+    pub toggle_mic: bool,
+    pub audio_devices_changed: bool,
 }
 
 /// Desktop SDL3 window exposing a Win32 `HWND` and translating events into `egui::RawInput`.
@@ -220,10 +222,16 @@ impl AppWindow {
                 ffi::SDL_EventType_SDL_EVENT_GAMEPAD_ADDED => {
                     let which = unsafe { event.gdevice.which };
                     gamepads.on_device_added(which);
+                    summary.audio_devices_changed = true;
                 }
                 ffi::SDL_EventType_SDL_EVENT_GAMEPAD_REMOVED => {
                     let which = unsafe { event.gdevice.which };
                     gamepads.on_device_removed(which);
+                    summary.audio_devices_changed = true;
+                }
+                ffi::SDL_EventType_SDL_EVENT_AUDIO_DEVICE_ADDED
+                | ffi::SDL_EventType_SDL_EVENT_AUDIO_DEVICE_REMOVED => {
+                    summary.audio_devices_changed = true;
                 }
                 _ => {}
             }
@@ -271,6 +279,7 @@ impl AppWindow {
                         raw_input.events.push(egui::Event::Paste(clipboard));
                     }
                 }
+                ffi::SDLK_M if !key_ev.repeat => summary.toggle_mic = true,
                 _ => {}
             }
         }

@@ -16,7 +16,7 @@ fn main() {
         .header("wrapper.h")
         .clang_arg(format!("-I{}", mingw_inc.display()))
         .clang_arg("-D_WIN32")
-        .allowlist_function("av_.*|avcodec_.*|SDL_InitSubSystem|SDL_OpenAudioDeviceStream|SDL_PutAudioStreamData|SDL_GetAudioStreamQueued|SDL_ClearAudioStream|SDL_ResumeAudioStreamDevice|SDL_DestroyAudioStream|SDL_GetError")
+        .allowlist_function("av_.*|avcodec_.*|SDL_InitSubSystem|SDL_OpenAudioDeviceStream|SDL_PutAudioStreamData|SDL_GetAudioStreamQueued|SDL_GetAudioStreamAvailable|SDL_GetAudioStreamData|SDL_ClearAudioStream|SDL_PauseAudioStreamDevice|SDL_ResumeAudioStreamDevice|SDL_DestroyAudioStream|SDL_GetAudioPlaybackDevices|SDL_GetAudioRecordingDevices|SDL_GetAudioDeviceName|SDL_GetAudioDeviceFormat|SDL_free|SDL_GetError")
         .allowlist_type("AV.*|SDL_AudioSpec|SDL_AudioFormat|SDL_AudioStream|SDL_AudioDeviceID")
         .allowlist_var("AV.*|GNSH_.*|SDL_INIT_AUDIO|SDL_AUDIO_.*")
         .derive_default(true)

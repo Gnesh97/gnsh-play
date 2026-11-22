@@ -8,6 +8,7 @@
 #include <chiaki/discoveryservice.h>
 #include <chiaki/feedback.h>
 #include <chiaki/opusdecoder.h>
+#include <chiaki/opusencoder.h>
 #include <chiaki/regist.h>
 #include <chiaki/session.h>
 #include <chiaki/takion.h>
