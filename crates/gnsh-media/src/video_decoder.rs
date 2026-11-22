@@ -65,6 +65,11 @@ pub struct VideoDecoder {
 
 unsafe impl Send for VideoDecoder {}
 
+enum DrainOutcome {
+    Done,
+    FallbackToSw,
+}
+
 impl VideoDecoder {
     pub fn new(codec: MediaCodec, d3d11_device: Option<ID3D11Device>) -> Result<Self> {
         if let Some(dev) = d3d11_device
@@ -79,16 +84,35 @@ impl VideoDecoder {
         self.hw_active
     }
 
+    /// Flushes buffered reference frames in FFmpeg after severe packet corruption.
+    pub fn flush(&mut self) {
+        unsafe {
+            ffi::avcodec_flush_buffers(self.ctx);
+        }
+    }
+
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
         if annex_b.is_empty() {
             return Ok(Vec::new());
         }
 
-        let send_err = unsafe {
+        let mut frames = Vec::new();
+        let mut send_err = unsafe {
             (*self.pkt).data = annex_b.as_ptr().cast_mut();
             (*self.pkt).size = annex_b.len() as i32;
             ffi::avcodec_send_packet(self.ctx, self.pkt)
         };
+
+        if send_err == ffi::GNSH_AVERROR_EAGAIN {
+            if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackToSw) {
+                return self.decode(annex_b);
+            }
+            send_err = unsafe {
+                (*self.pkt).data = annex_b.as_ptr().cast_mut();
+                (*self.pkt).size = annex_b.len() as i32;
+                ffi::avcodec_send_packet(self.ctx, self.pkt)
+            };
+        }
 
         if send_err < 0 && send_err != ffi::GNSH_AVERROR_EAGAIN {
             if self.hw_active && !self.decoded_any {
@@ -103,11 +127,18 @@ impl VideoDecoder {
             bail!("avcodec_send_packet failed: {}", av_err_string(send_err));
         }
 
-        let mut frames = Vec::new();
+        if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackToSw) {
+            return self.decode(annex_b);
+        }
+
+        Ok(frames)
+    }
+
+    fn drain_frames(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<DrainOutcome> {
         loop {
             let r = unsafe { ffi::avcodec_receive_frame(self.ctx, self.frame) };
             if r == ffi::GNSH_AVERROR_EAGAIN || r == ffi::GNSH_AVERROR_EOF {
-                break;
+                return Ok(DrainOutcome::Done);
             }
             if r < 0 {
                 if self.hw_active && !self.decoded_any {
@@ -117,7 +148,7 @@ impl VideoDecoder {
                     );
                     let sw = Self::open_internal(self.codec, None)?;
                     *self = sw;
-                    return self.decode(annex_b);
+                    return Ok(DrainOutcome::FallbackToSw);
                 }
                 bail!("avcodec_receive_frame failed: {}", av_err_string(r));
             }
@@ -130,8 +161,6 @@ impl VideoDecoder {
                 ffi::av_frame_unref(self.frame);
             }
         }
-
-        Ok(frames)
     }
 
     fn open_internal(codec: MediaCodec, d3d11_device: Option<ID3D11Device>) -> Result<Self> {
@@ -402,6 +431,15 @@ fn av_err_string(err: i32) -> String {
 mod tests {
     use super::*;
 
+    // Valid 64x64 H.264 Baseline Annex-B SPS + PPS + IDR NAL generated via FFmpeg libx264.
+    const TEST_H264_IDR: &[u8] = &[
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x0A, 0xD9, 0x04, 0x26, 0xC0, 0x44, 0x00, 0x00,
+        0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xCA, 0x3C, 0x48, 0x99, 0x20, 0x00, 0x00, 0x00,
+        0x01, 0x68, 0xCB, 0x83, 0xCB, 0x20, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x04, 0xBC, 0x46,
+        0x28, 0x00, 0x0C, 0xC4, 0xC7, 0x00, 0x01, 0x7D, 0x68, 0xE0, 0x00, 0x22, 0x43, 0x27, 0x27,
+        0x27, 0x5D, 0x75, 0xD7, 0x5D, 0x75, 0xD7, 0x5D, 0x75, 0xD7, 0x80,
+    ];
+
     #[test]
     fn initializes_h264_software_decoder_and_decodes_idr_frame() {
         let mut decoder =
@@ -410,16 +448,9 @@ mod tests {
 
         assert!(decoder.decode(&[]).expect("empty input ok").is_empty());
 
-        // Valid 64x64 H.264 Baseline Annex-B SPS + PPS + IDR NAL generated via FFmpeg libx264.
-        let idr = [
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x0A, 0xD9, 0x04, 0x26, 0xC0, 0x44, 0x00,
-            0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xCA, 0x3C, 0x48, 0x99, 0x20, 0x00,
-            0x00, 0x00, 0x01, 0x68, 0xCB, 0x83, 0xCB, 0x20, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84,
-            0x04, 0xBC, 0x46, 0x28, 0x00, 0x0C, 0xC4, 0xC7, 0x00, 0x01, 0x7D, 0x68, 0xE0, 0x00,
-            0x22, 0x43, 0x27, 0x27, 0x27, 0x5D, 0x75, 0xD7, 0x5D, 0x75, 0xD7, 0x5D, 0x75, 0xD7,
-            0x80,
-        ];
-        let frames = decoder.decode(&idr).expect("valid H.264 IDR decodes");
+        let frames = decoder
+            .decode(TEST_H264_IDR)
+            .expect("valid H.264 IDR decodes");
         assert_eq!(frames.len(), 1);
         match &frames[0] {
             DecodedFrame::SoftwareYuv420 { width, height, .. } => {
@@ -427,5 +458,20 @@ mod tests {
             }
             DecodedFrame::D3D11(_) => panic!("expected software YUV420 frame"),
         }
+    }
+
+    #[test]
+    fn flushes_and_decodes_subsequent_idr_frame() {
+        let mut decoder =
+            VideoDecoder::new(MediaCodec::H264, None).expect("FFmpeg H264 decoder initializes");
+        let first = decoder.decode(TEST_H264_IDR).expect("first IDR decodes");
+        assert_eq!(first.len(), 1);
+
+        decoder.flush();
+
+        let second = decoder
+            .decode(TEST_H264_IDR)
+            .expect("IDR decodes cleanly after flush");
+        assert_eq!(second.len(), 1);
     }
 }

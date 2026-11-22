@@ -175,7 +175,7 @@ impl Ps5Session {
 
         let mut logger = ChiakiLogger::new(false);
 
-        let (video_tx, video_rx) = crossbeam_channel::bounded(8);
+        let (video_tx, video_rx) = crossbeam_channel::bounded(32);
         let (audio_tx, audio_rx) = crossbeam_channel::bounded(32);
         let (event_tx, events_rx) = crossbeam_channel::bounded(64);
 
@@ -227,7 +227,9 @@ impl Ps5Session {
             enable_keyboard: false,
             enable_dualsense: config.enable_dualsense,
             packet_loss_max: 0.05,
-            enable_idr_on_fec_failure: true,
+            // Upstream chiaki-ng defaults this to false: requesting IDR on every FEC miss locks
+            // libchiaki into waiting_for_idr when high-entropy IDR keyframes themselves drop units.
+            enable_idr_on_fec_failure: false,
             ..Default::default()
         };
 

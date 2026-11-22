@@ -13,6 +13,8 @@ use gnsh_proto::{
     open_psn_login_in_browser, register_ps5, wake_ps5,
 };
 use std::collections::VecDeque;
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -29,6 +31,7 @@ const DEFAULT_HEIGHT: u32 = 720;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 const IDR_COOLDOWN: Duration = Duration::from_millis(500);
+const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliAction {
@@ -93,13 +96,120 @@ fn print_usage() {
     );
 }
 
-fn run_gui() -> Result<()> {
+struct TeeLogMakeWriter {
+    file: Option<Arc<Mutex<std::fs::File>>>,
+}
+
+struct TeeLogWriter {
+    file: Option<Arc<Mutex<std::fs::File>>>,
+    stderr: std::io::Stderr,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeLogMakeWriter {
+    type Writer = TeeLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeLogWriter {
+            file: self.file.as_ref().map(Arc::clone),
+            stderr: std::io::stderr(),
+        }
+    }
+}
+
+impl std::io::Write for TeeLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.stderr.write_all(buf);
+        if let Some(ref lock) = self.file
+            && let Ok(mut file) = lock.lock()
+        {
+            let _ = file.write_all(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.stderr.flush();
+        if let Some(ref lock) = self.file
+            && let Ok(mut file) = lock.lock()
+        {
+            let _ = file.flush();
+        }
+        Ok(())
+    }
+}
+
+fn default_log_path() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("gnsh-play").join("gnsh-play.log")
+}
+
+/// Initializes stderr + `%APPDATA%\gnsh-play\gnsh-play.log` tracing output and panic capture.
+fn init_logging() -> PathBuf {
+    let log_path = default_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(meta) = std::fs::metadata(&log_path)
+        && meta.len() > MAX_LOG_FILE_BYTES
+    {
+        let _ = std::fs::File::create(&log_path);
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok()
+        .map(|f| Arc::new(Mutex::new(f)));
+
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_writer(TeeLogMakeWriter {
+            file: file.as_ref().map(Arc::clone),
+        })
         .try_init();
+
+    let panic_path = log_path.clone();
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "unknown panic payload"
+        };
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        tracing::error!("PANIC at {location}: {payload}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_path)
+        {
+            let _ = writeln!(f, "PANIC at {location}: {payload}");
+        }
+        prev_hook(info);
+    }));
+
+    tracing::info!(
+        "gnsh-play {} starting; log file: {}",
+        env!("CARGO_PKG_VERSION"),
+        log_path.display()
+    );
+    log_path
+}
+
+fn run_gui() -> Result<()> {
+    let _log_path = init_logging();
 
     init_lib().context("failed to initialize Remote Play library")?;
 
@@ -429,6 +539,14 @@ impl ActiveStream {
         let (session, channels) = Ps5Session::start(config)
             .with_context(|| format!("failed starting Remote Play session to {}", console.host))?;
 
+        tracing::info!(
+            host = %console.host,
+            preset = ?settings.preset,
+            codec = ?settings.codec,
+            bitrate_kbps = settings.bitrate_kbps,
+            "Started Remote Play stream session"
+        );
+
         let media_codec = match settings.codec {
             VideoCodec::H264 => MediaCodec::H264,
             VideoCodec::Hevc => MediaCodec::Hevc,
@@ -499,7 +617,13 @@ impl ActiveStream {
     }
 
     fn shutdown(&mut self) {
+        tracing::info!(host = %self.console_host, "Shutting down active stream session");
         self.stop_flag.store(true, Ordering::Relaxed);
+        // Drop queued D3D11VA/AVFrame surfaces before joining the decode worker and destroying its context.
+        self.current_frame = None;
+        if let Ok(mut guard) = self.shared_latest.lock() {
+            *guard = None;
+        }
         if let Some(mut session) = self.session.take() {
             session.stop();
             drop(session);
@@ -514,6 +638,7 @@ impl ActiveStream {
         if let Ok(mut guard) = self.shared_latest.lock() {
             *guard = None;
         }
+        tracing::info!(host = %self.console_host, "Active stream shutdown complete");
     }
 }
 
@@ -553,6 +678,8 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
         "Video decoder ready"
     );
 
+    let mut consecutive_errors: u32 = 0;
+
     while !args.stop_flag.load(Ordering::Relaxed) {
         match args.video_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(pkt) => {
@@ -577,6 +704,7 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                         let count = frames.len() as u64;
                         if count > 0 {
                             args.frames_decoded.fetch_add(count, Ordering::Relaxed);
+                            consecutive_errors = 0;
                         }
                         if let Some(frame) = frames.into_iter().last() {
                             let prev = {
@@ -592,10 +720,19 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                         }
                     }
                     Err(err) => {
+                        consecutive_errors += 1;
                         tracing::warn!(
-                            "Video decode error (frames_lost={}): {err:#}",
-                            pkt.frames_lost
+                            consecutive_errors,
+                            frames_lost = pkt.frames_lost,
+                            "Video decode error: {err:#}"
                         );
+                        if consecutive_errors >= 3 {
+                            tracing::warn!(
+                                "Flushing video decoder after {consecutive_errors} consecutive decode errors"
+                            );
+                            decoder.flush();
+                            consecutive_errors = 0;
+                        }
                         args.idr_needed.store(true, Ordering::Relaxed);
                     }
                 }
@@ -870,6 +1007,7 @@ impl AppState {
                 match ev {
                     SessionEvent::Connected => {
                         stream.connected = true;
+                        tracing::info!(host = %stream.console_host, "Stream session connected");
                         if let Some(session) = stream.session.as_mut() {
                             match session.tune_udp_recv_buffer(UDP_RECV_BUF_BYTES) {
                                 Ok(actual) => {
@@ -904,6 +1042,11 @@ impl AppState {
                         });
                     }
                     SessionEvent::Quit { reason, is_error } => {
+                        if is_error {
+                            tracing::warn!(host = %stream.console_host, "Stream session ended with error: {reason}");
+                        } else {
+                            tracing::info!(host = %stream.console_host, "Stream session disconnected: {reason}");
+                        }
                         stream_quit_banner = Some(if is_error {
                             StatusBanner::error(format!("Session ended: {reason}"))
                         } else {
@@ -1074,6 +1217,11 @@ impl AppState {
                 self.mode = AppMode::Streaming(Box::new(stream));
             }
             Err(err) => {
+                tracing::warn!(
+                    "Unable to connect to {} ({}): {err:#}",
+                    console.name,
+                    console.host
+                );
                 self.status_banner = Some(StatusBanner::error(format!(
                     "Unable to connect to {}: {err:#}",
                     console.name
