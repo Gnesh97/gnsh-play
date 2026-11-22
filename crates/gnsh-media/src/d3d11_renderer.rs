@@ -1,7 +1,8 @@
 use crate::video_decoder::{D3D11Frame, DecodedFrame};
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::ffi::CStr;
-use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -27,9 +28,11 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIDevice1,
+    IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1, IDXGISwapChain2,
 };
+use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::core::{BOOL, Interface as _, PCSTR, s};
 
 const VIDEO_VS_HLSL: &str = r#"
@@ -146,11 +149,26 @@ struct SwYuvTextures {
     v_srv: ID3D11ShaderResourceView,
 }
 
+#[derive(Default)]
+struct Nv12SrvCache {
+    texture_key: (usize, u32, u32),
+    slices: HashMap<u32, (ID3D11ShaderResourceView, ID3D11ShaderResourceView)>,
+}
+
+impl Nv12SrvCache {
+    fn clear(&mut self) {
+        self.texture_key = (0, 0, 0);
+        self.slices.clear();
+    }
+}
+
 pub struct D3D11Renderer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swapchain: IDXGISwapChain1,
     rtv: Option<ID3D11RenderTargetView>,
+    swapchain_flags: u32,
+    frame_latency_waitable: Option<HANDLE>,
     allow_tearing: bool,
     width: u32,
     height: u32,
@@ -159,6 +177,8 @@ pub struct D3D11Renderer {
     ps_yuv420: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     cb_params: ID3D11Buffer,
+    nv12_srv_cache: Nv12SrvCache,
+    last_video_params_key: Option<(u32, u32, u32, u32, u32, u32)>,
     sw_textures: Option<SwYuvTextures>,
 }
 
@@ -167,6 +187,11 @@ impl D3D11Renderer {
         let w = width.max(1);
         let h = height.max(1);
         let (device, context) = create_d3d11_device()?;
+
+        if let Ok(dxgi_dev1) = device.cast::<IDXGIDevice1>() {
+            // SAFETY: Request 1-frame maximum GPU queue depth when supported by the DXGI driver.
+            let _ = unsafe { dxgi_dev1.SetMaximumFrameLatency(1) };
+        }
 
         let dxgi_device: IDXGIDevice = device.cast()?;
         let adapter = unsafe { dxgi_device.GetAdapter()? };
@@ -189,29 +214,66 @@ impl D3D11Renderer {
                 .unwrap_or(false)
         };
 
-        let swapchain_desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: w,
-            Height: h,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: if allow_tearing {
-                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+        let base_flags = if allow_tearing {
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+        } else {
+            0
+        };
+        let waitable_flags =
+            base_flags | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
+        let (swapchain, swapchain_flags) = {
+            let mut swapchain_desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: w,
+                Height: h,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Stereo: false.into(),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                Flags: waitable_flags,
+            };
+
+            if let Ok(sc) = unsafe {
+                factory.CreateSwapChainForHwnd(&device, hwnd, &swapchain_desc, None, None)
+            } {
+                (sc, waitable_flags)
             } else {
-                0
-            },
+                swapchain_desc.Flags = base_flags;
+                let sc = unsafe {
+                    factory.CreateSwapChainForHwnd(&device, hwnd, &swapchain_desc, None, None)?
+                };
+                (sc, base_flags)
+            }
         };
 
-        let swapchain =
-            unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &swapchain_desc, None, None)? };
+        let frame_latency_waitable =
+            if (swapchain_flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32) != 0
+            {
+                swapchain.cast::<IDXGISwapChain2>().ok().and_then(|sc2| {
+                    // SAFETY: swapchain was created with FRAME_LATENCY_WAITABLE_OBJECT; configuring
+                    // latency before acquiring its waitable HANDLE keeps max present queue at 1 frame.
+                    unsafe {
+                        if sc2.SetMaximumFrameLatency(1).is_err() {
+                            return None;
+                        }
+                        let handle = sc2.GetFrameLatencyWaitableObject();
+                        if handle.is_invalid() {
+                            None
+                        } else {
+                            Some(handle)
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+
         let rtv = create_backbuffer_rtv(&device, &swapchain)?;
 
         let vs_blob = compile_hlsl(VIDEO_VS_HLSL, s!("VSMain"), s!("vs_5_0"))?;
@@ -271,6 +333,8 @@ impl D3D11Renderer {
             context,
             swapchain,
             rtv: Some(rtv),
+            swapchain_flags,
+            frame_latency_waitable,
             allow_tearing,
             width: w,
             height: h,
@@ -279,6 +343,8 @@ impl D3D11Renderer {
             ps_yuv420,
             sampler,
             cb_params,
+            nv12_srv_cache: Nv12SrvCache::default(),
+            last_video_params_key: None,
             sw_textures: None,
         })
     }
@@ -310,11 +376,7 @@ impl D3D11Renderer {
         }
         self.rtv = None;
 
-        let flags = if self.allow_tearing {
-            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
-        } else {
-            DXGI_SWAP_CHAIN_FLAG(0)
-        };
+        let flags = DXGI_SWAP_CHAIN_FLAG(self.swapchain_flags as i32);
         unsafe {
             self.swapchain
                 .ResizeBuffers(0, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, flags)?;
@@ -322,7 +384,24 @@ impl D3D11Renderer {
         self.rtv = Some(create_backbuffer_rtv(&self.device, &self.swapchain)?);
         self.width = w;
         self.height = h;
+        self.last_video_params_key = None;
         Ok(())
+    }
+
+    /// Waits up to `timeout_ms` on DXGI's waitable frame-latency object to prevent swapchain queuing.
+    pub fn wait_for_frame_latency(&self, timeout_ms: u32) {
+        if let Some(handle) = self.frame_latency_waitable {
+            // SAFETY: handle is an owned DXGI swapchain latency waitable event opened in new().
+            unsafe {
+                let _ = WaitForSingleObjectEx(handle, timeout_ms, false);
+            }
+        }
+    }
+
+    /// Releases cached video SRVs and constant-buffer keys (called on stream shutdown).
+    pub fn clear_video_cache(&mut self) {
+        self.nv12_srv_cache.clear();
+        self.last_video_params_key = None;
     }
 
     pub fn begin_frame(&self, clear_rgba: [f32; 4]) {
@@ -367,16 +446,22 @@ impl D3D11Renderer {
                 (*width, *height, *width, *height)
             }
         };
-        let params = compute_video_params(fw, fh, tw, th, self.width, self.height);
+        let key = (fw, fh, tw, th, self.width, self.height);
+        if self.last_video_params_key != Some(key) {
+            let params = compute_video_params(fw, fh, tw, th, self.width, self.height);
+            unsafe {
+                self.context.UpdateSubresource(
+                    &self.cb_params,
+                    0,
+                    None,
+                    (&params as *const VideoParams).cast(),
+                    0,
+                    0,
+                );
+            }
+            self.last_video_params_key = Some(key);
+        }
         unsafe {
-            self.context.UpdateSubresource(
-                &self.cb_params,
-                0,
-                None,
-                (&params as *const VideoParams).cast(),
-                0,
-                0,
-            );
             self.context.IASetInputLayout(None);
             self.context
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -389,7 +474,7 @@ impl D3D11Renderer {
         }
 
         match frame {
-            DecodedFrame::D3D11(d3d_frame) => self.draw_d3d11_nv12(d3d_frame)?,
+            DecodedFrame::D3D11(d3d_frame) => self.draw_d3d11_nv12(d3d_frame, tw, th)?,
             DecodedFrame::SoftwareYuv420 {
                 y,
                 u,
@@ -409,43 +494,66 @@ impl D3D11Renderer {
         Ok(())
     }
 
-    fn draw_d3d11_nv12(&self, frame: &D3D11Frame) -> Result<()> {
-        let y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8_UNORM,
-            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
-            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 1,
-                    FirstArraySlice: frame.slice_index,
-                    ArraySize: 1,
-                },
-            },
-        };
-        let uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8_UNORM,
-            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
-            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 1,
-                    FirstArraySlice: frame.slice_index,
-                    ArraySize: 1,
-                },
-            },
-        };
+    fn draw_d3d11_nv12(&mut self, frame: &D3D11Frame, tex_w: u32, tex_h: u32) -> Result<()> {
+        let texture_key = (frame.texture.as_raw() as usize, tex_w, tex_h);
+        if self.nv12_srv_cache.texture_key != texture_key {
+            self.nv12_srv_cache.slices.clear();
+            self.nv12_srv_cache.texture_key = texture_key;
+        }
 
-        let y_srv = unsafe {
-            let mut out = None;
-            self.device
-                .CreateShaderResourceView(&frame.texture, Some(&y_desc), Some(&mut out))?;
-            out.context("CreateShaderResourceView(Y) returned None")?
-        };
-        let uv_srv = unsafe {
-            let mut out = None;
-            self.device
-                .CreateShaderResourceView(&frame.texture, Some(&uv_desc), Some(&mut out))?;
-            out.context("CreateShaderResourceView(UV) returned None")?
+        let slice_index = frame.slice_index;
+        let (y_srv, uv_srv) = match self.nv12_srv_cache.slices.entry(slice_index) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (y, uv) = entry.get();
+                (y.clone(), uv.clone())
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8_UNORM,
+                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            FirstArraySlice: slice_index,
+                            ArraySize: 1,
+                        },
+                    },
+                };
+                let uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8_UNORM,
+                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            FirstArraySlice: slice_index,
+                            ArraySize: 1,
+                        },
+                    },
+                };
+
+                let y_srv = unsafe {
+                    let mut out = None;
+                    self.device.CreateShaderResourceView(
+                        &frame.texture,
+                        Some(&y_desc),
+                        Some(&mut out),
+                    )?;
+                    out.context("CreateShaderResourceView(Y) returned None")?
+                };
+                let uv_srv = unsafe {
+                    let mut out = None;
+                    self.device.CreateShaderResourceView(
+                        &frame.texture,
+                        Some(&uv_desc),
+                        Some(&mut out),
+                    )?;
+                    out.context("CreateShaderResourceView(UV) returned None")?
+                };
+                let (y, uv) = entry.insert((y_srv, uv_srv));
+                (y.clone(), uv.clone())
+            }
         };
 
         unsafe {
@@ -509,6 +617,20 @@ impl D3D11Renderer {
         };
         unsafe { self.swapchain.Present(interval, flags).ok()? };
         Ok(())
+    }
+}
+
+impl Drop for D3D11Renderer {
+    fn drop(&mut self) {
+        self.nv12_srv_cache.clear();
+        if let Some(handle) = self.frame_latency_waitable.take()
+            && !handle.is_invalid()
+        {
+            // SAFETY: handle was returned by IDXGISwapChain2::GetFrameLatencyWaitableObject.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
     }
 }
 

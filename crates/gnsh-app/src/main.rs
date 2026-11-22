@@ -21,14 +21,18 @@ use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use storage::{ConsoleStore, SavedConsole, SettingsStore, StoredSettings};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -39,6 +43,9 @@ const DEFAULT_HEIGHT: u32 = 720;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 const IDR_COOLDOWN: Duration = Duration::from_millis(500);
+const LOW_LATENCY_INPUT_WAIT: Duration = Duration::from_millis(4);
+const IDLE_UI_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const PIPELINE_HISTORY_LEN: usize = 120;
 const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
 const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
@@ -307,8 +314,16 @@ fn run_gui() -> Result<()> {
 
     let mut raw_input = egui::RawInput::default();
     let start_time = Instant::now();
+    let mut was_streaming = false;
+    let mut last_present = Instant::now();
 
     loop {
+        if let AppMode::Streaming(ref stream) = app.mode
+            && !app.settings.vsync
+        {
+            stream.wait_for_frame(LOW_LATENCY_INPUT_WAIT);
+        }
+
         let summary = window.poll_events(&mut gamepads, &mut raw_input);
         if summary.quit {
             break;
@@ -336,11 +351,32 @@ fn run_gui() -> Result<()> {
         {
             stream.haptics_recheck.store(true, Ordering::Release);
         }
-        app.poll_background(&mut gamepads);
+        let got_new_frame = app.poll_background(&mut gamepads);
+
+        let is_streaming = matches!(app.mode, AppMode::Streaming(_));
+        if was_streaming && !is_streaming {
+            renderer.clear_video_cache();
+        }
+        was_streaming = is_streaming;
+
+        let should_render = !is_streaming
+            || app.settings.vsync
+            || got_new_frame
+            || !raw_input.events.is_empty()
+            || summary.resized.is_some()
+            || summary.toggle_fullscreen
+            || summary.toggle_hud
+            || summary.toggle_mic
+            || summary.escape_pressed
+            || last_present.elapsed() >= IDLE_UI_REFRESH_INTERVAL;
+        if !should_render {
+            continue;
+        }
+
+        renderer.wait_for_frame_latency(100);
 
         raw_input.time = Some(start_time.elapsed().as_secs_f64());
 
-        let is_streaming = matches!(app.mode, AppMode::Streaming(_));
         let clear_rgba = if is_streaming {
             [0.0, 0.0, 0.0, 1.0]
         } else {
@@ -389,14 +425,23 @@ fn run_gui() -> Result<()> {
         } else {
             true
         };
-        if let Err(err) = renderer.present(vsync) {
-            tracing::warn!("D3D11 present failed: {err:#}");
+        match renderer.present(vsync) {
+            Ok(()) => {
+                last_present = Instant::now();
+                if let AppMode::Streaming(ref mut stream) = app.mode {
+                    stream.record_present_latency();
+                }
+            }
+            Err(err) => {
+                tracing::warn!("D3D11 present failed: {err:#}");
+            }
         }
 
         app.process_post_ui(&mut gamepads);
     }
 
     app.stop_stream(&mut gamepads, None);
+    renderer.clear_video_cache();
     drop(app);
     drop(painter);
     drop(renderer);
@@ -530,7 +575,9 @@ impl RegisterModal {
     }
 }
 
-struct SleepInhibitor;
+struct SleepInhibitor {
+    high_res_timer_active: bool,
+}
 
 impl SleepInhibitor {
     fn acquire() -> Self {
@@ -539,16 +586,28 @@ impl SleepInhibitor {
         let prev = unsafe {
             SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
         };
+        // SAFETY: 1 ms OS timer resolution sharpens Condvar wait_timeout scheduling for decode-paced
+        // frame wakeups and 250 Hz controller polling; balanced cleanly by timeEndPeriod(1) in Drop.
+        let timer_ok = unsafe { timeBeginPeriod(1) } == 0;
         tracing::debug!(
             prev_flags = prev.0,
+            high_res_timer = timer_ok,
             "Acquired Win32 display/sleep inhibitor"
         );
-        Self
+        Self {
+            high_res_timer_active: timer_ok,
+        }
     }
 }
 
 impl Drop for SleepInhibitor {
     fn drop(&mut self) {
+        if self.high_res_timer_active {
+            // SAFETY: Matches the successful timeBeginPeriod(1) call from acquire().
+            unsafe {
+                let _ = timeEndPeriod(1);
+            }
+        }
         // SAFETY: Restores default display/sleep policy on the UI thread after stream shutdown.
         let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
         tracing::debug!(
@@ -558,10 +617,38 @@ impl Drop for SleepInhibitor {
     }
 }
 
+fn boost_current_thread_priority(worker_name: &str) {
+    // SAFETY: GetCurrentThread returns a pseudo-handle valid for the calling worker thread.
+    if let Err(err) = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) }
+    {
+        tracing::debug!(worker = worker_name, "SetThreadPriority failed: {err:#}");
+    }
+}
+
+fn compute_p50_p95(samples: &VecDeque<f32>) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sorted: Vec<f32> = samples
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .collect();
+    if sorted.is_empty() {
+        return (0.0, 0.0);
+    }
+    sorted.sort_by(f32::total_cmp);
+    let n = sorted.len();
+    let p50 = sorted[n / 2];
+    let p95_idx = ((n * 95) / 100).min(n - 1);
+    (p50, sorted[p95_idx])
+}
+
 struct LatestFrame {
     frame: DecodedFrame,
     decode_ms: f32,
     is_hw: bool,
+    arrived_at: Instant,
 }
 
 struct LoginPinPrompt {
@@ -574,8 +661,9 @@ struct ActiveStream {
     console_host: String,
     session: Option<Ps5Session>,
     events_rx: Receiver<SessionEvent>,
-    shared_latest: Arc<Mutex<Option<LatestFrame>>>,
+    frame_sync: Arc<(Mutex<Option<LatestFrame>>, Condvar)>,
     current_frame: Option<LatestFrame>,
+    current_frame_pending_measure: bool,
     frames_decoded: Arc<AtomicU64>,
     frames_lost_total: Arc<AtomicU64>,
     idr_needed: Arc<AtomicBool>,
@@ -603,6 +691,9 @@ struct ActiveStream {
     packet_loss_pct: f32,
     loss_window_start: Instant,
     loss_history: VecDeque<f32>,
+    pipeline_history: VecDeque<f32>,
+    pipe_p50_ms: f32,
+    pipe_p95_ms: f32,
     bytes_last_count: u64,
     udp_rcvbuf_kib: Option<i32>,
     last_idr_request: Instant,
@@ -642,7 +733,7 @@ impl ActiveStream {
             VideoCodec::Hevc => MediaCodec::Hevc,
         };
 
-        let shared_latest = Arc::new(Mutex::new(None));
+        let frame_sync = Arc::new((Mutex::new(None), Condvar::new()));
         let frames_decoded = Arc::new(AtomicU64::new(0));
         let frames_lost_total = Arc::new(AtomicU64::new(0));
         let idr_needed = Arc::new(AtomicBool::new(false));
@@ -657,7 +748,7 @@ impl ActiveStream {
             codec: media_codec,
             device,
             video_rx: channels.video_rx,
-            shared_latest: Arc::clone(&shared_latest),
+            frame_sync: Arc::clone(&frame_sync),
             frames_decoded: Arc::clone(&frames_decoded),
             frames_lost_total: Arc::clone(&frames_lost_total),
             idr_needed: Arc::clone(&idr_needed),
@@ -694,8 +785,9 @@ impl ActiveStream {
             console_host: console.host.clone(),
             session: Some(session),
             events_rx: channels.events_rx,
-            shared_latest,
+            frame_sync,
             current_frame: None,
+            current_frame_pending_measure: false,
             frames_decoded,
             frames_lost_total,
             idr_needed,
@@ -723,6 +815,9 @@ impl ActiveStream {
             packet_loss_pct: 0.0,
             loss_window_start: Instant::now(),
             loss_history: VecDeque::with_capacity(10),
+            pipeline_history: VecDeque::with_capacity(PIPELINE_HISTORY_LEN),
+            pipe_p50_ms: 0.0,
+            pipe_p95_ms: 0.0,
             bytes_last_count: 0,
             udp_rcvbuf_kib: None,
             last_idr_request: Instant::now() - IDR_COOLDOWN,
@@ -730,6 +825,50 @@ impl ActiveStream {
             packet_loss_notice_until: None,
             rumble_active_until: None,
         })
+    }
+
+    fn wait_for_frame(&self, timeout: Duration) {
+        let (lock, cvar) = &*self.frame_sync;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let _ = cvar.wait_timeout_while(guard, timeout, |slot| slot.is_none());
+        }
+    }
+
+    fn take_latest_frame(&mut self) -> bool {
+        let newer = {
+            let (lock, _) = &*self.frame_sync;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(frame) = newer {
+            self.current_frame = Some(frame);
+            self.current_frame_pending_measure = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_present_latency(&mut self) {
+        if !self.current_frame_pending_measure {
+            return;
+        }
+        self.current_frame_pending_measure = false;
+        let Some(ref frame) = self.current_frame else {
+            return;
+        };
+        let ms = frame.arrived_at.elapsed().as_secs_f32() * 1000.0;
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        self.pipeline_history.push_back(ms);
+        while self.pipeline_history.len() > PIPELINE_HISTORY_LEN {
+            self.pipeline_history.pop_front();
+        }
+        let (p50, p95) = compute_p50_p95(&self.pipeline_history);
+        self.pipe_p50_ms = p50;
+        self.pipe_p95_ms = p95;
     }
 
     fn toggle_mic(&mut self, gamepads: &GamepadManager) {
@@ -788,9 +927,10 @@ impl ActiveStream {
         self.mic_capture = None;
         // Drop queued D3D11VA/AVFrame surfaces before joining the decode worker and destroying its context.
         self.current_frame = None;
-        if let Ok(mut guard) = self.shared_latest.lock() {
+        if let Ok(mut guard) = self.frame_sync.0.lock() {
             *guard = None;
         }
+        self.frame_sync.1.notify_all();
         if let Some(mut session) = self.session.take() {
             session.stop();
             drop(session);
@@ -802,7 +942,7 @@ impl ActiveStream {
             let _ = handle.join();
         }
         self.current_frame = None;
-        if let Ok(mut guard) = self.shared_latest.lock() {
+        if let Ok(mut guard) = self.frame_sync.0.lock() {
             *guard = None;
         }
         tracing::info!(host = %self.console_host, "Active stream shutdown complete");
@@ -819,7 +959,7 @@ struct VideoWorkerArgs {
     codec: MediaCodec,
     device: ID3D11Device,
     video_rx: Receiver<gnsh_proto::VideoPacket>,
-    shared_latest: Arc<Mutex<Option<LatestFrame>>>,
+    frame_sync: Arc<(Mutex<Option<LatestFrame>>, Condvar)>,
     frames_decoded: Arc<AtomicU64>,
     frames_lost_total: Arc<AtomicU64>,
     idr_needed: Arc<AtomicBool>,
@@ -828,6 +968,7 @@ struct VideoWorkerArgs {
 }
 
 fn run_video_decode_loop(args: VideoWorkerArgs) {
+    boost_current_thread_priority("video");
     let mut decoder = match VideoDecoder::new(args.codec, Some(args.device)) {
         Ok(dec) => dec,
         Err(err) => {
@@ -876,13 +1017,15 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                         if let Some(frame) = frames.into_iter().last() {
                             let prev = {
                                 let mut guard =
-                                    args.shared_latest.lock().unwrap_or_else(|e| e.into_inner());
+                                    args.frame_sync.0.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.replace(LatestFrame {
                                     frame,
                                     decode_ms,
                                     is_hw,
+                                    arrived_at: pkt.arrived_at,
                                 })
                             };
+                            args.frame_sync.1.notify_one();
                             drop(prev);
                         }
                     }
@@ -943,6 +1086,7 @@ fn run_audio_output_loop(
     haptics_device_label: Arc<Mutex<Option<String>>>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    boost_current_thread_priority("audio");
     let mut audio = match AudioOutput::new(2, 48_000) {
         Ok(out) => Some(out),
         Err(err) => {
@@ -1108,7 +1252,8 @@ impl AppState {
         }
     }
 
-    fn poll_background(&mut self, gamepads: &mut GamepadManager) {
+    fn poll_background(&mut self, gamepads: &mut GamepadManager) -> bool {
+        let mut got_new_frame = false;
         if let Some(rx) = &self.discovery_rx
             && let Ok(res) = rx.try_recv()
         {
@@ -1335,11 +1480,7 @@ impl AppState {
                     stream.last_idr_request = Instant::now();
                 }
 
-                if let Ok(mut guard) = stream.shared_latest.lock()
-                    && let Some(newer) = guard.take()
-                {
-                    stream.current_frame = Some(newer);
-                }
+                got_new_frame = stream.take_latest_frame();
 
                 if stream.loss_window_start.elapsed().as_secs_f32() >= 0.2
                     && let Some(session) = stream.session.as_ref()
@@ -1388,6 +1529,7 @@ impl AppState {
         if let Some(banner) = stream_quit_banner {
             self.stop_stream(gamepads, Some(banner));
         }
+        got_new_frame
     }
 
     fn process_post_ui(&mut self, gamepads: &mut GamepadManager) {
@@ -1461,7 +1603,13 @@ impl AppState {
                 self.render_home_ui(ui, gamepad_name);
             }
             AppMode::Streaming(stream) => {
-                render_streaming_ui(ui, stream, gamepad_name, &mut self.settings.touchpad_touch);
+                render_streaming_ui(
+                    ui,
+                    stream,
+                    gamepad_name,
+                    &mut self.settings.touchpad_touch,
+                    &mut self.settings.vsync,
+                );
             }
         }
         if self.settings != prev_settings {
@@ -2153,6 +2301,7 @@ fn render_streaming_ui(
     stream: &mut ActiveStream,
     gamepad_name: Option<&str>,
     touchpad_touch: &mut bool,
+    vsync: &mut bool,
 ) {
     if stream.show_hud {
         egui::Area::new(egui::Id::unique("stream_hud"))
@@ -2233,6 +2382,11 @@ fn render_streaming_ui(
                             ui.separator();
                             ui.checkbox(touchpad_touch, "Touchpad Touch")
                                 .on_hover_text("Off: click-only. On: capacitive touch/swipe.");
+
+                            ui.separator();
+                            ui.checkbox(vsync, "VSync").on_hover_text(
+                                "Off: lowest latency (decode-paced + tearing, 250 Hz input). On: tear-free VSync (1-frame DXGI queue).",
+                            );
                         });
 
                         let (decode_ms_text, decoder_badge) = match &stream.current_frame {
@@ -2241,6 +2395,14 @@ fn render_streaming_ui(
                                 if info.is_hw { "D3D11VA" } else { "SW" },
                             ),
                             None => ("-- ms".to_string(), "Pending"),
+                        };
+                        let pipe_text = if stream.pipe_p50_ms > 0.0 {
+                            format!(
+                                "{:.1} ms (p95 {:.1})",
+                                stream.pipe_p50_ms, stream.pipe_p95_ms
+                            )
+                        } else {
+                            "-- ms".to_string()
                         };
                         let pad_label = gamepad_name.unwrap_or("No Gamepad");
                         let lost_total = stream.frames_lost_total.load(Ordering::Relaxed);
@@ -2267,8 +2429,13 @@ fn render_streaming_ui(
                         );
                         let telemetry_line = ui.label(
                             egui::RichText::new(format!(
-                                "Decode: {} ({})  |  UDP Buf: {}  |  Gamepad: {}  |  Haptics: {}",
-                                decode_ms_text, decoder_badge, udp_buf_text, pad_label, haptics_label
+                                "Pipe: {}  |  Decode: {} ({})  |  UDP Buf: {}  |  Gamepad: {}  |  Haptics: {}",
+                                pipe_text,
+                                decode_ms_text,
+                                decoder_badge,
+                                udp_buf_text,
+                                pad_label,
+                                haptics_label
                             ))
                             .small()
                             .color(egui::Color32::from_rgb(184, 196, 218)),
@@ -2444,4 +2611,24 @@ fn find_discovered_for_saved<'a>(
             || (!disc.host_id.is_empty()
                 && format_mac_id(saved.mac).eq_ignore_ascii_case(disc.host_id.trim()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_p50_and_p95_pipeline_latency() {
+        assert_eq!(compute_p50_p95(&VecDeque::new()), (0.0, 0.0));
+
+        let mut samples = VecDeque::new();
+        for ms in (1..=20).rev() {
+            samples.push_back(ms as f32);
+        }
+        samples.push_back(f32::NAN);
+        samples.push_back(-2.0);
+        let (p50, p95) = compute_p50_p95(&samples);
+        assert!((p50 - 11.0).abs() < 1e-5, "unexpected p50: {p50}");
+        assert!((p95 - 20.0).abs() < 1e-5, "unexpected p95: {p95}");
+    }
 }

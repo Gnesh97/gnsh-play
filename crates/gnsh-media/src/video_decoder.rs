@@ -197,6 +197,7 @@ impl VideoDecoder {
 
         unsafe {
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
         }
 
         if let Some(dev) = d3d11_device {
@@ -205,6 +206,7 @@ impl VideoDecoder {
                     unsafe {
                         (*ctx).hw_device_ctx = ffi::av_buffer_ref(buf_ref);
                         (*ctx).get_format = Some(select_d3d11_format);
+                        (*ctx).thread_count = 1;
                     }
                     hw_device_ctx = buf_ref;
                     hw_active = true;

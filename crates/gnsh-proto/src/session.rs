@@ -111,6 +111,7 @@ pub struct VideoPacket {
     pub data: Vec<u8>,
     pub frames_lost: i32,
     pub recovered: bool,
+    pub arrived_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -659,6 +660,7 @@ unsafe extern "C" fn video_sample_cb(
     if buf.is_null() || buf_size == 0 || user.is_null() {
         return true;
     }
+    let arrived_at = Instant::now();
     let ctx = unsafe { &*(user.cast::<SessionCallbacksCtx>()) };
     ctx.video_bytes_total
         .fetch_add(buf_size as u64, Ordering::Relaxed);
@@ -667,6 +669,7 @@ unsafe extern "C" fn video_sample_cb(
         data,
         frames_lost,
         recovered: frame_recovered,
+        arrived_at,
     }) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => false,
