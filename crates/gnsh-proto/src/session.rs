@@ -21,8 +21,12 @@ use gnsh_chiaki_sys::{
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub const MIN_BITRATE_KBPS: u32 = 2_000;
 pub const MAX_BITRATE_KBPS: u32 = 100_000;
@@ -31,12 +35,31 @@ pub const UDP_RECV_BUF_BYTES: i32 = 4 * 1024 * 1024;
 const SOL_SOCKET: i32 = 0xFFFF;
 const SO_RCVBUF: i32 = 0x1002;
 const INVALID_SOCKET: usize = usize::MAX;
+const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const RTT_PROBE_TIMEOUT_MS: u32 = 500;
 
 #[link(name = "ws2_32")]
 unsafe extern "system" {
     fn setsockopt(s: usize, level: i32, optname: i32, optval: *const i8, optlen: i32) -> i32;
     fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut i8, optlen: *mut i32) -> i32;
     fn WSAGetLastError() -> i32;
+}
+
+#[link(name = "iphlpapi")]
+unsafe extern "system" {
+    fn IcmpCreateFile() -> *mut c_void;
+    fn IcmpCloseHandle(icmp_handle: *mut c_void) -> i32;
+    fn IcmpSendEcho(
+        icmp_handle: *mut c_void,
+        destination_address: u32,
+        request_data: *const c_void,
+        request_size: u16,
+        request_options: *const c_void,
+        reply_buffer: *mut c_void,
+        reply_size: u32,
+        timeout: u32,
+    ) -> u32;
 }
 
 /// Live network and video throughput metrics from the active Remote Play session.
@@ -138,6 +161,7 @@ pub struct Ps5Session {
     opus_decoder: Box<ChiakiOpusDecoder>,
     _logger: ChiakiLogger,
     ctx: *mut SessionCallbacksCtx,
+    rtt_probe: RttProbe,
     started: bool,
 }
 
@@ -242,11 +266,13 @@ impl Ps5Session {
             return check_chiaki(start_err).and_then(|_| unreachable!());
         }
 
+        let rtt_probe = RttProbe::start(config.host.trim());
         let handle = Self {
             session,
             opus_decoder,
             _logger: logger,
             ctx: ctx_ptr,
+            rtt_probe,
             started: true,
         };
         let channels = SessionChannels {
@@ -277,6 +303,7 @@ impl Ps5Session {
     }
 
     pub fn stop(&mut self) {
+        self.rtt_probe.stop();
         if self.started {
             unsafe {
                 chiaki_session_stop(self.session.as_mut());
@@ -294,7 +321,13 @@ impl Ps5Session {
 
     /// Reads current RTT, packet loss, Chiaki bitrate estimate, and total decoded video bytes.
     pub fn telemetry(&self) -> StreamTelemetry {
-        let rtt_us = unsafe { std::ptr::addr_of!(self.session.rtt_us).read_volatile() };
+        let senkusha_rtt_us = unsafe { std::ptr::addr_of!(self.session.rtt_us).read_volatile() };
+        let live_rtt_us = self.rtt_probe.rtt_us();
+        let rtt_us = if live_rtt_us > 0 {
+            live_rtt_us as u64
+        } else {
+            senkusha_rtt_us
+        };
         let measured_bitrate = unsafe {
             std::ptr::addr_of!(self.session.stream_connection.measured_bitrate).read_volatile()
         };
@@ -328,6 +361,142 @@ impl Ps5Session {
             video_bytes_total,
         }
     }
+}
+
+struct RttProbe {
+    live_rtt_us: Arc<AtomicU32>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RttProbe {
+    /// Starts a periodic ICMP RTT sampler for LAN hosts so HUD latency tracks live changes.
+    fn start(host: &str) -> Self {
+        let live_rtt_us = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread = resolve_ipv4(host).and_then(|addr| {
+            let rtt_ref = Arc::clone(&live_rtt_us);
+            let stop_ref = Arc::clone(&stop);
+            thread::Builder::new()
+                .name("gnsh-rtt-probe".into())
+                .spawn(move || {
+                    let handle = unsafe { IcmpCreateFile() };
+                    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                        return;
+                    }
+                    loop {
+                        if *stop_ref.0.lock().unwrap_or_else(|e| e.into_inner()) {
+                            break;
+                        }
+                        if let Some(us) = icmp_ping_with_handle(handle, addr, RTT_PROBE_TIMEOUT_MS)
+                        {
+                            rtt_ref.store(us, Ordering::Relaxed);
+                        }
+                        let (lock, cvar) = &*stop_ref;
+                        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let (guard, _) = cvar
+                            .wait_timeout_while(guard, RTT_PROBE_INTERVAL, |is_stopped| {
+                                !*is_stopped
+                            })
+                            .unwrap_or_else(|e| e.into_inner());
+                        if *guard {
+                            break;
+                        }
+                    }
+                    unsafe {
+                        IcmpCloseHandle(handle);
+                    }
+                })
+                .ok()
+        });
+
+        Self {
+            live_rtt_us,
+            stop,
+            thread,
+        }
+    }
+
+    fn rtt_us(&self) -> u32 {
+        self.live_rtt_us.load(Ordering::Relaxed)
+    }
+
+    fn stop(&mut self) {
+        {
+            let (lock, cvar) = &*self.stop;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RttProbe {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn resolve_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let trimmed = host.trim();
+    if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+    (trimmed, 9295u16)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| match addr {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
+        })
+}
+
+fn icmp_ping_with_handle(handle: *mut c_void, addr: Ipv4Addr, timeout_ms: u32) -> Option<u32> {
+    const PAYLOAD: [u8; 16] = *b"gnsh-play-rtt-01";
+    #[repr(C, align(8))]
+    struct ReplyBuf([u8; 128]);
+
+    let mut reply = ReplyBuf([0u8; 128]);
+    let dest_addr = u32::from_ne_bytes(addr.octets());
+    let started = Instant::now();
+    let count = unsafe {
+        IcmpSendEcho(
+            handle,
+            dest_addr,
+            PAYLOAD.as_ptr().cast::<c_void>(),
+            PAYLOAD.len() as u16,
+            std::ptr::null(),
+            reply.0.as_mut_ptr().cast::<c_void>(),
+            reply.0.len() as u32,
+            timeout_ms,
+        )
+    };
+    // Measure around IcmpSendEcho so sub-millisecond LAN hops retain microsecond precision.
+    let elapsed_us = started.elapsed().as_micros().clamp(1, u32::MAX as u128) as u32;
+    if count == 0 {
+        return None;
+    }
+    let status = u32::from_ne_bytes(reply.0[4..8].try_into().ok()?);
+    if status != 0 {
+        return None;
+    }
+    Some(elapsed_us)
+}
+
+#[cfg(test)]
+fn icmp_ping_ipv4(addr: Ipv4Addr, timeout_ms: u32) -> Option<u32> {
+    let handle = unsafe { IcmpCreateFile() };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let res = icmp_ping_with_handle(handle, addr, timeout_ms);
+    unsafe {
+        IcmpCloseHandle(handle);
+    }
+    res
 }
 
 fn apply_udp_recv_buffer(sock: usize, bytes: i32) -> Result<i32> {
@@ -371,6 +540,7 @@ fn apply_udp_recv_buffer(sock: usize, bytes: i32) -> Result<i32> {
 
 impl Drop for Ps5Session {
     fn drop(&mut self) {
+        self.rtt_probe.stop();
         if self.started {
             unsafe {
                 chiaki_session_stop(self.session.as_mut());
@@ -533,5 +703,43 @@ mod tests {
         let actual =
             apply_udp_recv_buffer(sock.as_raw_socket() as usize, UDP_RECV_BUF_BYTES).expect("tune");
         assert!(actual >= UDP_RECV_BUF_BYTES);
+    }
+
+    #[test]
+    fn icmp_ping_loopback_measures_rtt() {
+        let rtt_us =
+            icmp_ping_ipv4(Ipv4Addr::LOCALHOST, 500).expect("loopback ICMP echo must succeed");
+        assert!(
+            rtt_us > 0 && rtt_us < 500_000,
+            "unexpected rtt_us: {rtt_us}"
+        );
+    }
+
+    #[test]
+    fn chiaki_session_layout_matches_packet_loss_max() {
+        init_lib().expect("chiaki lib init");
+        let mut logger = ChiakiLogger::new(false);
+        let host = CString::new("127.0.0.1").unwrap();
+        let mut connect_info = ChiakiConnectInfo {
+            ps5: true,
+            host: host.as_ptr(),
+            packet_loss_max: 0.05,
+            ..Default::default()
+        };
+        let mut session = Box::new(ChiakiSession::default());
+        let err = unsafe {
+            chiaki_session_init(session.as_mut(), &mut connect_info, logger.as_mut_ptr())
+        };
+        assert_eq!(err, gnsh_chiaki_sys::ChiakiErrorCode_CHIAKI_ERR_SUCCESS);
+        let actual_max = unsafe {
+            std::ptr::addr_of!(session.stream_connection.packet_loss_max).read_volatile()
+        };
+        unsafe {
+            chiaki_session_fini(session.as_mut());
+        }
+        assert!(
+            (actual_max - 0.05).abs() < 1e-6,
+            "unexpected packet_loss_max: {actual_max}"
+        );
     }
 }

@@ -12,6 +12,7 @@ use gnsh_proto::{
     decode_account_id_b64, discover_ps5_lan, exchange_redirect_url_for_account_id, init_lib,
     open_psn_login_in_browser, register_ps5, wake_ps5,
 };
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -401,6 +402,8 @@ struct ActiveStream {
     measured_mbps: f32,
     rtt_ms: f32,
     packet_loss_pct: f32,
+    loss_window_start: Instant,
+    loss_history: VecDeque<f32>,
     bytes_last_count: u64,
     udp_rcvbuf_kib: Option<i32>,
     last_idr_request: Instant,
@@ -485,6 +488,8 @@ impl ActiveStream {
             measured_mbps: 0.0,
             rtt_ms: 0.0,
             packet_loss_pct: 0.0,
+            loss_window_start: Instant::now(),
+            loss_history: VecDeque::with_capacity(10),
             bytes_last_count: 0,
             udp_rcvbuf_kib: None,
             last_idr_request: Instant::now() - IDR_COOLDOWN,
@@ -931,6 +936,20 @@ impl AppState {
                     stream.current_frame = Some(newer);
                 }
 
+                if stream.loss_window_start.elapsed().as_secs_f32() >= 0.2
+                    && let Some(session) = stream.session.as_ref()
+                {
+                    let t = session.telemetry();
+                    stream.loss_history.push_back(t.packet_loss_pct);
+                    if stream.loss_history.len() > 10 {
+                        stream.loss_history.pop_front();
+                    }
+                    let sum: f32 = stream.loss_history.iter().sum();
+                    stream.packet_loss_pct = sum / (stream.loss_history.len() as f32);
+                    stream.rtt_ms = t.rtt_ms;
+                    stream.loss_window_start = Instant::now();
+                }
+
                 let elapsed = stream.fps_window_start.elapsed().as_secs_f32();
                 if elapsed >= 0.5 {
                     let count = stream.frames_decoded.load(Ordering::Relaxed);
@@ -949,8 +968,6 @@ impl AppState {
                         } else {
                             t.measured_mbps
                         };
-                        stream.rtt_ms = t.rtt_ms;
-                        stream.packet_loss_pct = t.packet_loss_pct;
                     }
                 }
 
