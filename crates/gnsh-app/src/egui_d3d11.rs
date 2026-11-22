@@ -831,4 +831,9 @@ mod tests {
             vec![10, 20, 30, 40, 200, 210, 220, 255]
         );
     }
+
+    #[test]
+    fn default_fonts_are_embedded() {
+        assert!(!egui::FontDefinitions::default().font_data.is_empty());
+    }
 }
