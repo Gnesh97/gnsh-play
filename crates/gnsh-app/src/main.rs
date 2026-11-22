@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod egui_d3d11;
 mod storage;
 
@@ -32,6 +34,28 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 const IDR_COOLDOWN: Duration = Duration::from_millis(500);
 const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+const FILE_TYPE_UNKNOWN: u32 = 0;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn AttachConsole(dw_process_id: u32) -> i32;
+    fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+    fn GetFileType(h_file: *mut std::ffi::c_void) -> u32;
+}
+
+fn attach_parent_console() {
+    // SAFETY: Querying STD_OUTPUT_HANDLE and calling AttachConsole(ATTACH_PARENT_PROCESS)
+    // when stdout is unattached preserves redirected pipes/files while restoring interactive CLI output.
+    unsafe {
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        let invalid = (-1isize) as *mut std::ffi::c_void;
+        if stdout.is_null() || stdout == invalid || GetFileType(stdout) == FILE_TYPE_UNKNOWN {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliAction {
@@ -49,6 +73,9 @@ fn main() -> Result<()> {
 
 fn handle_cli() -> Result<CliAction> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        attach_parent_console();
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_usage();
         return Ok(CliAction::ExitSuccess);
@@ -1052,7 +1079,14 @@ impl AppState {
                     SessionEvent::Led { r, g, b } => {
                         gamepads.set_led(r, g, b);
                     }
-                    SessionEvent::TriggerEffects { .. } => {}
+                    SessionEvent::TriggerEffects {
+                        type_left,
+                        type_right,
+                        left,
+                        right,
+                    } => {
+                        gamepads.set_trigger_effects(type_left, &left, type_right, &right);
+                    }
                     SessionEvent::LoginPinRequested { incorrect } => {
                         stream.pin_prompt = Some(LoginPinPrompt {
                             pin_input: String::new(),
@@ -1198,6 +1232,7 @@ impl AppState {
             stream.shutdown();
             gamepads.set_rumble(0, 0);
             gamepads.set_led(0, 0, 0);
+            gamepads.clear_trigger_effects();
             if let Some(b) = banner {
                 self.status_banner = Some(b);
             }

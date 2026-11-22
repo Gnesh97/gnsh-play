@@ -176,6 +176,7 @@ struct ActiveGamepad {
     ptr: *mut ffi::SDL_Gamepad,
     instance_id: u32,
     name: String,
+    is_dualsense: bool,
 }
 
 /// Manages an active SDL3 gamepad for controller polling, sensors, LED, and rumble.
@@ -317,6 +318,36 @@ impl GamepadManager {
         }
     }
 
+    /// Sends DualSense adaptive trigger effects (`L2`/`R2`) via SDL3 when a PS5 controller is active.
+    pub fn set_trigger_effects(
+        &self,
+        type_left: u8,
+        left: &[u8; 10],
+        type_right: u8,
+        right: &[u8; 10],
+    ) {
+        let Some(gp) = self.active.as_ref() else {
+            return;
+        };
+        if !gp.is_dualsense {
+            return;
+        }
+        let packet = build_dualsense_trigger_effect_packet(type_left, left, type_right, right);
+        // SAFETY: gp.ptr is an open SDL_Gamepad* owned by self.active, and packet points to a
+        // 47-byte stack-allocated DualSense effect state buffer valid for the duration of the call.
+        let ok = unsafe {
+            ffi::SDL_SendGamepadEffect(gp.ptr, packet.as_ptr().cast(), packet.len() as c_int)
+        };
+        if !ok {
+            tracing::debug!("SDL_SendGamepadEffect failed: {}", crate::sdl_error());
+        }
+    }
+
+    /// Resets left and right DualSense adaptive triggers back to off (`0x05`).
+    pub fn clear_trigger_effects(&self) {
+        self.set_trigger_effects(0x05, &[0u8; 10], 0x05, &[0u8; 10]);
+    }
+
     fn open_first_available(&mut self, skip_id: Option<u32>) {
         let mut count: c_int = 0;
         let ids = unsafe { ffi::SDL_GetGamepads(&mut count) };
@@ -360,18 +391,23 @@ impl GamepadManager {
 
         enable_sensor_if_present(ptr, ffi::SDL_SensorType_SDL_SENSOR_ACCEL);
         enable_sensor_if_present(ptr, ffi::SDL_SensorType_SDL_SENSOR_GYRO);
+        // SAFETY: ptr is a non-null SDL_Gamepad* freshly opened by SDL_OpenGamepad on this thread.
+        let is_dualsense =
+            unsafe { ffi::SDL_GetGamepadType(ptr) } == ffi::SDL_GamepadType_SDL_GAMEPAD_TYPE_PS5;
 
-        tracing::info!("Opened gamepad: {name} (id={instance_id})");
+        tracing::info!("Opened gamepad: {name} (id={instance_id}, dualsense={is_dualsense})");
         self.touch_tracker.reset();
         self.active = Some(ActiveGamepad {
             ptr,
             instance_id,
             name,
+            is_dualsense,
         });
         true
     }
 
     fn close_active(&mut self) {
+        self.clear_trigger_effects();
         self.touch_tracker.reset();
         if let Some(gp) = self.active.take()
             && !gp.ptr.is_null()
@@ -449,9 +485,40 @@ fn poll_touchpad_raw(gamepad: *mut ffi::SDL_Gamepad) -> [(bool, f32, f32); 2] {
     raw
 }
 
+/// Encodes Sony DualSense 47-byte trigger effect HID state matching SDL's `DS5EffectsState_t`.
+pub fn build_dualsense_trigger_effect_packet(
+    type_left: u8,
+    left: &[u8; 10],
+    type_right: u8,
+    right: &[u8; 10],
+) -> [u8; 47] {
+    let mut buf = [0u8; 47];
+    buf[0] = 0x04 | 0x08;
+    buf[1] = 0x40;
+    buf[10] = type_right;
+    buf[11..21].copy_from_slice(right);
+    buf[21] = type_left;
+    buf[22..32].copy_from_slice(left);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_47_byte_dualsense_trigger_effect_packet() {
+        let left = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let right = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        let packet = build_dualsense_trigger_effect_packet(0x21, &left, 0x26, &right);
+        assert_eq!(packet.len(), 47);
+        assert_eq!(packet[0], 0x0c);
+        assert_eq!(packet[1], 0x40);
+        assert_eq!(packet[10], 0x26);
+        assert_eq!(&packet[11..21], &right);
+        assert_eq!(packet[21], 0x21);
+        assert_eq!(&packet[22..32], &left);
+    }
 
     #[test]
     fn deadzone_zeroes_interior_and_preserves_extremes() {
