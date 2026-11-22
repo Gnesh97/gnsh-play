@@ -19,7 +19,8 @@ pub use psn_auth::{
 pub use regist::{RegisteredConsole, register_ps5};
 pub use session::{
     AudioPcmFrame, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, Ps5Session, Ps5SessionConfig,
-    SessionChannels, SessionEvent, VideoCodec, VideoPacket, VideoPreset, clamp_bitrate_kbps,
+    SessionChannels, SessionEvent, StreamTelemetry, UDP_RECV_BUF_BYTES, VideoCodec, VideoPacket,
+    VideoPreset, clamp_bitrate_kbps,
 };
 
 #[derive(Debug, Error)]

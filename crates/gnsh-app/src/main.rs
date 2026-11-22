@@ -8,7 +8,7 @@ use gnsh_input::{AppWindow, GamepadManager};
 use gnsh_media::{AudioOutput, D3D11Renderer, DecodedFrame, MediaCodec, VideoDecoder};
 use gnsh_proto::{
     ConsoleState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, Ps5Session,
-    Ps5SessionConfig, RegisteredConsole, SessionEvent, VideoCodec, VideoPreset,
+    Ps5SessionConfig, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES, VideoCodec, VideoPreset,
     decode_account_id_b64, discover_ps5_lan, exchange_redirect_url_for_account_id, init_lib,
     open_psn_login_in_browser, register_ps5, wake_ps5,
 };
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use storage::{ConsoleStore, SavedConsole};
+use storage::{ConsoleStore, SavedConsole, SettingsStore, StoredSettings};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -103,7 +103,7 @@ fn run_gui() -> Result<()> {
     init_lib().context("failed to initialize Remote Play library")?;
 
     let store = ConsoleStore::default_store().context("failed to resolve console store path")?;
-    let (saved_consoles, initial_banner) = match store.load() {
+    let (saved_consoles, mut initial_banner) = match store.load() {
         Ok(list) => (list, None),
         Err(err) => (
             Vec::new(),
@@ -112,6 +112,21 @@ fn run_gui() -> Result<()> {
                 store.path().display()
             ))),
         ),
+    };
+
+    let settings_store =
+        SettingsStore::default_store().context("failed to resolve settings store path")?;
+    let initial_settings = match settings_store.load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            tracing::warn!("Failed loading settings.json, using defaults: {err:#}");
+            if initial_banner.is_none() {
+                initial_banner = Some(StatusBanner::info(format!(
+                    "Settings reset to defaults after read error: {err:#}"
+                )));
+            }
+            StoredSettings::default()
+        }
     };
 
     let mut window = AppWindow::new("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT)
@@ -126,7 +141,13 @@ fn run_gui() -> Result<()> {
     let egui_ctx = egui::Context::default();
     apply_theme(&egui_ctx);
 
-    let mut app = AppState::new(store, saved_consoles, initial_banner);
+    let mut app = AppState::new(
+        store,
+        settings_store,
+        saved_consoles,
+        initial_settings,
+        initial_banner,
+    );
     app.start_discovery();
 
     let mut raw_input = egui::RawInput::default();
@@ -281,26 +302,7 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-#[derive(Debug, Clone)]
-struct StreamSettings {
-    preset: VideoPreset,
-    codec: VideoCodec,
-    bitrate_kbps: u32,
-    vsync: bool,
-    touchpad_touch: bool,
-}
-
-impl Default for StreamSettings {
-    fn default() -> Self {
-        Self {
-            preset: VideoPreset::P1080Fps60,
-            codec: VideoCodec::Hevc,
-            bitrate_kbps: 30_000,
-            vsync: true,
-            touchpad_touch: false,
-        }
-    }
-}
+type StreamSettings = StoredSettings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BannerKind {
@@ -396,6 +398,11 @@ struct ActiveStream {
     fps: f32,
     fps_window_start: Instant,
     fps_last_count: u64,
+    measured_mbps: f32,
+    rtt_ms: f32,
+    packet_loss_pct: f32,
+    bytes_last_count: u64,
+    udp_rcvbuf_kib: Option<i32>,
     last_idr_request: Instant,
     last_seen_lost: u64,
     packet_loss_notice_until: Option<Instant>,
@@ -475,6 +482,11 @@ impl ActiveStream {
             fps: 0.0,
             fps_window_start: Instant::now(),
             fps_last_count: 0,
+            measured_mbps: 0.0,
+            rtt_ms: 0.0,
+            packet_loss_pct: 0.0,
+            bytes_last_count: 0,
+            udp_rcvbuf_kib: None,
             last_idr_request: Instant::now() - IDR_COOLDOWN,
             last_seen_lost: 0,
             packet_loss_notice_until: None,
@@ -631,6 +643,7 @@ enum HomeAction {
 
 struct AppState {
     store: ConsoleStore,
+    settings_store: SettingsStore,
     saved_consoles: Vec<SavedConsole>,
     discovered_consoles: Vec<DiscoveredConsole>,
     discovery_rx: Option<Receiver<std::result::Result<Vec<DiscoveredConsole>, String>>>,
@@ -646,21 +659,30 @@ struct AppState {
 impl AppState {
     fn new(
         store: ConsoleStore,
+        settings_store: SettingsStore,
         saved_consoles: Vec<SavedConsole>,
+        settings: StreamSettings,
         status_banner: Option<StatusBanner>,
     ) -> Self {
         Self {
             store,
+            settings_store,
             saved_consoles,
             discovered_consoles: Vec::new(),
             discovery_rx: None,
             wake_rx: None,
-            settings: StreamSettings::default(),
+            settings,
             status_banner,
             register_modal: None,
             mode: AppMode::Home,
             pending_home_action: None,
             pending_stream_connect: None,
+        }
+    }
+
+    fn persist_settings(&self) {
+        if let Err(err) = self.settings_store.save(&self.settings) {
+            tracing::warn!("Failed saving settings.json: {err:#}");
         }
     }
 
@@ -843,6 +865,20 @@ impl AppState {
                 match ev {
                     SessionEvent::Connected => {
                         stream.connected = true;
+                        if let Some(session) = stream.session.as_mut() {
+                            match session.tune_udp_recv_buffer(UDP_RECV_BUF_BYTES) {
+                                Ok(actual) => {
+                                    tracing::info!(
+                                        "Tuned Takion UDP SO_RCVBUF to {} KiB",
+                                        actual / 1024
+                                    );
+                                    stream.udp_rcvbuf_kib = Some(actual / 1024);
+                                }
+                                Err(err) => {
+                                    tracing::warn!("Failed tuning UDP SO_RCVBUF: {err:#}");
+                                }
+                            }
+                        }
                     }
                     SessionEvent::Nickname(nick) => {
                         if !nick.trim().is_empty() {
@@ -901,6 +937,21 @@ impl AppState {
                     stream.fps = (count.saturating_sub(stream.fps_last_count)) as f32 / elapsed;
                     stream.fps_last_count = count;
                     stream.fps_window_start = Instant::now();
+
+                    if let Some(session) = stream.session.as_ref() {
+                        let t = session.telemetry();
+                        let delta_bytes =
+                            t.video_bytes_total.saturating_sub(stream.bytes_last_count);
+                        stream.bytes_last_count = t.video_bytes_total;
+                        let rolling_mbps = (delta_bytes as f32 * 8.0) / (elapsed * 1_000_000.0);
+                        stream.measured_mbps = if rolling_mbps > 0.05 {
+                            rolling_mbps
+                        } else {
+                            t.measured_mbps
+                        };
+                        stream.rtt_ms = t.rtt_ms;
+                        stream.packet_loss_pct = t.packet_loss_pct;
+                    }
                 }
 
                 if let Some(ctrl_state) = gamepads.poll_state(self.settings.touchpad_touch)
@@ -980,6 +1031,7 @@ impl AppState {
             self.begin_stream(idx, device.clone());
         }
 
+        let prev_settings = self.settings.clone();
         match &mut self.mode {
             AppMode::Home => {
                 self.render_home_ui(ui, gamepad_name);
@@ -987,6 +1039,9 @@ impl AppState {
             AppMode::Streaming(stream) => {
                 render_streaming_ui(ui, stream, gamepad_name, &mut self.settings.touchpad_touch);
             }
+        }
+        if self.settings != prev_settings {
+            self.persist_settings();
         }
     }
 
@@ -1734,17 +1789,30 @@ fn render_streaming_ui(
                         };
                         let pad_label = gamepad_name.unwrap_or("No Gamepad");
                         let lost_total = stream.frames_lost_total.load(Ordering::Relaxed);
+                        let udp_buf_text = match stream.udp_rcvbuf_kib {
+                            Some(kib) => format!("{kib} KiB"),
+                            None => "default".to_string(),
+                        };
 
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{:.1} FPS  |  Decode: {} ({})  |  Gamepad: {}",
-                                    stream.fps, decode_ms_text, decoder_badge, pad_label
-                                ))
-                                .small()
-                                .color(egui::Color32::from_rgb(206, 216, 234)),
-                            );
-                        });
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.1} FPS  |  {:.1} Mbps  |  RTT: {:.1} ms  |  Loss: {:.1}%",
+                                stream.fps,
+                                stream.measured_mbps,
+                                stream.rtt_ms,
+                                stream.packet_loss_pct
+                            ))
+                            .small()
+                            .color(egui::Color32::from_rgb(206, 216, 234)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Decode: {} ({})  |  UDP Buf: {}  |  Gamepad: {}",
+                                decode_ms_text, decoder_badge, udp_buf_text, pad_label
+                            ))
+                            .small()
+                            .color(egui::Color32::from_rgb(184, 196, 218)),
+                        );
 
                         if lost_total > 0 {
                             let recent_loss = stream

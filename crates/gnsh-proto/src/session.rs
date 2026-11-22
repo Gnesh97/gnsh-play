@@ -19,25 +19,47 @@ use gnsh_chiaki_sys::{
     chiaki_session_join, chiaki_session_request_idr, chiaki_session_set_controller_state,
     chiaki_session_set_login_pin, chiaki_session_start, chiaki_session_stop,
 };
+use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const MIN_BITRATE_KBPS: u32 = 2_000;
 pub const MAX_BITRATE_KBPS: u32 = 100_000;
+pub const UDP_RECV_BUF_BYTES: i32 = 4 * 1024 * 1024;
+
+const SOL_SOCKET: i32 = 0xFFFF;
+const SO_RCVBUF: i32 = 0x1002;
+const INVALID_SOCKET: usize = usize::MAX;
+
+#[link(name = "ws2_32")]
+unsafe extern "system" {
+    fn setsockopt(s: usize, level: i32, optname: i32, optval: *const i8, optlen: i32) -> i32;
+    fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut i8, optlen: *mut i32) -> i32;
+    fn WSAGetLastError() -> i32;
+}
+
+/// Live network and video throughput metrics from the active Remote Play session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamTelemetry {
+    pub rtt_ms: f32,
+    pub measured_mbps: f32,
+    pub packet_loss_pct: f32,
+    pub video_bytes_total: u64,
+}
 
 /// Clamps a requested stream bitrate cleanly within PS5 Remote Play FEC bounds.
 pub fn clamp_bitrate_kbps(kbps: u32) -> u32 {
     kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCodec {
     H264,
     Hevc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoPreset {
     P720Fps60,
     P1080Fps60,
@@ -108,6 +130,7 @@ struct SessionCallbacksCtx {
     event_tx: Sender<SessionEvent>,
     audio_channels: AtomicU32,
     audio_rate: AtomicU32,
+    video_bytes_total: AtomicU64,
 }
 
 pub struct Ps5Session {
@@ -138,6 +161,7 @@ impl Ps5Session {
             event_tx,
             audio_channels: AtomicU32::new(2),
             audio_rate: AtomicU32::new(48_000),
+            video_bytes_total: AtomicU64::new(0),
         }));
 
         let mut video_profile = ChiakiConnectVideoProfile::default();
@@ -259,6 +283,90 @@ impl Ps5Session {
             }
         }
     }
+
+    /// Bumps the underlying Takion UDP socket `SO_RCVBUF` at runtime without patching libchiaki.
+    pub fn tune_udp_recv_buffer(&mut self, bytes: i32) -> Result<i32> {
+        let sock = unsafe {
+            std::ptr::addr_of!(self.session.stream_connection.takion.sock).read_volatile()
+        } as usize;
+        apply_udp_recv_buffer(sock, bytes)
+    }
+
+    /// Reads current RTT, packet loss, Chiaki bitrate estimate, and total decoded video bytes.
+    pub fn telemetry(&self) -> StreamTelemetry {
+        let rtt_us = unsafe { std::ptr::addr_of!(self.session.rtt_us).read_volatile() };
+        let measured_bitrate = unsafe {
+            std::ptr::addr_of!(self.session.stream_connection.measured_bitrate).read_volatile()
+        };
+        let packet_loss = unsafe {
+            std::ptr::addr_of!(
+                self.session
+                    .stream_connection
+                    .congestion_control
+                    .packet_loss
+            )
+            .read_volatile()
+        };
+        let video_bytes_total = if self.ctx.is_null() {
+            0
+        } else {
+            unsafe { (*self.ctx).video_bytes_total.load(Ordering::Relaxed) }
+        };
+
+        StreamTelemetry {
+            rtt_ms: (rtt_us as f32) / 1000.0,
+            measured_mbps: if measured_bitrate.is_finite() && measured_bitrate >= 0.0 {
+                measured_bitrate as f32
+            } else {
+                0.0
+            },
+            packet_loss_pct: if packet_loss.is_finite() && packet_loss >= 0.0 {
+                (packet_loss * 100.0).clamp(0.0, 100.0) as f32
+            } else {
+                0.0
+            },
+            video_bytes_total,
+        }
+    }
+}
+
+fn apply_udp_recv_buffer(sock: usize, bytes: i32) -> Result<i32> {
+    if sock == 0 || sock == INVALID_SOCKET || bytes <= 0 {
+        return Err(ProtoError::InvalidArg(
+            "invalid UDP socket or buffer size".into(),
+        ));
+    }
+    let val = bytes;
+    let rc = unsafe {
+        setsockopt(
+            sock,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (&val as *const i32).cast::<i8>(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc != 0 {
+        let wsa = unsafe { WSAGetLastError() };
+        return Err(ProtoError::Windows(format!(
+            "setsockopt(SO_RCVBUF={bytes}) failed with WSA error {wsa}"
+        )));
+    }
+    let mut actual: i32 = 0;
+    let mut actual_len = std::mem::size_of::<i32>() as i32;
+    let g_rc = unsafe {
+        getsockopt(
+            sock,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (&mut actual as *mut i32).cast::<i8>(),
+            &mut actual_len,
+        )
+    };
+    if g_rc != 0 {
+        return Ok(bytes);
+    }
+    Ok(actual)
 }
 
 impl Drop for Ps5Session {
@@ -292,6 +400,8 @@ unsafe extern "C" fn video_sample_cb(
         return true;
     }
     let ctx = unsafe { &*(user.cast::<SessionCallbacksCtx>()) };
+    ctx.video_bytes_total
+        .fetch_add(buf_size as u64, Ordering::Relaxed);
     let data = unsafe { std::slice::from_raw_parts(buf, buf_size) }.to_vec();
     match ctx.video_tx.try_send(VideoPacket {
         data,
@@ -413,5 +523,15 @@ mod tests {
         assert_eq!(clamp_bitrate_kbps(500), MIN_BITRATE_KBPS);
         assert_eq!(clamp_bitrate_kbps(50_000), 50_000);
         assert_eq!(clamp_bitrate_kbps(250_000), MAX_BITRATE_KBPS);
+    }
+
+    #[test]
+    fn sets_udp_recv_buffer_to_4_mib() {
+        use std::os::windows::io::AsRawSocket;
+
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP loopback socket");
+        let actual =
+            apply_udp_recv_buffer(sock.as_raw_socket() as usize, UDP_RECV_BUF_BYTES).expect("tune");
+        assert!(actual >= UDP_RECV_BUF_BYTES);
     }
 }

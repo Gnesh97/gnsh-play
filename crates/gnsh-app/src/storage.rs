@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -200,5 +201,108 @@ mod tests {
         assert_eq!(loaded[0].regist_key_hex(), "1a2b3c4d");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_store_roundtrips_and_clamps_bitrate() {
+        let dir = std::env::temp_dir().join(format!("gnsh-play-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SettingsStore::with_path(&path);
+        assert_eq!(
+            store.load().expect("default load"),
+            StoredSettings::default()
+        );
+
+        let custom = StoredSettings {
+            preset: VideoPreset::P720Fps60,
+            codec: VideoCodec::H264,
+            bitrate_kbps: 500_000,
+            vsync: false,
+            touchpad_touch: true,
+        };
+        store.save(&custom).expect("save custom");
+        let loaded = store.load().expect("load custom");
+        assert_eq!(loaded.preset, VideoPreset::P720Fps60);
+        assert_eq!(loaded.codec, VideoCodec::H264);
+        assert_eq!(loaded.bitrate_kbps, 100_000);
+        assert!(!loaded.vsync);
+        assert!(loaded.touchpad_touch);
+
+        std::fs::write(&path, r#"{"bitrate_kbps": 999999}"#).expect("write unclamped json");
+        let clamped = store.load().expect("load clamped");
+        assert_eq!(clamped.bitrate_kbps, 100_000);
+        assert_eq!(clamped.preset, VideoPreset::P1080Fps60);
+        assert_eq!(clamped.codec, VideoCodec::Hevc);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Persisted stream and controller preferences stored in `%APPDATA%\gnsh-play\settings.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredSettings {
+    pub preset: VideoPreset,
+    pub codec: VideoCodec,
+    pub bitrate_kbps: u32,
+    pub vsync: bool,
+    pub touchpad_touch: bool,
+}
+
+impl Default for StoredSettings {
+    fn default() -> Self {
+        Self {
+            preset: VideoPreset::P1080Fps60,
+            codec: VideoCodec::Hevc,
+            bitrate_kbps: 30_000,
+            vsync: true,
+            touchpad_touch: false,
+        }
+    }
+}
+
+pub struct SettingsStore {
+    path: PathBuf,
+}
+
+impl SettingsStore {
+    pub fn default_store() -> Result<Self> {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Ok(Self::with_path(
+            base.join("gnsh-play").join("settings.json"),
+        ))
+    }
+
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn load(&self) -> Result<StoredSettings> {
+        if !self.path.exists() {
+            return Ok(StoredSettings::default());
+        }
+        let raw = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("failed reading {}", self.path.display()))?;
+        let mut parsed: StoredSettings =
+            serde_json::from_str(&raw).context("failed parsing settings.json")?;
+        parsed.bitrate_kbps = clamp_bitrate_kbps(parsed.bitrate_kbps);
+        Ok(parsed)
+    }
+
+    pub fn save(&self, settings: &StoredSettings) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+        let mut clamped = settings.clone();
+        clamped.bitrate_kbps = clamp_bitrate_kbps(clamped.bitrate_kbps);
+        let json = serde_json::to_string_pretty(&clamped)?;
+        std::fs::write(&self.path, json)
+            .with_context(|| format!("failed writing {}", self.path.display()))?;
+        Ok(())
     }
 }

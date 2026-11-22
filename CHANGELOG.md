@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented `crates/gnsh-input` (SDL3 3.4.20 window/HWND/clipboard/event integration and `GamepadManager` DualSense polling with stick deadzones, trigger scaling, touchpad coordinates, gyro/accel sensors, rumble, and LED feedback) and `crates/gnsh-app` (`egui` 0.37 Direct3D 11 painter, Home/Register/Streaming HUD GUI, and `--help`/`--discover` CLI modes; `18` workspace tests passing with `clippy -D warnings` clean).
 - Added [`scripts/stage-dist.ps1`](scripts/stage-dist.ps1) and verified standalone release bundle (`dist/gnsh-play.exe` + `97` MinGW64 DLLs, `141.57 MiB`) executing `--help` and `--discover` without MSYS2 on `PATH`.
 
+### Added
+- Tuned Takion UDP `SO_RCVBUF` to `4 MiB` (`UDP_RECV_BUF_BYTES`) at runtime on `SessionEvent::Connected` via [`crates/gnsh-proto/src/session.rs`](crates/gnsh-proto/src/session.rs) without modifying `third_party/chiaki-ng`.
+- Added live stream HUD telemetry (rolling `Mbps`, `RTT ms`, `Loss %`, and `UDP Buf KiB`) in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs) + `Ps5Session::telemetry()`.
+- Persisted stream and controller preferences (`preset`, `codec`, clamped `bitrate_kbps`, `vsync`, `touchpad_touch`) to `%APPDATA%\gnsh-play\settings.json` via `SettingsStore` in [`crates/gnsh-app/src/storage.rs`](crates/gnsh-app/src/storage.rs) (`25` workspace tests passing).
+
 ### Fixed
 - Clamped PS5 stream bitrate to `2_000..=100_000` kbps (`MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS`) in [`crates/gnsh-proto/src/session.rs`](crates/gnsh-proto/src/session.rs) and enforced `SliderClamping::Always` in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs), preventing `>100 Mbps` burst FEC disconnects and `>250 Mbps` 256-slot FEC IDR stalls (black screen / `0 FPS`).
 - Fixed DualSense capacitive touchpad touches falsely registering as touchpad clicks (e.g. `streetpea/chiaki-ng#894`) by defaulting [`crates/gnsh-input/src/gamepad.rs`](crates/gnsh-input/src/gamepad.rs) + [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs) to click-only touchpad mode with an optional `Touchpad Touch` toggle (Home bar & live HUD), 7-bit incremental touch tracking IDs, 4 px noise deadband, and exact `1919x942` scaling (`23` workspace tests passing).
