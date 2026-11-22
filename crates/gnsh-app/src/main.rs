@@ -294,7 +294,7 @@ impl Default for StreamSettings {
         Self {
             preset: VideoPreset::P1080Fps60,
             codec: VideoCodec::Hevc,
-            bitrate_kbps: 15_000,
+            bitrate_kbps: 30_000,
             vsync: true,
         }
     }
@@ -1098,8 +1098,9 @@ impl AppState {
                     ui.separator();
 
                     ui.add(
-                        egui::Slider::new(&mut self.settings.bitrate_kbps, 8_000..=30_000)
-                            .step_by(500.0)
+                        egui::Slider::new(&mut self.settings.bitrate_kbps, 2_000..=100_000)
+                            .step_by(1_000.0)
+                            .clamping(egui::SliderClamping::Never)
                             .suffix(" kbps")
                             .text("Bitrate"),
                     );

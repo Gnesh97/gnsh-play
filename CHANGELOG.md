@@ -18,4 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added [`scripts/stage-dist.ps1`](scripts/stage-dist.ps1) and verified standalone release bundle (`dist/gnsh-play.exe` + `97` MinGW64 DLLs, `141.57 MiB`) executing `--help` and `--discover` without MSYS2 on `PATH`.
 
 ### Fixed
+- Cropped `D3D11VA` GPU surface alignment padding (e.g., `1920x1152` HEVC textures) in [`crates/gnsh-media/src/d3d11_renderer.rs`](crates/gnsh-media/src/d3d11_renderer.rs) via per-frame texture-desc UV rect + sub-texel luma/chroma clamp, eliminating the bottom green bar on HEVC streams (`20` workspace tests passing).
 - Enabled `egui` `default_fonts` feature in [`Cargo.toml`](Cargo.toml) (fixing missing glyph boxes in `gnsh-play` UI), added `default_fonts_are_embedded` unit test in [`crates/gnsh-app/src/egui_d3d11.rs`](crates/gnsh-app/src/egui_d3d11.rs) (`19` workspace tests passing), and restaged `dist/gnsh-play.exe` (`142.23 MiB`).
+
+### Changed
+- Raised default LAN bitrate to `30_000` kbps and expanded the bitrate slider range to `2_000..=100_000` kbps (`SliderClamping::Never` for manual overrides) in [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs).

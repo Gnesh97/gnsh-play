@@ -35,6 +35,8 @@ use windows::core::{BOOL, Interface as _, PCSTR, s};
 const VIDEO_VS_HLSL: &str = r#"
 cbuffer VideoParams : register(b0) {
     float4 pos_scale; // xy = scale, zw = offset
+    float4 uv_rect;   // xy = active scale, zw = offset
+    float4 uv_clamp;  // xy = luma max uv, zw = chroma max uv
 };
 
 struct VSOut {
@@ -57,7 +59,7 @@ VSOut VSMain(uint vid : SV_VertexID) {
     };
     VSOut o;
     o.pos = float4(quad[vid] * pos_scale.xy + pos_scale.zw, 0.0, 1.0);
-    o.uv = uvs[vid];
+    o.uv = uvs[vid] * uv_rect.xy + uv_rect.zw;
     return o;
 }
 "#;
@@ -66,6 +68,11 @@ const NV12_ARRAY_PS_HLSL: &str = r#"
 Texture2DArray<float> texY  : register(t0);
 Texture2DArray<float2> texUV : register(t1);
 SamplerState sampLinear : register(s0);
+cbuffer VideoParams : register(b0) {
+    float4 pos_scale;
+    float4 uv_rect;
+    float4 uv_clamp;
+};
 
 struct PSIn {
     float4 pos : SV_POSITION;
@@ -73,8 +80,8 @@ struct PSIn {
 };
 
 float4 PSMain(PSIn i) : SV_TARGET {
-    float y_raw = texY.Sample(sampLinear, float3(i.uv, 0.0));
-    float2 uv_raw = texUV.Sample(sampLinear, float3(i.uv, 0.0));
+    float y_raw = texY.Sample(sampLinear, float3(min(i.uv, uv_clamp.xy), 0.0));
+    float2 uv_raw = texUV.Sample(sampLinear, float3(min(i.uv, uv_clamp.zw), 0.0));
     float y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
     float cb = (uv_raw.x - 128.0 / 255.0) * (255.0 / 224.0);
     float cr = (uv_raw.y - 128.0 / 255.0) * (255.0 / 224.0);
@@ -84,6 +91,24 @@ float4 PSMain(PSIn i) : SV_TARGET {
     return float4(saturate(float3(r, g, b)), 1.0);
 }
 "#;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct VideoParams {
+    pos_scale: [f32; 4],
+    uv_rect: [f32; 4],
+    uv_clamp: [f32; 4],
+}
+
+impl Default for VideoParams {
+    fn default() -> Self {
+        Self {
+            pos_scale: [1.0, 1.0, 0.0, 0.0],
+            uv_rect: [1.0, 1.0, 0.0, 0.0],
+            uv_clamp: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
 
 const YUV420_PS_HLSL: &str = r#"
 Texture2D<float> texY : register(t0);
@@ -224,15 +249,15 @@ impl D3D11Renderer {
             out.context("CreateSamplerState returned None")?
         };
 
-        let init_params = [1.0f32, 1.0, 0.0, 0.0];
+        let init_params = VideoParams::default();
         let cb_desc = D3D11_BUFFER_DESC {
-            ByteWidth: std::mem::size_of::<[f32; 4]>() as u32,
+            ByteWidth: std::mem::size_of::<VideoParams>() as u32,
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
             ..Default::default()
         };
         let cb_sub = D3D11_SUBRESOURCE_DATA {
-            pSysMem: init_params.as_ptr().cast(),
+            pSysMem: (&init_params as *const VideoParams).cast(),
             ..Default::default()
         };
         let cb_params = unsafe {
@@ -330,20 +355,35 @@ impl D3D11Renderer {
     pub fn draw_video_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
         self.bind_backbuffer();
 
-        let (fw, fh) = match frame {
-            DecodedFrame::D3D11(f) => (f.width, f.height),
-            DecodedFrame::SoftwareYuv420 { width, height, .. } => (*width, *height),
+        let (fw, fh, tw, th) = match frame {
+            DecodedFrame::D3D11(f) => {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe {
+                    f.texture.GetDesc(&mut desc);
+                }
+                (f.width, f.height, desc.Width, desc.Height)
+            }
+            DecodedFrame::SoftwareYuv420 { width, height, .. } => {
+                (*width, *height, *width, *height)
+            }
         };
-        let scale = aspect_scale(fw, fh, self.width, self.height);
+        let params = compute_video_params(fw, fh, tw, th, self.width, self.height);
         unsafe {
-            self.context
-                .UpdateSubresource(&self.cb_params, 0, None, scale.as_ptr().cast(), 0, 0);
+            self.context.UpdateSubresource(
+                &self.cb_params,
+                0,
+                None,
+                (&params as *const VideoParams).cast(),
+                0,
+                0,
+            );
             self.context.IASetInputLayout(None);
             self.context
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             self.context.VSSetShader(&self.vs, None);
-            self.context
-                .VSSetConstantBuffers(0, Some(&[Some(self.cb_params.clone())]));
+            let cb = [Some(self.cb_params.clone())];
+            self.context.VSSetConstantBuffers(0, Some(&cb));
+            self.context.PSSetConstantBuffers(0, Some(&cb));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         }
@@ -626,6 +666,31 @@ fn aspect_scale(frame_w: u32, frame_h: u32, view_w: u32, view_h: u32) -> [f32; 4
     }
 }
 
+fn compute_video_params(
+    frame_w: u32,
+    frame_h: u32,
+    tex_w: u32,
+    tex_h: u32,
+    view_w: u32,
+    view_h: u32,
+) -> VideoParams {
+    let pos_scale = aspect_scale(frame_w, frame_h, view_w, view_h);
+    let tw = tex_w.max(frame_w).max(1) as f32;
+    let th = tex_h.max(frame_h).max(1) as f32;
+    let fw = frame_w.max(1) as f32;
+    let fh = frame_h.max(1) as f32;
+    VideoParams {
+        pos_scale,
+        uv_rect: [fw / tw, fh / th, 0.0, 0.0],
+        uv_clamp: [
+            (fw - 0.5).max(0.0) / tw,
+            (fh - 0.5).max(0.0) / th,
+            (fw - 1.0).max(0.0) / tw,
+            (fh - 1.0).max(0.0) / th,
+        ],
+    }
+}
+
 pub fn compile_hlsl(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     let mut code = None;
     let mut err_blob = None;
@@ -686,5 +751,17 @@ mod tests {
 
         let wide = aspect_scale(1920, 1080, 2560, 1080);
         assert!(wide[0] < 1.0 && (wide[1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn computes_padded_surface_uv_crop() {
+        let hevc = compute_video_params(1920, 1080, 1920, 1152, 1920, 1080);
+        assert!((hevc.uv_rect[0] - 1.0).abs() < 1e-6);
+        assert!((hevc.uv_rect[1] - (1080.0 / 1152.0)).abs() < 1e-6);
+        assert!(hevc.uv_clamp[1] < hevc.uv_rect[1]);
+        assert!(hevc.uv_clamp[3] < hevc.uv_clamp[1]);
+
+        let h264 = compute_video_params(1920, 1080, 1920, 1088, 1920, 1080);
+        assert!((h264.uv_rect[1] - (1080.0 / 1088.0)).abs() < 1e-6);
     }
 }
