@@ -23,6 +23,14 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+pub const MIN_BITRATE_KBPS: u32 = 2_000;
+pub const MAX_BITRATE_KBPS: u32 = 100_000;
+
+/// Clamps a requested stream bitrate cleanly within PS5 Remote Play FEC bounds.
+pub fn clamp_bitrate_kbps(kbps: u32) -> u32 {
+    kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     H264,
@@ -153,7 +161,7 @@ impl Ps5Session {
             VideoCodec::Hevc => ChiakiCodec_CHIAKI_CODEC_H265,
         };
         if config.bitrate_kbps > 0 {
-            video_profile.bitrate = config.bitrate_kbps;
+            video_profile.bitrate = clamp_bitrate_kbps(config.bitrate_kbps);
         }
 
         let mut regist_key_c = [0 as std::os::raw::c_char; 16];
@@ -393,5 +401,17 @@ unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
 
     if let Some(item) = mapped {
         let _ = ctx.event_tx.try_send(item);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamps_bitrate_within_ps5_fec_limits() {
+        assert_eq!(clamp_bitrate_kbps(500), MIN_BITRATE_KBPS);
+        assert_eq!(clamp_bitrate_kbps(50_000), 50_000);
+        assert_eq!(clamp_bitrate_kbps(250_000), MAX_BITRATE_KBPS);
     }
 }

@@ -7,10 +7,10 @@ use egui_d3d11::EguiD3d11Painter;
 use gnsh_input::{AppWindow, GamepadManager};
 use gnsh_media::{AudioOutput, D3D11Renderer, DecodedFrame, MediaCodec, VideoDecoder};
 use gnsh_proto::{
-    ConsoleState, DiscoveredConsole, Ps5Session, Ps5SessionConfig, RegisteredConsole, SessionEvent,
-    VideoCodec, VideoPreset, decode_account_id_b64, discover_ps5_lan,
-    exchange_redirect_url_for_account_id, init_lib, open_psn_login_in_browser, register_ps5,
-    wake_ps5,
+    ConsoleState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, Ps5Session,
+    Ps5SessionConfig, RegisteredConsole, SessionEvent, VideoCodec, VideoPreset,
+    decode_account_id_b64, discover_ps5_lan, exchange_redirect_url_for_account_id, init_lib,
+    open_psn_login_in_browser, register_ps5, wake_ps5,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -287,6 +287,7 @@ struct StreamSettings {
     codec: VideoCodec,
     bitrate_kbps: u32,
     vsync: bool,
+    touchpad_touch: bool,
 }
 
 impl Default for StreamSettings {
@@ -296,6 +297,7 @@ impl Default for StreamSettings {
             codec: VideoCodec::Hevc,
             bitrate_kbps: 30_000,
             vsync: true,
+            touchpad_touch: false,
         }
     }
 }
@@ -901,7 +903,7 @@ impl AppState {
                     stream.fps_window_start = Instant::now();
                 }
 
-                if let Some(ctrl_state) = gamepads.poll_state()
+                if let Some(ctrl_state) = gamepads.poll_state(self.settings.touchpad_touch)
                     && let Some(session) = stream.session.as_mut()
                     && let Err(err) = session.send_controller_state(&ctrl_state)
                 {
@@ -983,7 +985,7 @@ impl AppState {
                 self.render_home_ui(ui, gamepad_name);
             }
             AppMode::Streaming(stream) => {
-                render_streaming_ui(ui, stream, gamepad_name);
+                render_streaming_ui(ui, stream, gamepad_name, &mut self.settings.touchpad_touch);
             }
         }
     }
@@ -1098,14 +1100,22 @@ impl AppState {
                     ui.separator();
 
                     ui.add(
-                        egui::Slider::new(&mut self.settings.bitrate_kbps, 2_000..=100_000)
-                            .step_by(1_000.0)
-                            .clamping(egui::SliderClamping::Never)
-                            .suffix(" kbps")
-                            .text("Bitrate"),
-                    );
+                        egui::Slider::new(
+                            &mut self.settings.bitrate_kbps,
+                            MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS,
+                        )
+                        .step_by(1_000.0)
+                        .clamping(egui::SliderClamping::Always)
+                        .suffix(" kbps")
+                        .text("Bitrate"),
+                    )
+                    .on_hover_text("PS5 Remote Play FEC limit: 2,000-100,000 kbps (100 Mbps max)");
 
                     ui.checkbox(&mut self.settings.vsync, "VSync");
+                    ui.checkbox(&mut self.settings.touchpad_touch, "Touchpad Touch")
+                        .on_hover_text(
+                            "Off: click-only (prevents touch registering as click in GTA 6). On: capacitive swipe/touch.",
+                        );
                 });
             });
 
@@ -1654,7 +1664,12 @@ fn trigger_register_worker(modal: &mut RegisterModal) {
     modal.notice = Some("Connecting to PS5 for registration...".into());
 }
 
-fn render_streaming_ui(ui: &mut egui::Ui, stream: &mut ActiveStream, gamepad_name: Option<&str>) {
+fn render_streaming_ui(
+    ui: &mut egui::Ui,
+    stream: &mut ActiveStream,
+    gamepad_name: Option<&str>,
+    touchpad_touch: &mut bool,
+) {
     if stream.show_hud {
         egui::Area::new(egui::Id::unique("stream_hud"))
             .anchor(egui::Align2::LEFT_TOP, [14.0, 14.0])
@@ -1704,6 +1719,10 @@ fn render_streaming_ui(ui: &mut egui::Ui, stream: &mut ActiveStream, gamepad_nam
                             {
                                 stream.disconnect_requested = true;
                             }
+
+                            ui.separator();
+                            ui.checkbox(touchpad_touch, "Touchpad Touch")
+                                .on_hover_text("Off: click-only. On: capacitive touch/swipe.");
                         });
 
                         let (decode_ms_text, decoder_badge) = match &stream.current_frame {

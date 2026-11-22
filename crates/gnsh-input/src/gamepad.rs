@@ -5,8 +5,9 @@ use std::os::raw::c_int;
 
 const STICK_DEADZONE: i16 = 2200;
 const STANDARD_GRAVITY: f32 = 9.80665;
-const PS5_TOUCHPAD_WIDTH: f32 = 1920.0;
-const PS5_TOUCHPAD_HEIGHT: f32 = 1080.0;
+const PS5_TOUCHPAD_WIDTH: f32 = 1919.0;
+const PS5_TOUCHPAD_HEIGHT: f32 = 942.0;
+const TOUCH_POS_DEADBAND: u16 = 4;
 
 const BUTTON_MAP: &[(ffi::SDL_GamepadButton, u32)] = &[
     (
@@ -106,6 +107,71 @@ where
     mask
 }
 
+#[derive(Debug)]
+struct TouchpadTracker {
+    next_id: u8,
+    active_ids: [i8; 2],
+    last_pos: [(u16, u16); 2],
+}
+
+impl Default for TouchpadTracker {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            active_ids: [-1, -1],
+            last_pos: [(0, 0); 2],
+        }
+    }
+}
+
+impl TouchpadTracker {
+    fn reset(&mut self) {
+        self.active_ids = [-1, -1];
+        self.last_pos = [(0, 0); 2];
+    }
+
+    fn update(
+        &mut self,
+        raw: [(bool, f32, f32); 2],
+        allow_capacitive: bool,
+        clicked: bool,
+    ) -> [TouchPoint; 2] {
+        let mut touches = [TouchPoint::default(); 2];
+        // Suppress bare capacitive touch when click-only mode is active so resting a thumb does
+        // not synthesize a click in PS5 games that misinterpret Remote Play 0xd0 touch events.
+        if !allow_capacitive && !clicked {
+            self.active_ids = [-1, -1];
+            return touches;
+        }
+
+        for (i, &(down, x, y)) in raw.iter().enumerate() {
+            if !down {
+                self.active_ids[i] = -1;
+                continue;
+            }
+            let px = (x.clamp(0.0, 1.0) * PS5_TOUCHPAD_WIDTH).round() as u16;
+            let py = (y.clamp(0.0, 1.0) * PS5_TOUCHPAD_HEIGHT).round() as u16;
+            if self.active_ids[i] < 0 {
+                let id = self.next_id as i8;
+                self.next_id = (self.next_id + 1) & 0x7f;
+                self.active_ids[i] = id;
+                self.last_pos[i] = (px, py);
+            } else {
+                let (lx, ly) = self.last_pos[i];
+                if px.abs_diff(lx) >= TOUCH_POS_DEADBAND || py.abs_diff(ly) >= TOUCH_POS_DEADBAND {
+                    self.last_pos[i] = (px, py);
+                }
+            }
+            touches[i] = TouchPoint {
+                id: self.active_ids[i],
+                x: self.last_pos[i].0,
+                y: self.last_pos[i].1,
+            };
+        }
+        touches
+    }
+}
+
 struct ActiveGamepad {
     ptr: *mut ffi::SDL_Gamepad,
     instance_id: u32,
@@ -115,13 +181,17 @@ struct ActiveGamepad {
 /// Manages an active SDL3 gamepad for controller polling, sensors, LED, and rumble.
 pub struct GamepadManager {
     active: Option<ActiveGamepad>,
+    touch_tracker: TouchpadTracker,
 }
 
 impl GamepadManager {
     /// Initializes SDL3 and opens the first connected gamepad if available.
     pub fn new() -> anyhow::Result<Self> {
         crate::init_sdl()?;
-        let mut manager = Self { active: None };
+        let mut manager = Self {
+            active: None,
+            touch_tracker: TouchpadTracker::default(),
+        };
         manager.open_first_available(None);
         Ok(manager)
     }
@@ -152,46 +222,53 @@ impl GamepadManager {
     }
 
     /// Polls buttons, deadzoned sticks, triggers, touchpad fingers, gyro, and accel.
-    pub fn poll_state(&self) -> Option<ControllerState> {
-        let gp = self.active.as_ref()?;
-        if !unsafe { ffi::SDL_GamepadConnected(gp.ptr) } {
+    ///
+    /// When `allow_capacitive_touch` is `false`, finger coordinates are only forwarded while the
+    /// physical touchpad click button is held (workaround for Remote Play touch-as-click issues).
+    pub fn poll_state(&mut self, allow_capacitive_touch: bool) -> Option<ControllerState> {
+        let gp_ptr = self.active.as_ref()?.ptr;
+        if !unsafe { ffi::SDL_GamepadConnected(gp_ptr) } {
             return None;
         }
 
-        let buttons = map_sdl_buttons(|btn| unsafe { ffi::SDL_GetGamepadButton(gp.ptr, btn) });
+        let buttons = map_sdl_buttons(|btn| unsafe { ffi::SDL_GetGamepadButton(gp_ptr, btn) });
 
         let left_x = apply_stick_deadzone(
-            unsafe { ffi::SDL_GetGamepadAxis(gp.ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_LEFTX) },
+            unsafe { ffi::SDL_GetGamepadAxis(gp_ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_LEFTX) },
             STICK_DEADZONE,
         );
         let left_y = apply_stick_deadzone(
-            unsafe { ffi::SDL_GetGamepadAxis(gp.ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_LEFTY) },
+            unsafe { ffi::SDL_GetGamepadAxis(gp_ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_LEFTY) },
             STICK_DEADZONE,
         );
         let right_x = apply_stick_deadzone(
             unsafe {
-                ffi::SDL_GetGamepadAxis(gp.ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_RIGHTX)
+                ffi::SDL_GetGamepadAxis(gp_ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_RIGHTX)
             },
             STICK_DEADZONE,
         );
         let right_y = apply_stick_deadzone(
             unsafe {
-                ffi::SDL_GetGamepadAxis(gp.ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_RIGHTY)
+                ffi::SDL_GetGamepadAxis(gp_ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_RIGHTY)
             },
             STICK_DEADZONE,
         );
 
         let l2 = scale_trigger_u8(unsafe {
-            ffi::SDL_GetGamepadAxis(gp.ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_LEFT_TRIGGER)
+            ffi::SDL_GetGamepadAxis(gp_ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_LEFT_TRIGGER)
         });
         let r2 = scale_trigger_u8(unsafe {
-            ffi::SDL_GetGamepadAxis(gp.ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
+            ffi::SDL_GetGamepadAxis(gp_ptr, ffi::SDL_GamepadAxis_SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
         });
 
-        let touches = poll_touchpad(gp.ptr);
-        let gyro = read_sensor(gp.ptr, ffi::SDL_SensorType_SDL_SENSOR_GYRO, [0.0; 3]);
+        let raw_touches = poll_touchpad_raw(gp_ptr);
+        let touchpad_clicked = (buttons & buttons::TOUCHPAD) != 0;
+        let touches =
+            self.touch_tracker
+                .update(raw_touches, allow_capacitive_touch, touchpad_clicked);
+        let gyro = read_sensor(gp_ptr, ffi::SDL_SensorType_SDL_SENSOR_GYRO, [0.0; 3]);
         let accel_mps2 = read_sensor(
-            gp.ptr,
+            gp_ptr,
             ffi::SDL_SensorType_SDL_SENSOR_ACCEL,
             [0.0, STANDARD_GRAVITY, 0.0],
         );
@@ -285,6 +362,7 @@ impl GamepadManager {
         enable_sensor_if_present(ptr, ffi::SDL_SensorType_SDL_SENSOR_GYRO);
 
         tracing::info!("Opened gamepad: {name} (id={instance_id})");
+        self.touch_tracker.reset();
         self.active = Some(ActiveGamepad {
             ptr,
             instance_id,
@@ -294,6 +372,7 @@ impl GamepadManager {
     }
 
     fn close_active(&mut self) {
+        self.touch_tracker.reset();
         if let Some(gp) = self.active.take()
             && !gp.ptr.is_null()
         {
@@ -340,11 +419,11 @@ fn read_sensor(
     data
 }
 
-fn poll_touchpad(gamepad: *mut ffi::SDL_Gamepad) -> [TouchPoint; 2] {
-    let mut touches = [TouchPoint::default(); 2];
+fn poll_touchpad_raw(gamepad: *mut ffi::SDL_Gamepad) -> [(bool, f32, f32); 2] {
+    let mut raw = [(false, 0.0_f32, 0.0_f32); 2];
     let num_touchpads = unsafe { ffi::SDL_GetNumGamepadTouchpads(gamepad) };
     if num_touchpads <= 0 {
-        return touches;
+        return raw;
     }
 
     let num_fingers = unsafe { ffi::SDL_GetNumGamepadTouchpadFingers(gamepad, 0) }.clamp(0, 2);
@@ -364,14 +443,10 @@ fn poll_touchpad(gamepad: *mut ffi::SDL_Gamepad) -> [TouchPoint; 2] {
             )
         };
         if ok && down {
-            touches[finger_idx as usize] = TouchPoint {
-                id: finger_idx as i8,
-                x: (x.clamp(0.0, 1.0) * PS5_TOUCHPAD_WIDTH).round() as u16,
-                y: (y.clamp(0.0, 1.0) * PS5_TOUCHPAD_HEIGHT).round() as u16,
-            };
+            raw[finger_idx as usize] = (true, x, y);
         }
     }
-    touches
+    raw
 }
 
 #[cfg(test)]
@@ -439,5 +514,44 @@ mod tests {
         let unmapped =
             map_sdl_buttons(|btn| btn == ffi::SDL_GamepadButton_SDL_GAMEPAD_BUTTON_MISC1);
         assert_eq!(unmapped, 0);
+    }
+
+    #[test]
+    fn touchpad_click_only_suppresses_bare_touch_and_allows_clicked_position() {
+        let mut tracker = TouchpadTracker::default();
+        let bare = tracker.update([(true, 0.5, 0.5), (false, 0.0, 0.0)], false, false);
+        assert_eq!(bare, [TouchPoint::default(); 2]);
+
+        let clicked = tracker.update([(true, 0.25, 0.5), (false, 0.0, 0.0)], false, true);
+        assert_eq!(clicked[0].id, 0);
+        assert_eq!(clicked[0].x, (0.25_f32 * PS5_TOUCHPAD_WIDTH).round() as u16);
+        assert_eq!(clicked[0].y, (0.5_f32 * PS5_TOUCHPAD_HEIGHT).round() as u16);
+        assert_eq!(clicked[1].id, -1);
+
+        let released = tracker.update([(true, 0.25, 0.5), (false, 0.0, 0.0)], false, false);
+        assert_eq!(released, [TouchPoint::default(); 2]);
+    }
+
+    #[test]
+    fn touchpad_capacitive_mode_increments_7bit_ids_and_clamps_bounds() {
+        let mut tracker = TouchpadTracker {
+            next_id: 127,
+            ..Default::default()
+        };
+        let first = tracker.update([(true, 1.5, -0.2), (false, 0.0, 0.0)], true, false);
+        assert_eq!(first[0].id, 127);
+        assert_eq!(first[0].x, 1919);
+        assert_eq!(first[0].y, 0);
+
+        // Noise smaller than deadband preserves stabilized coordinates without new movement.
+        let jitter = tracker.update([(true, 0.999, 0.001), (false, 0.0, 0.0)], true, false);
+        assert_eq!(jitter[0], first[0]);
+
+        // Lift then touch again wraps 7-bit tracking ID cleanly from 127 -> 0.
+        let lifted = tracker.update([(false, 0.0, 0.0), (false, 0.0, 0.0)], true, false);
+        assert_eq!(lifted[0].id, -1);
+        let second = tracker.update([(true, 0.5, 1.0), (false, 0.0, 0.0)], true, false);
+        assert_eq!(second[0].id, 0);
+        assert_eq!(second[0].y, 942);
     }
 }
