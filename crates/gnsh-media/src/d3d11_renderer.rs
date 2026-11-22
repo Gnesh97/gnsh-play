@@ -484,6 +484,7 @@ impl D3D11Renderer {
                 v_stride,
                 width,
                 height,
+                ..
             } => self.draw_sw_yuv420(y, u, v, *y_stride, *u_stride, *v_stride, *width, *height)?,
         }
 

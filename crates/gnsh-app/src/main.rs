@@ -43,7 +43,7 @@ const DEFAULT_HEIGHT: u32 = 720;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 const IDR_COOLDOWN: Duration = Duration::from_millis(500);
-const LOW_LATENCY_INPUT_WAIT: Duration = Duration::from_millis(4);
+const LOW_LATENCY_INPUT_WAIT: Duration = Duration::from_millis(1);
 const IDLE_UI_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const PIPELINE_HISTORY_LEN: usize = 120;
 const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -318,11 +318,16 @@ fn run_gui() -> Result<()> {
     let mut last_present = Instant::now();
 
     loop {
-        if let AppMode::Streaming(ref stream) = app.mode
-            && !app.settings.vsync
+        let waited_for_latency = if matches!(app.mode, AppMode::Streaming(_)) && !app.settings.vsync
         {
-            stream.wait_for_frame(LOW_LATENCY_INPUT_WAIT);
-        }
+            if let AppMode::Streaming(ref stream) = app.mode {
+                stream.wait_for_frame(LOW_LATENCY_INPUT_WAIT);
+            }
+            false
+        } else {
+            renderer.wait_for_frame_latency(100);
+            true
+        };
 
         let summary = window.poll_events(&mut gamepads, &mut raw_input);
         if summary.quit {
@@ -373,7 +378,9 @@ fn run_gui() -> Result<()> {
             continue;
         }
 
-        renderer.wait_for_frame_latency(100);
+        if !waited_for_latency {
+            renderer.wait_for_frame_latency(100);
+        }
 
         raw_input.time = Some(start_time.elapsed().as_secs_f64());
 
@@ -391,34 +398,40 @@ fn run_gui() -> Result<()> {
             tracing::warn!("draw_video_frame failed: {err:#}");
         }
 
-        renderer.bind_backbuffer();
+        let draw_egui = !is_streaming
+            || matches!(&app.mode, AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some());
+        if draw_egui {
+            renderer.bind_backbuffer();
 
-        let gamepad_name = gamepads.connected_name().map(str::to_owned);
-        let device_for_connect = renderer.device().clone();
-        let full_output = egui_ctx.run_ui(raw_input.take(), |ui| {
-            app.ui(ui, gamepad_name.as_deref(), &device_for_connect);
-        });
+            let gamepad_name = gamepads.connected_name().map(str::to_owned);
+            let device_for_connect = renderer.device().clone();
+            let full_output = egui_ctx.run_ui(raw_input.take(), |ui| {
+                app.ui(ui, gamepad_name.as_deref(), &device_for_connect);
+            });
 
-        handle_platform_commands(&window, &full_output.platform_output.commands);
+            handle_platform_commands(&window, &full_output.platform_output.commands);
 
-        let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        if let Err(err) = painter.update_textures(
-            renderer.device(),
-            renderer.context(),
-            &full_output.textures_delta,
-        ) {
-            tracing::warn!("egui texture upload failed: {err:#}");
+            let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+            if let Err(err) = painter.update_textures(
+                renderer.device(),
+                renderer.context(),
+                &full_output.textures_delta,
+            ) {
+                tracing::warn!("egui texture upload failed: {err:#}");
+            }
+            if let Err(err) = painter.paint(
+                renderer.device(),
+                renderer.context(),
+                renderer.viewport_size(),
+                full_output.pixels_per_point,
+                &clipped,
+            ) {
+                tracing::warn!("egui paint failed: {err:#}");
+            }
+            painter.free_textures(&full_output.textures_delta);
+        } else {
+            let _ = raw_input.take();
         }
-        if let Err(err) = painter.paint(
-            renderer.device(),
-            renderer.context(),
-            renderer.viewport_size(),
-            full_output.pixels_per_point,
-            &clipped,
-        ) {
-            tracing::warn!("egui paint failed: {err:#}");
-        }
-        painter.free_textures(&full_output.textures_delta);
 
         let vsync = if is_streaming {
             app.settings.vsync
@@ -665,6 +678,7 @@ struct ActiveStream {
     current_frame: Option<LatestFrame>,
     current_frame_pending_measure: bool,
     frames_decoded: Arc<AtomicU64>,
+    decoder_lag_frames: Arc<AtomicU64>,
     frames_lost_total: Arc<AtomicU64>,
     idr_needed: Arc<AtomicBool>,
     video_init_error: Arc<Mutex<Option<String>>>,
@@ -735,6 +749,7 @@ impl ActiveStream {
 
         let frame_sync = Arc::new((Mutex::new(None), Condvar::new()));
         let frames_decoded = Arc::new(AtomicU64::new(0));
+        let decoder_lag_frames = Arc::new(AtomicU64::new(0));
         let frames_lost_total = Arc::new(AtomicU64::new(0));
         let idr_needed = Arc::new(AtomicBool::new(false));
         let video_init_error = Arc::new(Mutex::new(None));
@@ -750,6 +765,7 @@ impl ActiveStream {
             video_rx: channels.video_rx,
             frame_sync: Arc::clone(&frame_sync),
             frames_decoded: Arc::clone(&frames_decoded),
+            decoder_lag_frames: Arc::clone(&decoder_lag_frames),
             frames_lost_total: Arc::clone(&frames_lost_total),
             idr_needed: Arc::clone(&idr_needed),
             init_error: Arc::clone(&video_init_error),
@@ -789,6 +805,7 @@ impl ActiveStream {
             current_frame: None,
             current_frame_pending_measure: false,
             frames_decoded,
+            decoder_lag_frames,
             frames_lost_total,
             idr_needed,
             video_init_error,
@@ -961,6 +978,7 @@ struct VideoWorkerArgs {
     video_rx: Receiver<gnsh_proto::VideoPacket>,
     frame_sync: Arc<(Mutex<Option<LatestFrame>>, Condvar)>,
     frames_decoded: Arc<AtomicU64>,
+    decoder_lag_frames: Arc<AtomicU64>,
     frames_lost_total: Arc<AtomicU64>,
     idr_needed: Arc<AtomicBool>,
     init_error: Arc<Mutex<Option<String>>>,
@@ -987,6 +1005,8 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
     );
 
     let mut consecutive_errors: u32 = 0;
+    let mut next_seq: i64 = 1;
+    let mut seq_arrivals: VecDeque<(i64, Instant)> = VecDeque::with_capacity(32);
 
     while !args.stop_flag.load(Ordering::Relaxed) {
         match args.video_rx.recv_timeout(Duration::from_millis(50)) {
@@ -1004,8 +1024,15 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                     }
                 }
 
+                let seq = next_seq;
+                next_seq = next_seq.saturating_add(1);
+                seq_arrivals.push_back((seq, pkt.arrived_at));
+                while seq_arrivals.len() > 32 {
+                    seq_arrivals.pop_front();
+                }
+
                 let t0 = Instant::now();
-                match decoder.decode(&pkt.data) {
+                match decoder.decode_with_pts(&pkt.data, seq) {
                     Ok(frames) => {
                         let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                         let is_hw = decoder.is_hw_active();
@@ -1015,6 +1042,20 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                             consecutive_errors = 0;
                         }
                         if let Some(frame) = frames.into_iter().last() {
+                            let out_pts = frame.pts();
+                            let matched_arrived = seq_arrivals
+                                .iter()
+                                .rev()
+                                .find(|(s, _)| *s == out_pts)
+                                .map(|(_, t)| *t)
+                                .unwrap_or(pkt.arrived_at);
+                            let lag = if out_pts > 0 && seq >= out_pts {
+                                (seq - out_pts) as u64
+                            } else {
+                                0
+                            };
+                            args.decoder_lag_frames.store(lag, Ordering::Relaxed);
+
                             let prev = {
                                 let mut guard =
                                     args.frame_sync.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -1022,7 +1063,7 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                                     frame,
                                     decode_ms,
                                     is_hw,
-                                    arrived_at: pkt.arrived_at,
+                                    arrived_at: matched_arrived,
                                 })
                             };
                             args.frame_sync.1.notify_one();
@@ -1041,6 +1082,7 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                                 "Flushing video decoder after {consecutive_errors} consecutive decode errors"
                             );
                             decoder.flush();
+                            seq_arrivals.clear();
                             consecutive_errors = 0;
                         }
                         args.idr_needed.store(true, Ordering::Relaxed);
@@ -2396,10 +2438,11 @@ fn render_streaming_ui(
                             ),
                             None => ("-- ms".to_string(), "Pending"),
                         };
+                        let buf_frames = stream.decoder_lag_frames.load(Ordering::Relaxed);
                         let pipe_text = if stream.pipe_p50_ms > 0.0 {
                             format!(
-                                "{:.1} ms (p95 {:.1})",
-                                stream.pipe_p50_ms, stream.pipe_p95_ms
+                                "{:.1} ms (p95 {:.1}, Buf {})",
+                                stream.pipe_p50_ms, stream.pipe_p95_ms, buf_frames
                             )
                         } else {
                             "-- ms".to_string()

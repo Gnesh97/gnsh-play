@@ -35,6 +35,7 @@ pub struct D3D11Frame {
     pub slice_index: u32,
     pub width: u32,
     pub height: u32,
+    pub pts: i64,
     // Retains FFmpeg's AVBufferRef until the texture slice is finished rendering.
     _av_frame: AvFrameGuard,
 }
@@ -50,7 +51,18 @@ pub enum DecodedFrame {
         v_stride: usize,
         width: u32,
         height: u32,
+        pts: i64,
     },
+}
+
+impl DecodedFrame {
+    /// Returns the FFmpeg presentation timestamp carried through decoding.
+    pub fn pts(&self) -> i64 {
+        match self {
+            Self::D3D11(frame) => frame.pts,
+            Self::SoftwareYuv420 { pts, .. } => *pts,
+        }
+    }
 }
 
 pub struct VideoDecoder {
@@ -92,6 +104,11 @@ impl VideoDecoder {
     }
 
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
+        self.decode_with_pts(annex_b, 0)
+    }
+
+    /// Decodes one Annex-B unit while tagging `AVPacket.pts` so output frames preserve lag identity.
+    pub fn decode_with_pts(&mut self, annex_b: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
         if annex_b.is_empty() {
             return Ok(Vec::new());
         }
@@ -100,16 +117,20 @@ impl VideoDecoder {
         let mut send_err = unsafe {
             (*self.pkt).data = annex_b.as_ptr().cast_mut();
             (*self.pkt).size = annex_b.len() as i32;
+            (*self.pkt).pts = pts;
+            (*self.pkt).dts = pts;
             ffi::avcodec_send_packet(self.ctx, self.pkt)
         };
 
         if send_err == ffi::GNSH_AVERROR_EAGAIN {
             if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackToSw) {
-                return self.decode(annex_b);
+                return self.decode_with_pts(annex_b, pts);
             }
             send_err = unsafe {
                 (*self.pkt).data = annex_b.as_ptr().cast_mut();
                 (*self.pkt).size = annex_b.len() as i32;
+                (*self.pkt).pts = pts;
+                (*self.pkt).dts = pts;
                 ffi::avcodec_send_packet(self.ctx, self.pkt)
             };
         }
@@ -122,13 +143,13 @@ impl VideoDecoder {
                 );
                 let sw = Self::open_internal(self.codec, None)?;
                 *self = sw;
-                return self.decode(annex_b);
+                return self.decode_with_pts(annex_b, pts);
             }
             bail!("avcodec_send_packet failed: {}", av_err_string(send_err));
         }
 
         if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackToSw) {
-            return self.decode(annex_b);
+            return self.decode_with_pts(annex_b, pts);
         }
 
         Ok(frames)
@@ -198,6 +219,8 @@ impl VideoDecoder {
         unsafe {
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
+            // Disallow FF_THREAD_FRAME (1), which adds 1+ frame of decode buffering latency.
+            (*ctx).thread_type = 2;
         }
 
         if let Some(dev) = d3d11_device {
@@ -319,6 +342,7 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
     let fmt = unsafe { (*src).format };
     let width = unsafe { (*src).width.max(0) as u32 };
     let height = unsafe { (*src).height.max(0) as u32 };
+    let pts = unsafe { (*src).pts };
     if width == 0 || height == 0 {
         return Ok(None);
     }
@@ -339,6 +363,7 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
             slice_index,
             width,
             height,
+            pts,
             _av_frame: guard,
         })));
     }
@@ -370,6 +395,7 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
             v_stride: cw,
             width,
             height,
+            pts,
         }));
     }
 
@@ -405,6 +431,7 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame) -> Result<Option<DecodedFrame>> 
             v_stride: cw,
             width,
             height,
+            pts,
         }));
     }
 
@@ -475,5 +502,16 @@ mod tests {
             .decode(TEST_H264_IDR)
             .expect("IDR decodes cleanly after flush");
         assert_eq!(second.len(), 1);
+    }
+
+    #[test]
+    fn preserves_packet_pts_across_decode() {
+        let mut decoder =
+            VideoDecoder::new(MediaCodec::H264, None).expect("FFmpeg H264 decoder initializes");
+        let frames = decoder
+            .decode_with_pts(TEST_H264_IDR, 42)
+            .expect("H.264 IDR decodes with explicit PTS");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts(), 42);
     }
 }

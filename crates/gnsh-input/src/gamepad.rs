@@ -3,7 +3,7 @@ use gnsh_proto::controller::{ControllerState, TouchPoint, buttons};
 use std::ffi::CStr;
 use std::os::raw::c_int;
 
-const STICK_DEADZONE: i16 = 2200;
+const STICK_DEADZONE: i16 = 0;
 const STANDARD_GRAVITY: f32 = 9.80665;
 const PS5_TOUCHPAD_WIDTH: f32 = 1919.0;
 const PS5_TOUCHPAD_HEIGHT: f32 = 942.0;
