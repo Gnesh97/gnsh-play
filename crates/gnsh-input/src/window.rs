@@ -14,6 +14,7 @@ pub struct WindowEventSummary {
     pub toggle_hud: bool,
     pub escape_pressed: bool,
     pub toggle_mic: bool,
+    pub go_home: bool,
     pub audio_devices_changed: bool,
 }
 
@@ -266,6 +267,7 @@ impl AppWindow {
                 ffi::SDLK_F11 => summary.toggle_fullscreen = true,
                 ffi::SDLK_F3 => summary.toggle_hud = true,
                 ffi::SDLK_ESCAPE => summary.escape_pressed = true,
+                ffi::SDLK_HOME if !modifiers.ctrl && !modifiers.alt => summary.go_home = true,
                 _ => {}
             }
         }

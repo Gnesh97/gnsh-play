@@ -5,7 +5,9 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gnsh_chiaki_sys::{
     ChiakiAudioHeader, ChiakiAudioSink, ChiakiCodec_CHIAKI_CODEC_H264,
     ChiakiCodec_CHIAKI_CODEC_H265, ChiakiConnectInfo, ChiakiConnectVideoProfile, ChiakiEvent,
-    ChiakiEventType_CHIAKI_EVENT_CONNECTED, ChiakiEventType_CHIAKI_EVENT_LED_COLOR,
+    ChiakiEventType_CHIAKI_EVENT_CONNECTED, ChiakiEventType_CHIAKI_EVENT_KEYBOARD_OPEN,
+    ChiakiEventType_CHIAKI_EVENT_KEYBOARD_REMOTE_CLOSE,
+    ChiakiEventType_CHIAKI_EVENT_KEYBOARD_TEXT_CHANGE, ChiakiEventType_CHIAKI_EVENT_LED_COLOR,
     ChiakiEventType_CHIAKI_EVENT_LOGIN_PIN_REQUEST, ChiakiEventType_CHIAKI_EVENT_NICKNAME_RECEIVED,
     ChiakiEventType_CHIAKI_EVENT_QUIT, ChiakiEventType_CHIAKI_EVENT_RUMBLE,
     ChiakiEventType_CHIAKI_EVENT_TRIGGER_EFFECTS, ChiakiOpusDecoder, ChiakiOpusEncoder,
@@ -17,10 +19,11 @@ use gnsh_chiaki_sys::{
     chiaki_connect_video_profile_preset, chiaki_opus_decoder_fini, chiaki_opus_decoder_get_sink,
     chiaki_opus_decoder_init, chiaki_opus_encoder_fini, chiaki_opus_encoder_frame,
     chiaki_opus_encoder_header, chiaki_opus_encoder_init, chiaki_quit_reason_string,
-    chiaki_session_connect_microphone, chiaki_session_fini, chiaki_session_init,
-    chiaki_session_join, chiaki_session_request_idr, chiaki_session_set_controller_state,
-    chiaki_session_set_login_pin, chiaki_session_start, chiaki_session_stop,
-    chiaki_session_toggle_microphone,
+    chiaki_session_connect_microphone, chiaki_session_fini, chiaki_session_go_home,
+    chiaki_session_init, chiaki_session_join, chiaki_session_keyboard_accept,
+    chiaki_session_keyboard_reject, chiaki_session_keyboard_set_text, chiaki_session_request_idr,
+    chiaki_session_set_controller_state, chiaki_session_set_login_pin, chiaki_session_start,
+    chiaki_session_stop, chiaki_session_toggle_microphone,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -152,6 +155,13 @@ pub enum SessionEvent {
     LoginPinRequested {
         incorrect: bool,
     },
+    KeyboardOpen {
+        text: String,
+    },
+    KeyboardTextChange {
+        text: String,
+    },
+    KeyboardRemoteClose,
 }
 
 pub struct SessionChannels {
@@ -250,7 +260,7 @@ impl Ps5Session {
             morning: config.rp_key,
             video_profile,
             video_profile_auto_downgrade: true,
-            enable_keyboard: false,
+            enable_keyboard: true,
             enable_dualsense: config.enable_dualsense,
             packet_loss_max: 0.05,
             // Upstream chiaki-ng defaults this to false: requesting IDR on every FEC miss locks
@@ -389,6 +399,39 @@ impl Ps5Session {
 
     pub fn request_idr(&mut self) -> Result<()> {
         let err = unsafe { chiaki_session_request_idr(self.session.as_mut()) };
+        check_chiaki(err)
+    }
+
+    /// Updates live PS5 on-screen keyboard text using UTF-8 with NUL/newline bytes stripped.
+    pub fn keyboard_set_text(&mut self, text: &str) -> Result<()> {
+        let clean = sanitize_osk_text(text);
+        let c_text = CString::new(clean)
+            .map_err(|_| ProtoError::InvalidArg("OSK text contains interior NUL".into()))?;
+        // SAFETY: self.session is a live ChiakiSession and c_text is valid NUL-terminated UTF-8
+        // for the synchronous duration of chiaki_session_keyboard_set_text.
+        let err =
+            unsafe { chiaki_session_keyboard_set_text(self.session.as_mut(), c_text.as_ptr()) };
+        check_chiaki(err)
+    }
+
+    /// Accepts and submits the active PS5 on-screen keyboard dialog.
+    pub fn keyboard_accept(&mut self) -> Result<()> {
+        // SAFETY: self.session is a live ChiakiSession owned by Ps5Session.
+        let err = unsafe { chiaki_session_keyboard_accept(self.session.as_mut()) };
+        check_chiaki(err)
+    }
+
+    /// Cancels and closes the active PS5 on-screen keyboard dialog.
+    pub fn keyboard_reject(&mut self) -> Result<()> {
+        // SAFETY: self.session is a live ChiakiSession owned by Ps5Session.
+        let err = unsafe { chiaki_session_keyboard_reject(self.session.as_mut()) };
+        check_chiaki(err)
+    }
+
+    /// Sends the PlayStation Home button control message to the active PS5 session.
+    pub fn go_home(&mut self) -> Result<()> {
+        // SAFETY: self.session is a live ChiakiSession owned by Ps5Session.
+        let err = unsafe { chiaki_session_go_home(self.session.as_mut()) };
         check_chiaki(err)
     }
 
@@ -771,6 +814,23 @@ unsafe extern "C" fn haptics_frame_cb(buf: *mut u8, buf_size: usize, user: *mut 
     }
 }
 
+/// Strips NUL and newline characters from PS5 on-screen keyboard text while keeping full UTF-8.
+pub fn sanitize_osk_text(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !matches!(c, '\0' | '\r' | '\n'))
+        .collect()
+}
+
+unsafe fn c_str_opt(ptr: *const std::os::raw::c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
     if event.is_null() || user.is_null() {
         return;
@@ -838,6 +898,17 @@ unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
                 incorrect: ev.__bindgen_anon_1.login_pin_request.pin_incorrect,
             })
         },
+        x if x == ChiakiEventType_CHIAKI_EVENT_KEYBOARD_OPEN => unsafe {
+            let text = c_str_opt(ev.__bindgen_anon_1.keyboard.text_str);
+            Some(SessionEvent::KeyboardOpen { text })
+        },
+        x if x == ChiakiEventType_CHIAKI_EVENT_KEYBOARD_TEXT_CHANGE => unsafe {
+            let text = c_str_opt(ev.__bindgen_anon_1.keyboard.text_str);
+            Some(SessionEvent::KeyboardTextChange { text })
+        },
+        x if x == ChiakiEventType_CHIAKI_EVENT_KEYBOARD_REMOTE_CLOSE => {
+            Some(SessionEvent::KeyboardRemoteClose)
+        }
         _ => None,
     };
 
@@ -935,5 +1006,12 @@ mod tests {
         bytes.extend_from_slice(&(-1234_i16).to_le_bytes());
         bytes.extend_from_slice(&5678_i16.to_le_bytes());
         assert_eq!(haptics_bytes_to_i16(&bytes), Some(vec![-1234, 5678]));
+    }
+
+    #[test]
+    fn sanitizes_osk_text_preserving_utf8_and_stripping_nul_newlines() {
+        let input = "Merhaba\0 PS5\r\nTürkçe çğışöü";
+        assert_eq!(sanitize_osk_text(input), "Merhaba PS5Türkçe çğışöü");
+        assert_eq!(sanitize_osk_text(""), "");
     }
 }

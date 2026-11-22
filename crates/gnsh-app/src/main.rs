@@ -350,6 +350,7 @@ fn run_gui() -> Result<()> {
             summary.toggle_hud,
             summary.escape_pressed,
             summary.toggle_mic,
+            summary.go_home,
         );
         if summary.audio_devices_changed
             && let AppMode::Streaming(ref stream) = app.mode
@@ -372,6 +373,7 @@ fn run_gui() -> Result<()> {
             || summary.toggle_fullscreen
             || summary.toggle_hud
             || summary.toggle_mic
+            || summary.go_home
             || summary.escape_pressed
             || last_present.elapsed() >= IDLE_UI_REFRESH_INTERVAL;
         if !should_render {
@@ -399,7 +401,10 @@ fn run_gui() -> Result<()> {
         }
 
         let draw_egui = !is_streaming
-            || matches!(&app.mode, AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some());
+            || matches!(
+                &app.mode,
+                AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some() || s.osk_prompt.is_some()
+            );
         if draw_egui {
             renderer.bind_backbuffer();
 
@@ -669,6 +674,13 @@ struct LoginPinPrompt {
     incorrect: bool,
 }
 
+struct OskPrompt {
+    text: String,
+    last_sent_text: String,
+    needs_focus: bool,
+    cancel_requested: bool,
+}
+
 struct ActiveStream {
     console_name: String,
     console_host: String,
@@ -696,7 +708,9 @@ struct ActiveStream {
     connected: bool,
     show_hud: bool,
     disconnect_requested: bool,
+    go_home_requested: bool,
     pin_prompt: Option<LoginPinPrompt>,
+    osk_prompt: Option<OskPrompt>,
     fps: f32,
     fps_window_start: Instant,
     fps_last_count: u64,
@@ -823,7 +837,9 @@ impl ActiveStream {
             connected: false,
             show_hud: true,
             disconnect_requested: false,
+            go_home_requested: false,
             pin_prompt: None,
+            osk_prompt: None,
             fps: 0.0,
             fps_window_start: Instant::now(),
             fps_last_count: 0,
@@ -1273,7 +1289,13 @@ impl AppState {
         self.wake_rx = Some(rx);
     }
 
-    fn handle_shortcuts(&mut self, toggle_hud: bool, escape_pressed: bool, toggle_mic: bool) {
+    fn handle_shortcuts(
+        &mut self,
+        toggle_hud: bool,
+        escape_pressed: bool,
+        toggle_mic: bool,
+        go_home: bool,
+    ) {
         match &mut self.mode {
             AppMode::Home => {
                 if escape_pressed && self.register_modal.is_some() {
@@ -1287,8 +1309,15 @@ impl AppState {
                 if toggle_mic {
                     stream.mic_toggle_requested = true;
                 }
+                if go_home && stream.osk_prompt.is_none() && stream.pin_prompt.is_none() {
+                    stream.go_home_requested = true;
+                }
                 if escape_pressed {
-                    stream.disconnect_requested = true;
+                    if let Some(osk) = stream.osk_prompt.as_mut() {
+                        osk.cancel_requested = true;
+                    } else {
+                        stream.disconnect_requested = true;
+                    }
                 }
             }
         }
@@ -1296,6 +1325,7 @@ impl AppState {
 
     fn poll_background(&mut self, gamepads: &mut GamepadManager) -> bool {
         let mut got_new_frame = false;
+        let mut ui_dirty = false;
         if let Some(rx) = &self.discovery_rx
             && let Ok(res) = rx.try_recv()
         {
@@ -1467,6 +1497,30 @@ impl AppState {
                             pin_input: String::new(),
                             incorrect,
                         });
+                        ui_dirty = true;
+                    }
+                    SessionEvent::KeyboardOpen { text } => {
+                        stream.osk_prompt = Some(OskPrompt {
+                            last_sent_text: text.clone(),
+                            text,
+                            needs_focus: true,
+                            cancel_requested: false,
+                        });
+                        ui_dirty = true;
+                    }
+                    SessionEvent::KeyboardTextChange { text } => {
+                        if let Some(osk) = stream.osk_prompt.as_mut()
+                            && text != osk.last_sent_text
+                        {
+                            osk.text = text.clone();
+                            osk.last_sent_text = text;
+                            ui_dirty = true;
+                        }
+                    }
+                    SessionEvent::KeyboardRemoteClose => {
+                        if stream.osk_prompt.take().is_some() {
+                            ui_dirty = true;
+                        }
                     }
                     SessionEvent::Quit { reason, is_error } => {
                         if is_error {
@@ -1484,6 +1538,28 @@ impl AppState {
             }
 
             if stream_quit_banner.is_none() {
+                if std::mem::take(&mut stream.go_home_requested)
+                    && stream.connected
+                    && let Some(session) = stream.session.as_mut()
+                    && let Err(err) = session.go_home()
+                {
+                    tracing::debug!("go_home failed: {err:#}");
+                }
+
+                if stream
+                    .osk_prompt
+                    .as_ref()
+                    .is_some_and(|o| o.cancel_requested)
+                {
+                    if let Some(session) = stream.session.as_mut()
+                        && let Err(err) = session.keyboard_reject()
+                    {
+                        tracing::debug!("keyboard_reject failed: {err:#}");
+                    }
+                    stream.osk_prompt = None;
+                    ui_dirty = true;
+                }
+
                 let gamepad_mic_toggle = gamepads.take_mic_toggle();
                 let ui_mic_toggle = std::mem::take(&mut stream.mic_toggle_requested);
                 if gamepad_mic_toggle || ui_mic_toggle {
@@ -1571,7 +1647,7 @@ impl AppState {
         if let Some(banner) = stream_quit_banner {
             self.stop_stream(gamepads, Some(banner));
         }
-        got_new_frame
+        got_new_frame || ui_dirty
     }
 
     fn process_post_ui(&mut self, gamepads: &mut GamepadManager) {
@@ -2421,13 +2497,29 @@ fn render_streaming_ui(
                                 stream.mic_toggle_requested = true;
                             }
 
+                            if ui
+                                .add_enabled(
+                                    stream.connected,
+                                    egui::Button::new(
+                                        egui::RichText::new("PS Home")
+                                            .small()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(0, 112, 209)),
+                                )
+                                .on_hover_text("Open PS5 Home screen (Home key).")
+                                .clicked()
+                            {
+                                stream.go_home_requested = true;
+                            }
+
                             ui.separator();
                             ui.checkbox(touchpad_touch, "Touchpad Touch")
                                 .on_hover_text("Off: click-only. On: capacitive touch/swipe.");
 
                             ui.separator();
                             ui.checkbox(vsync, "VSync").on_hover_text(
-                                "Off: lowest latency (decode-paced + tearing, 250 Hz input). On: tear-free VSync (1-frame DXGI queue).",
+                                "Off: lowest latency (decode-paced + tearing, 1000 Hz input). On: tear-free VSync (1-frame DXGI queue).",
                             );
                         });
 
@@ -2507,7 +2599,7 @@ fn render_streaming_ui(
 
                         ui.label(
                             egui::RichText::new(
-                                "F3: Toggle HUD   |   F11: Fullscreen   |   Ctrl+M: Toggle Mic   |   Esc: Disconnect",
+                                "F3: Toggle HUD   |   F11: Fullscreen   |   Home: PS Home   |   Ctrl+M: Toggle Mic   |   Esc: Disconnect",
                             )
                             .small()
                             .weak(),
@@ -2576,6 +2668,91 @@ fn render_streaming_ui(
             stream.pin_prompt = None;
             stream.disconnect_requested = true;
         }
+    }
+
+    render_osk_modal(ui, stream);
+}
+
+fn render_osk_modal(ui: &egui::Ui, stream: &mut ActiveStream) {
+    let Some(osk) = &mut stream.osk_prompt else {
+        return;
+    };
+
+    let mut submit = false;
+    let mut cancel = false;
+    let mut sync_text: Option<String> = None;
+
+    egui::Window::new("PS5 On-Screen Keyboard")
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .default_width(440.0)
+        .show(ui.ctx(), |ui| {
+            ui.label("Type UTF-8 text to forward directly into the active PS5 input field:");
+            ui.add_space(6.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut osk.text)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Type text to send to PS5..."),
+            );
+            if osk.needs_focus {
+                resp.request_focus();
+                osk.needs_focus = false;
+            }
+            if resp.changed() && osk.text != osk.last_sent_text {
+                sync_text = Some(osk.text.clone());
+            }
+            let enter_pressed = (resp.has_focus() || resp.lost_focus())
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Send (Enter)")
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(egui::Color32::from_rgb(0, 112, 209)),
+                    )
+                    .clicked()
+                    || enter_pressed
+                {
+                    submit = true;
+                }
+                if ui.button("Cancel (Esc)").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if submit {
+        if let Some(session) = stream.session.as_mut() {
+            if osk.text != osk.last_sent_text
+                && let Err(err) = session.keyboard_set_text(&osk.text)
+            {
+                tracing::debug!("keyboard_set_text failed: {err:#}");
+            }
+            if let Err(err) = session.keyboard_accept() {
+                tracing::debug!("keyboard_accept failed: {err:#}");
+            }
+        }
+        stream.osk_prompt = None;
+    } else if cancel {
+        if let Some(session) = stream.session.as_mut()
+            && let Err(err) = session.keyboard_reject()
+        {
+            tracing::debug!("keyboard_reject failed: {err:#}");
+        }
+        stream.osk_prompt = None;
+    } else if let Some(text) = sync_text {
+        if let Some(session) = stream.session.as_mut()
+            && let Err(err) = session.keyboard_set_text(&text)
+        {
+            tracing::debug!("keyboard_set_text failed: {err:#}");
+        }
+        osk.last_sent_text = text;
     }
 }
 
