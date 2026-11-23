@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use gnsh_input::KbmBindings;
 use gnsh_media::ScaleMode;
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
@@ -216,6 +217,10 @@ mod tests {
             StoredSettings::default()
         );
 
+        let custom_bindings = KbmBindings {
+            cross: gnsh_input::KbmInput::Key(0x6b), // 'k'
+            ..KbmBindings::default()
+        };
         let custom = StoredSettings {
             preset: VideoPreset::P1080Fps30,
             codec: VideoCodec::HevcHdr,
@@ -226,6 +231,11 @@ mod tests {
             scale_mode: ScaleMode::Zoom,
             volume_pct: 220,
             audio_device: Some("  Speakers (Realtek Audio) ".into()),
+            kbm_enabled: true,
+            kbm_sensitivity_pct: 200,
+            kbm_deadzone_pct: 90,
+            kbm_invert_y: true,
+            kbm_bindings: custom_bindings.clone(),
         };
         store.save(&custom).expect("save custom");
         let loaded = store.load().expect("load custom");
@@ -241,10 +251,15 @@ mod tests {
             loaded.audio_device.as_deref(),
             Some("Speakers (Realtek Audio)")
         );
+        assert!(loaded.kbm_enabled);
+        assert_eq!(loaded.kbm_sensitivity_pct, 100);
+        assert_eq!(loaded.kbm_deadzone_pct, 40);
+        assert!(loaded.kbm_invert_y);
+        assert_eq!(loaded.kbm_bindings, custom_bindings);
 
         std::fs::write(
             &path,
-            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   "}"#,
+            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   ", "kbm_sensitivity_pct": 0, "kbm_deadzone_pct": 80}"#,
         )
         .expect("write unclamped json");
         let clamped = store.load().expect("load clamped");
@@ -255,6 +270,10 @@ mod tests {
         assert_eq!(clamped.preset, VideoPreset::P1080Fps60);
         assert_eq!(clamped.codec, VideoCodec::Hevc);
         assert_eq!(clamped.scale_mode, ScaleMode::Fit);
+        assert!(!clamped.kbm_enabled);
+        assert_eq!(clamped.kbm_sensitivity_pct, 1);
+        assert_eq!(clamped.kbm_deadzone_pct, 40);
+        assert!(!clamped.kbm_invert_y);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -273,6 +292,11 @@ pub struct StoredSettings {
     pub scale_mode: ScaleMode,
     pub volume_pct: u8,
     pub audio_device: Option<String>,
+    pub kbm_enabled: bool,
+    pub kbm_sensitivity_pct: u8,
+    pub kbm_deadzone_pct: u8,
+    pub kbm_invert_y: bool,
+    pub kbm_bindings: KbmBindings,
 }
 
 impl Default for StoredSettings {
@@ -287,6 +311,11 @@ impl Default for StoredSettings {
             scale_mode: ScaleMode::Fit,
             volume_pct: 100,
             audio_device: None,
+            kbm_enabled: false,
+            kbm_sensitivity_pct: 50,
+            kbm_deadzone_pct: 14,
+            kbm_invert_y: false,
+            kbm_bindings: KbmBindings::default(),
         }
     }
 }
@@ -295,6 +324,8 @@ fn normalize_settings(settings: &mut StoredSettings) {
     settings.bitrate_kbps = clamp_bitrate_kbps(settings.bitrate_kbps);
     settings.sharpness_pct = settings.sharpness_pct.min(100);
     settings.volume_pct = settings.volume_pct.min(100);
+    settings.kbm_sensitivity_pct = settings.kbm_sensitivity_pct.clamp(1, 100);
+    settings.kbm_deadzone_pct = settings.kbm_deadzone_pct.min(40);
     settings.audio_device = settings
         .audio_device
         .take()

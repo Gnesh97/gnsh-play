@@ -6,16 +6,16 @@ mod storage;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, select};
 use egui_d3d11::EguiD3d11Painter;
-use gnsh_input::{AppWindow, GamepadManager};
+use gnsh_input::{AppWindow, GamepadManager, KbmConfig, KbmEmulator, merge_controller_states};
 use gnsh_media::{
     AudioOutput, D3D11Renderer, DecodedFrame, HapticsAudioOutput, MediaCodec, MicCapture,
     ScaleMode, VideoDecoder, list_playback_devices, volume_pct_to_gain,
 };
 use gnsh_proto::{
-    ConsoleState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, Ps5Session,
-    Ps5SessionConfig, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES, VideoCodec, VideoPreset,
-    decode_account_id_b64, discover_ps5_lan, exchange_redirect_url_for_account_id, init_lib,
-    open_psn_login_in_browser, register_ps5, wake_ps5,
+    ConsoleState, ControllerState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS,
+    Ps5Session, Ps5SessionConfig, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES, VideoCodec,
+    VideoPreset, decode_account_id_b64, discover_ps5_lan, exchange_redirect_url_for_account_id,
+    init_lib, open_psn_login_in_browser, register_ps5, wake_ps5,
 };
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -299,6 +299,7 @@ fn run_gui() -> Result<()> {
     let mut painter = EguiD3d11Painter::new(renderer.device())
         .context("failed initializing egui D3D11 painter")?;
     let mut gamepads = GamepadManager::new().context("failed initializing SDL3 gamepad manager")?;
+    let mut kbm = KbmEmulator::default();
 
     let egui_ctx = egui::Context::default();
     apply_theme(&egui_ctx);
@@ -330,7 +331,7 @@ fn run_gui() -> Result<()> {
             true
         };
 
-        let summary = window.poll_events(&mut gamepads, &mut raw_input);
+        let summary = window.poll_events(&mut gamepads, &mut kbm, &mut raw_input);
         if summary.quit {
             break;
         }
@@ -347,9 +348,30 @@ fn run_gui() -> Result<()> {
             )));
         }
 
+        let prev_mouse_locked = window.is_relative_mouse_mode();
+        let mut escape_for_shortcuts = summary.escape_pressed;
+        if summary.escape_pressed && prev_mouse_locked {
+            window.set_relative_mouse_mode(false);
+            kbm.clear_state();
+            escape_for_shortcuts = false;
+        }
+        if summary.toggle_mouse_lock && matches!(app.mode, AppMode::Streaming(_)) {
+            if !app.settings.kbm_enabled {
+                app.settings.kbm_enabled = true;
+                app.persist_settings();
+                window.set_relative_mouse_mode(true);
+            } else {
+                let next = !window.is_relative_mouse_mode();
+                window.set_relative_mouse_mode(next);
+                if !next {
+                    kbm.clear_state();
+                }
+            }
+        }
+
         app.handle_shortcuts(
             summary.toggle_hud,
-            summary.escape_pressed,
+            escape_for_shortcuts,
             summary.toggle_mic,
             summary.go_home,
         );
@@ -360,13 +382,16 @@ fn run_gui() -> Result<()> {
                 stream.audio_device_recheck.store(true, Ordering::Release);
             }
         }
-        let got_new_frame = app.poll_background(&mut gamepads);
+        let got_new_frame =
+            app.poll_background(&mut gamepads, &mut kbm, window.is_relative_mouse_mode());
 
         let is_streaming = matches!(app.mode, AppMode::Streaming(_));
         if was_streaming && !is_streaming {
             renderer.clear_video_cache();
         }
         was_streaming = is_streaming;
+
+        let lock_state_changed = window.is_relative_mouse_mode() != prev_mouse_locked;
 
         let want_hdr = matches!(&app.mode, AppMode::Streaming(s) if s.codec == VideoCodec::HevcHdr);
         let hdr_mode_changed = want_hdr != prev_want_hdr;
@@ -394,10 +419,12 @@ fn run_gui() -> Result<()> {
             || app.settings.vsync
             || got_new_frame
             || hdr_mode_changed
+            || lock_state_changed
             || !raw_input.events.is_empty()
             || summary.resized.is_some()
             || summary.toggle_fullscreen
             || summary.toggle_hud
+            || summary.toggle_mouse_lock
             || summary.toggle_mic
             || summary.go_home
             || summary.escape_pressed
@@ -434,6 +461,7 @@ fn run_gui() -> Result<()> {
                 AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some() || s.osk_prompt.is_some()
             );
         let hdr_output_active = renderer.is_hdr_output_active();
+        let mouse_locked = window.is_relative_mouse_mode();
         if draw_egui {
             renderer.bind_backbuffer();
 
@@ -445,6 +473,7 @@ fn run_gui() -> Result<()> {
                     gamepad_name.as_deref(),
                     &device_for_connect,
                     hdr_output_active,
+                    mouse_locked,
                 );
             });
 
@@ -491,8 +520,32 @@ fn run_gui() -> Result<()> {
         }
 
         app.process_post_ui(&mut gamepads);
+
+        if let AppMode::Streaming(ref mut stream) = app.mode
+            && std::mem::take(&mut stream.mouse_lock_toggle_requested)
+            && app.settings.kbm_enabled
+            && stream.pin_prompt.is_none()
+            && stream.osk_prompt.is_none()
+        {
+            let next = !window.is_relative_mouse_mode();
+            window.set_relative_mouse_mode(next);
+            if !next {
+                kbm.clear_state();
+            }
+        }
+        let allow_mouse_lock = app.settings.kbm_enabled
+            && matches!(
+                &app.mode,
+                AppMode::Streaming(s) if s.pin_prompt.is_none() && s.osk_prompt.is_none()
+            );
+        if !allow_mouse_lock && window.is_relative_mouse_mode() {
+            window.set_relative_mouse_mode(false);
+            kbm.clear_state();
+        }
     }
 
+    window.set_relative_mouse_mode(false);
+    kbm.clear_state();
     app.stop_stream(&mut gamepads, None);
     let _ = renderer.set_hdr_output(false);
     renderer.clear_video_cache();
@@ -747,6 +800,8 @@ struct ActiveStream {
     _sleep_inhibitor: SleepInhibitor,
     connected: bool,
     show_hud: bool,
+    mouse_lock_toggle_requested: bool,
+    kbm_was_active: bool,
     disconnect_requested: bool,
     go_home_requested: bool,
     pin_prompt: Option<LoginPinPrompt>,
@@ -880,6 +935,8 @@ impl ActiveStream {
             _sleep_inhibitor: sleep_inhibitor,
             connected: false,
             show_hud: true,
+            mouse_lock_toggle_requested: false,
+            kbm_was_active: false,
             disconnect_requested: false,
             go_home_requested: false,
             pin_prompt: None,
@@ -1426,7 +1483,12 @@ impl AppState {
         }
     }
 
-    fn poll_background(&mut self, gamepads: &mut GamepadManager) -> bool {
+    fn poll_background(
+        &mut self,
+        gamepads: &mut GamepadManager,
+        kbm: &mut KbmEmulator,
+        mouse_locked: bool,
+    ) -> bool {
         let mut got_new_frame = false;
         let mut ui_dirty = false;
         if let Some(rx) = &self.discovery_rx
@@ -1738,7 +1800,38 @@ impl AppState {
                     }
                 }
 
-                if let Some(ctrl_state) = gamepads.poll_state(self.settings.touchpad_touch)
+                let pad_state = gamepads.poll_state(self.settings.touchpad_touch);
+                let kbm_active = self.settings.kbm_enabled
+                    && mouse_locked
+                    && stream.pin_prompt.is_none()
+                    && stream.osk_prompt.is_none();
+                let kbm_state = if kbm_active {
+                    Some(kbm.sample_state(
+                        KbmConfig {
+                            sensitivity_pct: self.settings.kbm_sensitivity_pct,
+                            deadzone_pct: self.settings.kbm_deadzone_pct,
+                            invert_y: self.settings.kbm_invert_y,
+                        },
+                        &self.settings.kbm_bindings,
+                    ))
+                } else {
+                    None
+                };
+                let combined = match (pad_state, kbm_state.as_ref()) {
+                    (Some(pad), Some(kb)) => Some(merge_controller_states(&pad, kb)),
+                    (Some(pad), None) => Some(pad),
+                    (None, Some(_)) => kbm_state,
+                    (None, None) => {
+                        if stream.kbm_was_active {
+                            Some(ControllerState::default())
+                        } else {
+                            None
+                        }
+                    }
+                };
+                stream.kbm_was_active = kbm_active;
+
+                if let Some(ctrl_state) = combined
                     && let Some(session) = stream.session.as_mut()
                     && let Err(err) = session.send_controller_state(&ctrl_state)
                 {
@@ -1819,6 +1912,7 @@ impl AppState {
         gamepad_name: Option<&str>,
         device: &ID3D11Device,
         hdr_output_active: bool,
+        mouse_locked: bool,
     ) {
         if let Some(idx) = self.pending_stream_connect.take() {
             self.begin_stream(idx, device.clone());
@@ -1837,6 +1931,7 @@ impl AppState {
                     &mut self.settings,
                     &self.audio_devices,
                     hdr_output_active,
+                    mouse_locked,
                 );
             }
         }
@@ -2018,6 +2113,9 @@ impl AppState {
                         .on_hover_text(
                             "Off: click-only (prevents touch registering as click in GTA 6). On: capacitive swipe/touch.",
                         );
+
+                    ui.separator();
+                    render_kbm_controls(ui, &mut self.settings, None);
                 });
             });
 
@@ -2622,6 +2720,62 @@ fn render_audio_device_combo(
         });
 }
 
+fn render_kbm_controls(
+    ui: &mut egui::Ui,
+    settings: &mut StreamSettings,
+    mouse_lock: Option<(bool, &mut bool)>,
+) {
+    ui.checkbox(&mut settings.kbm_enabled, "KB+M")
+        .on_hover_text(settings.kbm_bindings.summary_tooltip());
+    if !settings.kbm_enabled {
+        return;
+    }
+
+    if let Some((locked, toggle_requested)) = mouse_lock {
+        let (label, fill) = if locked {
+            ("Mouse: LOCKED (F8)", egui::Color32::from_rgb(38, 134, 82))
+        } else {
+            ("Lock Mouse (F8)", egui::Color32::from_rgb(0, 112, 209))
+        };
+        if ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(label)
+                        .small()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(fill),
+            )
+            .on_hover_text(
+                "Toggle cursor capture for right-stick camera look (F8 or Esc to unlock)",
+            )
+            .clicked()
+        {
+            *toggle_requested = true;
+        }
+    }
+
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = 65.0;
+        ui.add(
+            egui::Slider::new(&mut settings.kbm_sensitivity_pct, 1..=100)
+                .clamping(egui::SliderClamping::Always)
+                .suffix("%")
+                .text("Sens"),
+        )
+        .on_hover_text("Mouse-to-right-stick sensitivity (1-100%)");
+        ui.add(
+            egui::Slider::new(&mut settings.kbm_deadzone_pct, 0..=40)
+                .clamping(egui::SliderClamping::Always)
+                .suffix("%")
+                .text("DZ"),
+        )
+        .on_hover_text("Radial deadzone boost to overcome the game's inner analog deadzone");
+    });
+    ui.checkbox(&mut settings.kbm_invert_y, "Inv Y")
+        .on_hover_text("Invert vertical mouse camera axis");
+}
+
 fn render_streaming_ui(
     ui: &mut egui::Ui,
     stream: &mut ActiveStream,
@@ -2629,6 +2783,7 @@ fn render_streaming_ui(
     settings: &mut StreamSettings,
     audio_devices: &[String],
     hdr_output_active: bool,
+    mouse_locked: bool,
 ) {
     if stream.show_hud {
         egui::Area::new(egui::Id::unique("stream_hud"))
@@ -2766,6 +2921,14 @@ fn render_streaming_ui(
                             );
                         });
 
+                        ui.horizontal(|ui| {
+                            render_kbm_controls(
+                                ui,
+                                settings,
+                                Some((mouse_locked, &mut stream.mouse_lock_toggle_requested)),
+                            );
+                        });
+
                         let (decode_ms_text, decoder_badge) = match &stream.current_frame {
                             Some(info) => (
                                 format!("{:.2} ms", info.decode_ms),
@@ -2782,7 +2945,12 @@ fn render_streaming_ui(
                         } else {
                             "-- ms".to_string()
                         };
-                        let pad_label = gamepad_name.unwrap_or("No Gamepad");
+                        let pad_label = match (gamepad_name, settings.kbm_enabled) {
+                            (Some(name), true) => format!("{name} + KB+M"),
+                            (Some(name), false) => name.to_string(),
+                            (None, true) => "KB+M Virtual DualSense".to_string(),
+                            (None, false) => "No Gamepad".to_string(),
+                        };
                         let lost_total = stream.frames_lost_total.load(Ordering::Relaxed);
                         let udp_buf_text = match stream.udp_rcvbuf_kib {
                             Some(kib) => format!("{kib} KiB"),
@@ -2859,7 +3027,7 @@ fn render_streaming_ui(
 
                         ui.label(
                             egui::RichText::new(
-                                "F3: Toggle HUD   |   F11: Fullscreen   |   Home: PS Home   |   Ctrl+M: Toggle Mic   |   Esc: Disconnect",
+                                "F3: Toggle HUD   |   F8: Lock Mouse   |   F11: Fullscreen   |   Home: PS Home   |   Ctrl+M: Toggle Mic   |   Esc: Unlock / Disconnect",
                             )
                             .small()
                             .weak(),

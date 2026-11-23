@@ -1,5 +1,6 @@
 use crate::ffi;
 use crate::gamepad::GamepadManager;
+use crate::kbm::KbmEmulator;
 use anyhow::Context;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
@@ -12,6 +13,7 @@ pub struct WindowEventSummary {
     pub resized: Option<(u32, u32)>,
     pub toggle_fullscreen: bool,
     pub toggle_hud: bool,
+    pub toggle_mouse_lock: bool,
     pub escape_pressed: bool,
     pub toggle_mic: bool,
     pub go_home: bool,
@@ -23,6 +25,7 @@ pub struct AppWindow {
     window: *mut ffi::SDL_Window,
     hwnd: HWND,
     last_modifiers: egui::Modifiers,
+    mouse_locked: bool,
 }
 
 impl AppWindow {
@@ -69,6 +72,7 @@ impl AppWindow {
             window,
             hwnd: HWND(hwnd_ptr),
             last_modifiers: egui::Modifiers::default(),
+            mouse_locked: false,
         })
     }
 
@@ -121,10 +125,32 @@ impl AppWindow {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    /// Polls all pending SDL events, updates `raw_input`, and dispatches gamepad hotplug events.
+    /// Enables or disables SDL3 relative mouse mode for camera/aim capture.
+    pub fn set_relative_mouse_mode(&mut self, enabled: bool) {
+        if self.mouse_locked == enabled {
+            return;
+        }
+        // SAFETY: self.window is a valid SDL_Window* owned by self.
+        if unsafe { ffi::SDL_SetWindowRelativeMouseMode(self.window, enabled) } {
+            self.mouse_locked = enabled;
+        } else {
+            tracing::warn!(
+                "SDL_SetWindowRelativeMouseMode({enabled}) failed: {}",
+                crate::sdl_error()
+            );
+        }
+    }
+
+    /// Returns whether relative mouse capture is currently active.
+    pub fn is_relative_mouse_mode(&self) -> bool {
+        self.mouse_locked
+    }
+
+    /// Polls all pending SDL events, updates `raw_input` / `kbm`, and dispatches gamepad hotplug events.
     pub fn poll_events(
         &mut self,
         gamepads: &mut GamepadManager,
+        kbm: &mut KbmEmulator,
         raw_input: &mut egui::RawInput,
     ) -> WindowEventSummary {
         raw_input.events.clear();
@@ -155,6 +181,10 @@ impl AppWindow {
                 ffi::SDL_EventType_SDL_EVENT_WINDOW_FOCUS_LOST => {
                     raw_input.focused = false;
                     self.last_modifiers = egui::Modifiers::default();
+                    if self.mouse_locked {
+                        self.set_relative_mouse_mode(false);
+                    }
+                    kbm.clear_state();
                     raw_input.events.push(egui::Event::WindowFocused(false));
                 }
                 ffi::SDL_EventType_SDL_EVENT_WINDOW_MOUSE_LEAVE => {
@@ -162,26 +192,34 @@ impl AppWindow {
                 }
                 ffi::SDL_EventType_SDL_EVENT_MOUSE_MOTION => {
                     let motion = unsafe { event.motion };
-                    raw_input
-                        .events
-                        .push(egui::Event::PointerMoved(egui::pos2(motion.x, motion.y)));
+                    if self.mouse_locked {
+                        kbm.on_mouse_motion(motion.xrel, motion.yrel);
+                    } else {
+                        raw_input
+                            .events
+                            .push(egui::Event::PointerMoved(egui::pos2(motion.x, motion.y)));
+                    }
                 }
                 ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_DOWN
                 | ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_UP => {
                     let btn = unsafe { event.button };
-                    let button = match btn.button {
-                        1 => Some(egui::PointerButton::Primary),
-                        3 => Some(egui::PointerButton::Secondary),
-                        2 => Some(egui::PointerButton::Middle),
-                        _ => None,
-                    };
-                    if let Some(button) = button {
-                        raw_input.events.push(egui::Event::PointerButton {
-                            pos: egui::pos2(btn.x, btn.y),
-                            button,
-                            pressed: btn.down,
-                            modifiers: current_modifiers(),
-                        });
+                    if self.mouse_locked {
+                        kbm.on_mouse_button(btn.button, btn.down);
+                    } else {
+                        let button = match btn.button {
+                            1 => Some(egui::PointerButton::Primary),
+                            3 => Some(egui::PointerButton::Secondary),
+                            2 => Some(egui::PointerButton::Middle),
+                            _ => None,
+                        };
+                        if let Some(button) = button {
+                            raw_input.events.push(egui::Event::PointerButton {
+                                pos: egui::pos2(btn.x, btn.y),
+                                button,
+                                pressed: btn.down,
+                                modifiers: current_modifiers(),
+                            });
+                        }
                     }
                 }
                 ffi::SDL_EventType_SDL_EVENT_MOUSE_WHEEL => {
@@ -201,6 +239,9 @@ impl AppWindow {
                     });
                 }
                 ffi::SDL_EventType_SDL_EVENT_TEXT_INPUT => {
+                    if self.mouse_locked {
+                        continue;
+                    }
                     let text_ev = unsafe { event.text };
                     if !text_ev.text.is_null() {
                         let text = unsafe { CStr::from_ptr(text_ev.text) }
@@ -218,7 +259,7 @@ impl AppWindow {
                 ffi::SDL_EventType_SDL_EVENT_KEY_DOWN | ffi::SDL_EventType_SDL_EVENT_KEY_UP => {
                     let key_ev = unsafe { event.key };
                     let pressed = event_type == ffi::SDL_EventType_SDL_EVENT_KEY_DOWN;
-                    self.handle_key_event(key_ev, pressed, raw_input, &mut summary);
+                    self.handle_key_event(key_ev, pressed, kbm, raw_input, &mut summary);
                 }
                 ffi::SDL_EventType_SDL_EVENT_GAMEPAD_ADDED => {
                     let which = unsafe { event.gdevice.which };
@@ -251,6 +292,7 @@ impl AppWindow {
         &mut self,
         key_ev: ffi::SDL_KeyboardEvent,
         pressed: bool,
+        kbm: &mut KbmEmulator,
         raw_input: &mut egui::RawInput,
         summary: &mut WindowEventSummary,
     ) {
@@ -266,6 +308,7 @@ impl AppWindow {
             match key_ev.key {
                 ffi::SDLK_F11 => summary.toggle_fullscreen = true,
                 ffi::SDLK_F3 => summary.toggle_hud = true,
+                ffi::SDLK_F8 => summary.toggle_mouse_lock = true,
                 ffi::SDLK_ESCAPE => summary.escape_pressed = true,
                 ffi::SDLK_HOME if !modifiers.ctrl && !modifiers.alt => summary.go_home = true,
                 _ => {}
@@ -274,16 +317,23 @@ impl AppWindow {
 
         if pressed && modifiers.ctrl && !modifiers.alt {
             match key_ev.key {
-                ffi::SDLK_C => raw_input.events.push(egui::Event::Copy),
-                ffi::SDLK_X => raw_input.events.push(egui::Event::Cut),
-                ffi::SDLK_V => {
+                ffi::SDLK_M if !key_ev.repeat => summary.toggle_mic = true,
+                ffi::SDLK_C if !self.mouse_locked => raw_input.events.push(egui::Event::Copy),
+                ffi::SDLK_X if !self.mouse_locked => raw_input.events.push(egui::Event::Cut),
+                ffi::SDLK_V if !self.mouse_locked => {
                     if let Some(clipboard) = self.get_clipboard_text() {
                         raw_input.events.push(egui::Event::Paste(clipboard));
                     }
                 }
-                ffi::SDLK_M if !key_ev.repeat => summary.toggle_mic = true,
                 _ => {}
             }
+        }
+
+        if self.mouse_locked {
+            if !key_ev.repeat {
+                kbm.on_key(key_ev.key, pressed);
+            }
+            return;
         }
 
         if let Some(key) = map_sdl_key(key_ev.key) {
@@ -302,6 +352,9 @@ impl Drop for AppWindow {
     fn drop(&mut self) {
         if !self.window.is_null() {
             unsafe {
+                if self.mouse_locked {
+                    let _ = ffi::SDL_SetWindowRelativeMouseMode(self.window, false);
+                }
                 let _ = ffi::SDL_StopTextInput(self.window);
                 ffi::SDL_DestroyWindow(self.window);
             }

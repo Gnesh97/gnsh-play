@@ -10,9 +10,11 @@ pub(crate) mod ffi {
 }
 
 pub mod gamepad;
+pub mod kbm;
 pub mod window;
 
 pub use gamepad::{GamepadManager, apply_stick_deadzone, map_sdl_buttons, scale_trigger_u8};
+pub use kbm::{KbmBindings, KbmConfig, KbmEmulator, KbmInput, merge_controller_states};
 pub use window::{AppWindow, WindowEventSummary};
 
 use std::ffi::CStr;

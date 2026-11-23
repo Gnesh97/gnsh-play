@@ -8,6 +8,7 @@ license.workspace = true
 gnsh-proto = { path = "../gnsh-proto" }
 anyhow.workspace = true
 egui.workspace = true
+serde.workspace = true
 tracing.workspace = true
 windows.workspace = true
 

@@ -366,6 +366,7 @@ dependencies = [
  "bindgen",
  "egui",
  "gnsh-proto",
+ "serde",
  "tracing",
  "windows",
 ]
