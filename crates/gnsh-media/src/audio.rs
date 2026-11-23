@@ -32,36 +32,144 @@ pub fn remix_stereo_to_dualsense_4ch(stereo_s16: &[i16], out: &mut Vec<i16>) {
     }
 }
 
+/// Converts a `0..=100` integer volume percentage into an SDL3 linear stream gain (`0.0..=1.0`).
+pub fn volume_pct_to_gain(volume_pct: u8) -> f32 {
+    f32::from(volume_pct.min(100)) / 100.0
+}
+
+fn normalize_device_name(name: Option<&str>) -> Option<String> {
+    name.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Lists available SDL3 playback device names in system presentation order.
+pub fn list_playback_devices() -> Vec<String> {
+    if let Err(err) = ensure_sdl_audio_init() {
+        tracing::debug!("SDL audio init failed during playback device enumeration: {err:#}");
+        return Vec::new();
+    }
+
+    let mut count: c_int = 0;
+    // SAFETY: count is a valid stack i32 pointer; SDL allocates the returned device ID array.
+    let ids = unsafe { ffi::SDL_GetAudioPlaybackDevices(&mut count) };
+    if ids.is_null() {
+        return Vec::new();
+    }
+
+    let mut devices = Vec::new();
+    if count > 0 {
+        // SAFETY: ids is non-null and holds `count` elements reported by SDL_GetAudioPlaybackDevices.
+        let slice = unsafe { std::slice::from_raw_parts(ids, count as usize) };
+        for &dev_id in slice {
+            let ptr = unsafe { ffi::SDL_GetAudioDeviceName(dev_id) };
+            if ptr.is_null() {
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            if !name.is_empty() && !devices.contains(&name) {
+                devices.push(name);
+            }
+        }
+    }
+
+    // SAFETY: ids was allocated by SDL_GetAudioPlaybackDevices and must always be freed.
+    unsafe { ffi::SDL_free(ids.cast()) };
+    devices
+}
+
 /// Low-latency PCM16 playback stream backed by SDL3.
 pub struct AudioOutput {
     stream: *mut ffi::SDL_AudioStream,
     channels: u32,
     sample_rate: u32,
+    device_name: Option<String>,
+    volume: f32,
 }
 
 unsafe impl Send for AudioOutput {}
 
 impl AudioOutput {
     pub fn new(channels: u32, sample_rate: u32) -> Result<Self> {
+        Self::new_for_device(channels, sample_rate, None, 1.0)
+    }
+
+    /// Opens an SDL3 playback stream targeting `device_name` (or system default if `None`) with `volume`.
+    pub fn new_for_device(
+        channels: u32,
+        sample_rate: u32,
+        device_name: Option<&str>,
+        volume: f32,
+    ) -> Result<Self> {
         ensure_sdl_audio_init()?;
-        let stream = unsafe { open_playback_stream(channels, sample_rate)? };
+        let normalized = normalize_device_name(device_name);
+        let gain = volume.clamp(0.0, 1.0);
+        let stream =
+            unsafe { open_playback_stream(channels, sample_rate, normalized.as_deref(), gain)? };
         Ok(Self {
             stream,
             channels,
             sample_rate,
+            device_name: normalized,
+            volume: gain,
         })
+    }
+
+    /// Updates live playback gain (`0.0..=1.0`) without recreating the audio stream.
+    pub fn set_volume(&mut self, volume: f32) {
+        let gain = volume.clamp(0.0, 1.0);
+        self.volume = gain;
+        if !self.stream.is_null()
+            // SAFETY: self.stream is a valid playback SDL_AudioStream* owned by self.
+            && unsafe { !ffi::SDL_SetAudioStreamGain(self.stream, gain) }
+        {
+            tracing::debug!("SDL_SetAudioStreamGain failed: {}", sdl_error());
+        }
+    }
+
+    /// Switches playback output to `device_name` (or system default if `None`) preserving volume.
+    pub fn switch_device(&mut self, device_name: Option<&str>) -> Result<()> {
+        let normalized = normalize_device_name(device_name);
+        let next_stream = unsafe {
+            open_playback_stream(
+                self.channels,
+                self.sample_rate,
+                normalized.as_deref(),
+                self.volume,
+            )?
+        };
+        let old = std::mem::replace(&mut self.stream, next_stream);
+        if !old.is_null() {
+            // SAFETY: `old` was replaced above and is uniquely owned by self.
+            unsafe {
+                ffi::SDL_DestroyAudioStream(old);
+            }
+        }
+        self.device_name = normalized;
+        Ok(())
     }
 
     pub fn push_pcm(&mut self, samples: &[i16], channels: u32, sample_rate: u32) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
         }
-        if channels != self.channels || sample_rate != self.sample_rate {
-            unsafe {
-                if !self.stream.is_null() {
-                    ffi::SDL_DestroyAudioStream(self.stream);
+        if self.stream.is_null() || channels != self.channels || sample_rate != self.sample_rate {
+            let next_stream = unsafe {
+                open_playback_stream(
+                    channels,
+                    sample_rate,
+                    self.device_name.as_deref(),
+                    self.volume,
+                )?
+            };
+            let old = std::mem::replace(&mut self.stream, next_stream);
+            if !old.is_null() {
+                unsafe {
+                    ffi::SDL_DestroyAudioStream(old);
                 }
-                self.stream = open_playback_stream(channels, sample_rate)?;
             }
             self.channels = channels;
             self.sample_rate = sample_rate;
@@ -370,25 +478,64 @@ fn ensure_sdl_audio_init() -> Result<()> {
     Ok(())
 }
 
+fn find_playback_device_id(target_name: &str) -> Option<u32> {
+    let mut count: c_int = 0;
+    let ids = unsafe { ffi::SDL_GetAudioPlaybackDevices(&mut count) };
+    if ids.is_null() {
+        return None;
+    }
+
+    let mut matched = None;
+    if count > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(ids, count as usize) };
+        for &dev_id in slice {
+            let ptr = unsafe { ffi::SDL_GetAudioDeviceName(dev_id) };
+            if ptr.is_null() {
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+            if name.trim() == target_name {
+                matched = Some(dev_id);
+                break;
+            }
+        }
+    }
+
+    unsafe { ffi::SDL_free(ids.cast()) };
+    matched
+}
+
 unsafe fn open_playback_stream(
     channels: u32,
     sample_rate: u32,
+    device_name: Option<&str>,
+    volume: f32,
 ) -> Result<*mut ffi::SDL_AudioStream> {
+    let dev_id = match normalize_device_name(device_name) {
+        Some(name) => match find_playback_device_id(&name) {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    device = %name,
+                    "Selected playback device unavailable; falling back to system default"
+                );
+                SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK
+            }
+        },
+        None => SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+    };
     let spec = ffi::SDL_AudioSpec {
         format: ffi::SDL_AudioFormat_SDL_AUDIO_S16,
         channels: channels as i32,
         freq: sample_rate as i32,
     };
-    let stream = unsafe {
-        ffi::SDL_OpenAudioDeviceStream(
-            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-            &spec,
-            None,
-            std::ptr::null_mut(),
-        )
-    };
+    let stream =
+        unsafe { ffi::SDL_OpenAudioDeviceStream(dev_id, &spec, None, std::ptr::null_mut()) };
     if stream.is_null() {
         bail!("SDL_OpenAudioDeviceStream failed: {}", sdl_error());
+    }
+    if unsafe { !ffi::SDL_SetAudioStreamGain(stream, volume.clamp(0.0, 1.0)) } {
+        tracing::warn!("SDL_SetAudioStreamGain failed on open: {}", sdl_error());
     }
     if !unsafe { ffi::SDL_ResumeAudioStreamDevice(stream) } {
         unsafe { ffi::SDL_DestroyAudioStream(stream) };
@@ -434,5 +581,16 @@ mod tests {
         let mut out = vec![999];
         remix_stereo_to_dualsense_4ch(&[120, -340, 560, 780, 999], &mut out);
         assert_eq!(out, vec![0, 0, 120, -340, 0, 0, 560, 780]);
+    }
+
+    #[test]
+    fn volume_pct_clamps_to_unit_gain_and_device_list_runs() {
+        assert!((volume_pct_to_gain(0) - 0.0).abs() < 1e-6);
+        assert!((volume_pct_to_gain(50) - 0.5).abs() < 1e-6);
+        assert!((volume_pct_to_gain(100) - 1.0).abs() < 1e-6);
+        assert!((volume_pct_to_gain(250) - 1.0).abs() < 1e-6);
+
+        let devices = list_playback_devices();
+        assert!(devices.iter().all(|name| !name.is_empty()));
     }
 }

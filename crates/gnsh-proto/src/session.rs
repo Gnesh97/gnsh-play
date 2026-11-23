@@ -13,6 +13,7 @@ use gnsh_chiaki_sys::{
     ChiakiEventType_CHIAKI_EVENT_TRIGGER_EFFECTS, ChiakiOpusDecoder, ChiakiOpusEncoder,
     ChiakiQuitReason_CHIAKI_QUIT_REASON_STOPPED,
     ChiakiQuitReason_CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN, ChiakiSession,
+    ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_30,
     ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_60,
     ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_720p,
     ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_1080p,
@@ -95,7 +96,9 @@ pub enum VideoCodec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoPreset {
+    P720Fps30,
     P720Fps60,
+    P1080Fps30,
     P1080Fps60,
 }
 
@@ -226,20 +229,26 @@ impl Ps5Session {
         }));
 
         let mut video_profile = ChiakiConnectVideoProfile::default();
-        let res_preset = match config.preset {
-            VideoPreset::P720Fps60 => {
-                ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_720p
-            }
-            VideoPreset::P1080Fps60 => {
-                ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_1080p
-            }
+        let (res_preset, fps_preset) = match config.preset {
+            VideoPreset::P720Fps30 => (
+                ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_720p,
+                ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_30,
+            ),
+            VideoPreset::P720Fps60 => (
+                ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_720p,
+                ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_60,
+            ),
+            VideoPreset::P1080Fps30 => (
+                ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_1080p,
+                ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_30,
+            ),
+            VideoPreset::P1080Fps60 => (
+                ChiakiVideoResolutionPreset_CHIAKI_VIDEO_RESOLUTION_PRESET_1080p,
+                ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_60,
+            ),
         };
         unsafe {
-            chiaki_connect_video_profile_preset(
-                &mut video_profile,
-                res_preset,
-                ChiakiVideoFPSPreset_CHIAKI_VIDEO_FPS_PRESET_60,
-            );
+            chiaki_connect_video_profile_preset(&mut video_profile, res_preset, fps_preset);
         }
         video_profile.codec = match config.codec {
             VideoCodec::H264 => ChiakiCodec_CHIAKI_CODEC_H264,

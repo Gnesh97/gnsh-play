@@ -9,7 +9,7 @@ use egui_d3d11::EguiD3d11Painter;
 use gnsh_input::{AppWindow, GamepadManager};
 use gnsh_media::{
     AudioOutput, D3D11Renderer, DecodedFrame, HapticsAudioOutput, MediaCodec, MicCapture,
-    VideoDecoder,
+    ScaleMode, VideoDecoder, list_playback_devices, volume_pct_to_gain,
 };
 use gnsh_proto::{
     ConsoleState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, Ps5Session,
@@ -20,7 +20,7 @@ use gnsh_proto::{
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -353,10 +353,12 @@ fn run_gui() -> Result<()> {
             summary.toggle_mic,
             summary.go_home,
         );
-        if summary.audio_devices_changed
-            && let AppMode::Streaming(ref stream) = app.mode
-        {
-            stream.haptics_recheck.store(true, Ordering::Release);
+        if summary.audio_devices_changed {
+            app.audio_devices = list_playback_devices();
+            if let AppMode::Streaming(ref stream) = app.mode {
+                stream.haptics_recheck.store(true, Ordering::Release);
+                stream.audio_device_recheck.store(true, Ordering::Release);
+            }
         }
         let got_new_frame = app.poll_background(&mut gamepads);
 
@@ -420,7 +422,8 @@ fn run_gui() -> Result<()> {
         let sharpness = f32::from(app.settings.sharpness_pct.min(100)) / 100.0;
         if let AppMode::Streaming(ref stream) = app.mode
             && let Some(ref latest) = stream.current_frame
-            && let Err(err) = renderer.draw_video_frame(&latest.frame, sharpness)
+            && let Err(err) =
+                renderer.draw_video_frame(&latest.frame, sharpness, app.settings.scale_mode)
         {
             tracing::warn!("draw_video_frame failed: {err:#}");
         }
@@ -734,6 +737,9 @@ struct ActiveStream {
     usb_haptics_active: Arc<AtomicBool>,
     haptics_recheck: Arc<AtomicBool>,
     haptics_device_label: Arc<Mutex<Option<String>>>,
+    volume_pct: Arc<AtomicU8>,
+    audio_device: Arc<Mutex<Option<String>>>,
+    audio_device_recheck: Arc<AtomicBool>,
     mic_capture: Option<MicCapture>,
     mic_muted: bool,
     mic_toggle_requested: bool,
@@ -825,24 +831,23 @@ impl ActiveStream {
             .spawn(move || run_video_decode_loop(video_args))
             .context("failed spawning video decode thread")?;
 
-        let audio_rx = channels.audio_rx;
-        let haptics_rx = channels.haptics_rx;
-        let audio_usb_active = Arc::clone(&usb_haptics_active);
-        let audio_haptics_recheck = Arc::clone(&haptics_recheck);
-        let audio_haptics_label = Arc::clone(&haptics_device_label);
-        let audio_stop = Arc::clone(&stop_flag);
+        let volume_pct = Arc::new(AtomicU8::new(settings.volume_pct.min(100)));
+        let audio_device = Arc::new(Mutex::new(settings.audio_device.clone()));
+        let audio_device_recheck = Arc::new(AtomicBool::new(false));
+        let audio_args = AudioWorkerArgs {
+            audio_rx: channels.audio_rx,
+            haptics_rx: channels.haptics_rx,
+            usb_haptics_active: Arc::clone(&usb_haptics_active),
+            haptics_recheck: Arc::clone(&haptics_recheck),
+            haptics_device_label: Arc::clone(&haptics_device_label),
+            volume_pct: Arc::clone(&volume_pct),
+            audio_device: Arc::clone(&audio_device),
+            audio_device_recheck: Arc::clone(&audio_device_recheck),
+            stop_flag: Arc::clone(&stop_flag),
+        };
         let audio_thread = thread::Builder::new()
             .name("gnsh-audio-out".into())
-            .spawn(move || {
-                run_audio_output_loop(
-                    audio_rx,
-                    haptics_rx,
-                    audio_usb_active,
-                    audio_haptics_recheck,
-                    audio_haptics_label,
-                    audio_stop,
-                )
-            })
+            .spawn(move || run_audio_output_loop(audio_args))
             .context("failed spawning audio output thread")?;
 
         Ok(Self {
@@ -865,6 +870,9 @@ impl ActiveStream {
             usb_haptics_active,
             haptics_recheck,
             haptics_device_label,
+            volume_pct,
+            audio_device,
+            audio_device_recheck,
             mic_capture: None,
             mic_muted: true,
             mic_toggle_requested: false,
@@ -1172,16 +1180,28 @@ fn refresh_usb_haptics(
     }
 }
 
-fn run_audio_output_loop(
+struct AudioWorkerArgs {
     audio_rx: Receiver<gnsh_proto::AudioPcmFrame>,
     haptics_rx: Receiver<gnsh_proto::HapticsPcmFrame>,
     usb_haptics_active: Arc<AtomicBool>,
     haptics_recheck: Arc<AtomicBool>,
     haptics_device_label: Arc<Mutex<Option<String>>>,
+    volume_pct: Arc<AtomicU8>,
+    audio_device: Arc<Mutex<Option<String>>>,
+    audio_device_recheck: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
-) {
+}
+
+fn run_audio_output_loop(args: AudioWorkerArgs) {
     boost_current_thread_priority("audio");
-    let mut audio = match AudioOutput::new(2, 48_000) {
+    let mut last_vol = args.volume_pct.load(Ordering::Relaxed);
+    let initial_dev = args.audio_device.lock().ok().and_then(|g| g.clone());
+    let mut audio = match AudioOutput::new_for_device(
+        2,
+        48_000,
+        initial_dev.as_deref(),
+        volume_pct_to_gain(last_vol),
+    ) {
         Ok(out) => Some(out),
         Err(err) => {
             tracing::warn!("AudioOutput init failed (continuing muted): {err:#}");
@@ -1190,15 +1210,60 @@ fn run_audio_output_loop(
     };
 
     let mut haptics: Option<HapticsAudioOutput> = None;
-    refresh_usb_haptics(&mut haptics, &usb_haptics_active, &haptics_device_label);
+    refresh_usb_haptics(
+        &mut haptics,
+        &args.usb_haptics_active,
+        &args.haptics_device_label,
+    );
 
-    while !stop_flag.load(Ordering::Relaxed) {
-        if haptics_recheck.swap(false, Ordering::AcqRel) {
-            refresh_usb_haptics(&mut haptics, &usb_haptics_active, &haptics_device_label);
+    while !args.stop_flag.load(Ordering::Relaxed) {
+        if args.haptics_recheck.swap(false, Ordering::AcqRel) {
+            refresh_usb_haptics(
+                &mut haptics,
+                &args.usb_haptics_active,
+                &args.haptics_device_label,
+            );
+        }
+
+        if args.audio_device_recheck.swap(false, Ordering::AcqRel) {
+            let desired = args.audio_device.lock().ok().and_then(|g| g.clone());
+            let vol = args.volume_pct.load(Ordering::Relaxed);
+            match audio.as_mut() {
+                Some(out) => {
+                    if let Err(err) = out.switch_device(desired.as_deref()) {
+                        tracing::warn!("Audio output device switch failed: {err:#}");
+                    } else {
+                        tracing::info!(
+                            device = desired.as_deref().unwrap_or("System Default"),
+                            "Switched audio playback device"
+                        );
+                    }
+                }
+                None => {
+                    match AudioOutput::new_for_device(
+                        2,
+                        48_000,
+                        desired.as_deref(),
+                        volume_pct_to_gain(vol),
+                    ) {
+                        Ok(out) => audio = Some(out),
+                        Err(err) => tracing::warn!("AudioOutput open failed: {err:#}"),
+                    }
+                }
+            }
+            last_vol = vol;
+        }
+
+        let cur_vol = args.volume_pct.load(Ordering::Relaxed);
+        if cur_vol != last_vol {
+            if let Some(out) = audio.as_mut() {
+                out.set_volume(volume_pct_to_gain(cur_vol));
+            }
+            last_vol = cur_vol;
         }
 
         select! {
-            recv(audio_rx) -> msg => match msg {
+            recv(args.audio_rx) -> msg => match msg {
                 Ok(frame) => {
                     if let Some(out) = audio.as_mut()
                         && let Err(err) =
@@ -1209,7 +1274,7 @@ fn run_audio_output_loop(
                 }
                 Err(_) => break,
             },
-            recv(haptics_rx) -> msg => match msg {
+            recv(args.haptics_rx) -> msg => match msg {
                 Ok(frame) => {
                     if let Some(hap) = haptics.as_mut()
                         && let Err(err) = hap.push_stereo_3khz(&frame.samples)
@@ -1218,8 +1283,8 @@ fn run_audio_output_loop(
                             "DualSense USB haptics push failed, falling back to rumble: {err:#}"
                         );
                         haptics = None;
-                        usb_haptics_active.store(false, Ordering::Release);
-                        if let Ok(mut guard) = haptics_device_label.lock() {
+                        args.usb_haptics_active.store(false, Ordering::Release);
+                        if let Ok(mut guard) = args.haptics_device_label.lock() {
                             *guard = None;
                         }
                     }
@@ -1230,7 +1295,7 @@ fn run_audio_output_loop(
         }
     }
 
-    usb_haptics_active.store(false, Ordering::Release);
+    args.usb_haptics_active.store(false, Ordering::Release);
 }
 
 enum AppMode {
@@ -1250,6 +1315,7 @@ struct AppState {
     settings_store: SettingsStore,
     saved_consoles: Vec<SavedConsole>,
     discovered_consoles: Vec<DiscoveredConsole>,
+    audio_devices: Vec<String>,
     discovery_rx: Option<Receiver<std::result::Result<Vec<DiscoveredConsole>, String>>>,
     wake_rx: Option<Receiver<std::result::Result<String, String>>>,
     settings: StreamSettings,
@@ -1273,6 +1339,7 @@ impl AppState {
             settings_store,
             saved_consoles,
             discovered_consoles: Vec::new(),
+            audio_devices: list_playback_devices(),
             discovery_rx: None,
             wake_rx: None,
             settings,
@@ -1767,14 +1834,26 @@ impl AppState {
                     ui,
                     stream,
                     gamepad_name,
-                    &mut self.settings.touchpad_touch,
-                    &mut self.settings.vsync,
-                    &mut self.settings.sharpness_pct,
+                    &mut self.settings,
+                    &self.audio_devices,
                     hdr_output_active,
                 );
             }
         }
         if self.settings != prev_settings {
+            if let AppMode::Streaming(ref stream) = self.mode {
+                if self.settings.volume_pct != prev_settings.volume_pct {
+                    stream
+                        .volume_pct
+                        .store(self.settings.volume_pct.min(100), Ordering::Relaxed);
+                }
+                if self.settings.audio_device != prev_settings.audio_device {
+                    if let Ok(mut guard) = stream.audio_device.lock() {
+                        *guard = self.settings.audio_device.clone();
+                    }
+                    stream.audio_device_recheck.store(true, Ordering::Release);
+                }
+            }
             self.persist_settings();
         }
     }
@@ -1873,17 +1952,7 @@ impl AppState {
 
                     ui.separator();
 
-                    ui.label(egui::RichText::new("Res:").weak());
-                    ui.selectable_value(
-                        &mut self.settings.preset,
-                        VideoPreset::P1080Fps60,
-                        "1080p60",
-                    );
-                    ui.selectable_value(
-                        &mut self.settings.preset,
-                        VideoPreset::P720Fps60,
-                        "720p60",
-                    );
+                    render_preset_controls(ui, &mut self.settings.preset);
 
                     ui.separator();
 
@@ -1898,6 +1967,9 @@ impl AppState {
                         "10-bit HEVC HDR10: native passthrough on Windows HDR displays, automatic ACES tone-mapping on SDR monitors.",
                     );
                     ui.selectable_value(&mut self.settings.codec, VideoCodec::H264, "H264");
+
+                    ui.separator();
+                    render_scale_selector(ui, &mut self.settings.scale_mode);
 
                     ui.separator();
 
@@ -1924,7 +1996,22 @@ impl AppState {
                         .on_hover_text(
                             "Contrast Adaptive Sharpening (single-pass HLSL, 0% = off)",
                         );
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.volume_pct, 0..=100)
+                                .clamping(egui::SliderClamping::Always)
+                                .suffix("%")
+                                .text("Vol"),
+                        )
+                        .on_hover_text("Stream audio playback volume (0-100%)");
                     });
+
+                    ui.label(egui::RichText::new("Audio:").weak());
+                    render_audio_device_combo(
+                        ui,
+                        "home_audio_device",
+                        &self.audio_devices,
+                        &mut self.settings.audio_device,
+                    );
 
                     ui.checkbox(&mut self.settings.vsync, "VSync");
                     ui.checkbox(&mut self.settings.touchpad_touch, "Touchpad Touch")
@@ -2479,13 +2566,68 @@ fn trigger_register_worker(modal: &mut RegisterModal) {
     modal.notice = Some("Connecting to PS5 for registration...".into());
 }
 
+fn render_preset_controls(ui: &mut egui::Ui, preset: &mut VideoPreset) {
+    let mut is_1080p = matches!(preset, VideoPreset::P1080Fps30 | VideoPreset::P1080Fps60);
+    let mut is_60fps = matches!(preset, VideoPreset::P720Fps60 | VideoPreset::P1080Fps60);
+
+    ui.label(egui::RichText::new("Res:").weak());
+    ui.selectable_value(&mut is_1080p, true, "1080p");
+    ui.selectable_value(&mut is_1080p, false, "720p");
+
+    ui.separator();
+
+    ui.label(egui::RichText::new("FPS:").weak());
+    ui.selectable_value(&mut is_60fps, true, "60");
+    ui.selectable_value(&mut is_60fps, false, "30");
+
+    *preset = match (is_1080p, is_60fps) {
+        (true, true) => VideoPreset::P1080Fps60,
+        (true, false) => VideoPreset::P1080Fps30,
+        (false, true) => VideoPreset::P720Fps60,
+        (false, false) => VideoPreset::P720Fps30,
+    };
+}
+
+fn render_scale_selector(ui: &mut egui::Ui, scale_mode: &mut ScaleMode) {
+    ui.label(egui::RichText::new("Scale:").weak());
+    ui.selectable_value(scale_mode, ScaleMode::Fit, "Fit")
+        .on_hover_text("Preserve 16:9 aspect ratio (letterbox/pillarbox black bars)");
+    ui.selectable_value(scale_mode, ScaleMode::Zoom, "Zoom")
+        .on_hover_text(
+            "Fill screen preserving aspect ratio by cropping outer edges (no black bars on 16:10 / 21:9)",
+        );
+    ui.selectable_value(scale_mode, ScaleMode::Stretch, "Stretch")
+        .on_hover_text("Stretch frame to fill entire window without cropping");
+}
+
+fn render_audio_device_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    devices: &[String],
+    selected: &mut Option<String>,
+) {
+    let selected_label = match selected.as_deref() {
+        None => "System Default".to_string(),
+        Some(name) if devices.iter().any(|d| d == name) => name.to_string(),
+        Some(name) => format!("{name} (unavailable)"),
+    };
+    egui::ComboBox::from_id_salt(id_salt)
+        .width(160.0)
+        .selected_text(selected_label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, None, "System Default");
+            for dev in devices {
+                ui.selectable_value(selected, Some(dev.clone()), dev);
+            }
+        });
+}
+
 fn render_streaming_ui(
     ui: &mut egui::Ui,
     stream: &mut ActiveStream,
     gamepad_name: Option<&str>,
-    touchpad_touch: &mut bool,
-    vsync: &mut bool,
-    sharpness_pct: &mut u8,
+    settings: &mut StreamSettings,
+    audio_devices: &[String],
     hdr_output_active: bool,
 ) {
     if stream.show_hud {
@@ -2581,19 +2723,23 @@ fn render_streaming_ui(
                             }
 
                             ui.separator();
-                            ui.checkbox(touchpad_touch, "Touchpad Touch")
+                            ui.checkbox(&mut settings.touchpad_touch, "Touchpad Touch")
                                 .on_hover_text("Off: click-only. On: capacitive touch/swipe.");
 
                             ui.separator();
-                            ui.checkbox(vsync, "VSync").on_hover_text(
+                            ui.checkbox(&mut settings.vsync, "VSync").on_hover_text(
                                 "Off: lowest latency (decode-paced + tearing, 1000 Hz input). On: tear-free VSync (1-frame DXGI queue).",
                             );
+                        });
+
+                        ui.horizontal(|ui| {
+                            render_scale_selector(ui, &mut settings.scale_mode);
 
                             ui.separator();
                             ui.scope(|ui| {
                                 ui.spacing_mut().slider_width = 70.0;
                                 ui.add(
-                                    egui::Slider::new(sharpness_pct, 0..=100)
+                                    egui::Slider::new(&mut settings.sharpness_pct, 0..=100)
                                         .clamping(egui::SliderClamping::Always)
                                         .suffix("%")
                                         .text("CAS"),
@@ -2601,7 +2747,23 @@ fn render_streaming_ui(
                                 .on_hover_text(
                                     "Contrast Adaptive Sharpening (single-pass HLSL, 0% = off)",
                                 );
+                                ui.add(
+                                    egui::Slider::new(&mut settings.volume_pct, 0..=100)
+                                        .clamping(egui::SliderClamping::Always)
+                                        .suffix("%")
+                                        .text("Vol"),
+                                )
+                                .on_hover_text("Stream audio playback volume (0-100%)");
                             });
+
+                            ui.separator();
+                            ui.label(egui::RichText::new("Audio:").weak());
+                            render_audio_device_combo(
+                                ui,
+                                "hud_audio_device",
+                                audio_devices,
+                                &mut settings.audio_device,
+                            );
                         });
 
                         let (decode_ms_text, decoder_badge) = match &stream.current_frame {
@@ -2641,8 +2803,8 @@ fn render_streaming_ui(
                         } else {
                             ""
                         };
-                        let cas_badge = if *sharpness_pct > 0 {
-                            format!("  |  CAS: {}%", *sharpness_pct)
+                        let cas_badge = if settings.sharpness_pct > 0 {
+                            format!("  |  CAS: {}%", settings.sharpness_pct)
                         } else {
                             String::new()
                         };

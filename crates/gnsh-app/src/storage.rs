@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use gnsh_media::ScaleMode;
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -216,29 +217,44 @@ mod tests {
         );
 
         let custom = StoredSettings {
-            preset: VideoPreset::P720Fps60,
+            preset: VideoPreset::P1080Fps30,
             codec: VideoCodec::HevcHdr,
             bitrate_kbps: 500_000,
             vsync: false,
             touchpad_touch: true,
             sharpness_pct: 250,
+            scale_mode: ScaleMode::Zoom,
+            volume_pct: 220,
+            audio_device: Some("  Speakers (Realtek Audio) ".into()),
         };
         store.save(&custom).expect("save custom");
         let loaded = store.load().expect("load custom");
-        assert_eq!(loaded.preset, VideoPreset::P720Fps60);
+        assert_eq!(loaded.preset, VideoPreset::P1080Fps30);
         assert_eq!(loaded.codec, VideoCodec::HevcHdr);
         assert_eq!(loaded.bitrate_kbps, 100_000);
         assert!(!loaded.vsync);
         assert!(loaded.touchpad_touch);
         assert_eq!(loaded.sharpness_pct, 100);
+        assert_eq!(loaded.scale_mode, ScaleMode::Zoom);
+        assert_eq!(loaded.volume_pct, 100);
+        assert_eq!(
+            loaded.audio_device.as_deref(),
+            Some("Speakers (Realtek Audio)")
+        );
 
-        std::fs::write(&path, r#"{"bitrate_kbps": 999999, "sharpness_pct": 180}"#)
-            .expect("write unclamped json");
+        std::fs::write(
+            &path,
+            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   "}"#,
+        )
+        .expect("write unclamped json");
         let clamped = store.load().expect("load clamped");
         assert_eq!(clamped.bitrate_kbps, 100_000);
         assert_eq!(clamped.sharpness_pct, 100);
+        assert_eq!(clamped.volume_pct, 100);
+        assert_eq!(clamped.audio_device, None);
         assert_eq!(clamped.preset, VideoPreset::P1080Fps60);
         assert_eq!(clamped.codec, VideoCodec::Hevc);
+        assert_eq!(clamped.scale_mode, ScaleMode::Fit);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -254,6 +270,9 @@ pub struct StoredSettings {
     pub vsync: bool,
     pub touchpad_touch: bool,
     pub sharpness_pct: u8,
+    pub scale_mode: ScaleMode,
+    pub volume_pct: u8,
+    pub audio_device: Option<String>,
 }
 
 impl Default for StoredSettings {
@@ -265,8 +284,22 @@ impl Default for StoredSettings {
             vsync: true,
             touchpad_touch: false,
             sharpness_pct: 0,
+            scale_mode: ScaleMode::Fit,
+            volume_pct: 100,
+            audio_device: None,
         }
     }
+}
+
+fn normalize_settings(settings: &mut StoredSettings) {
+    settings.bitrate_kbps = clamp_bitrate_kbps(settings.bitrate_kbps);
+    settings.sharpness_pct = settings.sharpness_pct.min(100);
+    settings.volume_pct = settings.volume_pct.min(100);
+    settings.audio_device = settings
+        .audio_device
+        .take()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 }
 
 pub struct SettingsStore {
@@ -295,8 +328,7 @@ impl SettingsStore {
             .with_context(|| format!("failed reading {}", self.path.display()))?;
         let mut parsed: StoredSettings =
             serde_json::from_str(&raw).context("failed parsing settings.json")?;
-        parsed.bitrate_kbps = clamp_bitrate_kbps(parsed.bitrate_kbps);
-        parsed.sharpness_pct = parsed.sharpness_pct.min(100);
+        normalize_settings(&mut parsed);
         Ok(parsed)
     }
 
@@ -306,8 +338,7 @@ impl SettingsStore {
                 .with_context(|| format!("failed creating {}", parent.display()))?;
         }
         let mut clamped = settings.clone();
-        clamped.bitrate_kbps = clamp_bitrate_kbps(clamped.bitrate_kbps);
-        clamped.sharpness_pct = clamped.sharpness_pct.min(100);
+        normalize_settings(&mut clamped);
         let json = serde_json::to_string_pretty(&clamped)?;
         std::fs::write(&self.path, json)
             .with_context(|| format!("failed writing {}", self.path.display()))?;

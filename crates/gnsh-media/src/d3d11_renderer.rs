@@ -1,5 +1,6 @@
 use crate::video_decoder::{D3D11Frame, DecodedFrame};
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, HWND};
@@ -345,6 +346,24 @@ impl D3d11SrvCache {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScaleMode {
+    #[default]
+    Fit,
+    Zoom,
+    Stretch,
+}
+
+impl ScaleMode {
+    fn key(self) -> u8 {
+        match self {
+            Self::Fit => 0,
+            Self::Zoom => 1,
+            Self::Stretch => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct VideoParamsKey {
     fw: u32,
@@ -355,6 +374,7 @@ struct VideoParamsKey {
     vh: u32,
     sharp_q: u32,
     mode_bits: u32,
+    scale_mode: u8,
 }
 
 pub struct D3D11Renderer {
@@ -735,7 +755,12 @@ impl D3D11Renderer {
         }
     }
 
-    pub fn draw_video_frame(&mut self, frame: &DecodedFrame, sharpness: f32) -> Result<()> {
+    pub fn draw_video_frame(
+        &mut self,
+        frame: &DecodedFrame,
+        sharpness: f32,
+        scale_mode: ScaleMode,
+    ) -> Result<()> {
         self.bind_backbuffer();
 
         let sharp = sharpness.clamp(0.0, 1.0);
@@ -787,10 +812,20 @@ impl D3D11Renderer {
             vh: self.height,
             sharp_q,
             mode_bits: color_mode.to_bits(),
+            scale_mode: scale_mode.key(),
         };
         if self.last_video_params_key != Some(key) {
-            let params =
-                compute_video_params(fw, fh, tw, th, self.width, self.height, sharp, color_mode);
+            let params = compute_video_params(
+                fw,
+                fh,
+                tw,
+                th,
+                self.width,
+                self.height,
+                sharp,
+                color_mode,
+                scale_mode,
+            );
             unsafe {
                 self.context.UpdateSubresource(
                     &self.cb_params,
@@ -1139,16 +1174,37 @@ fn upload_plane(
     Ok(())
 }
 
-fn aspect_scale(frame_w: u32, frame_h: u32, view_w: u32, view_h: u32) -> [f32; 4] {
+fn aspect_scale(
+    frame_w: u32,
+    frame_h: u32,
+    view_w: u32,
+    view_h: u32,
+    scale_mode: ScaleMode,
+) -> [f32; 4] {
     if frame_w == 0 || frame_h == 0 || view_w == 0 || view_h == 0 {
+        return [1.0, 1.0, 0.0, 0.0];
+    }
+    if scale_mode == ScaleMode::Stretch {
         return [1.0, 1.0, 0.0, 0.0];
     }
     let frame_aspect = frame_w as f32 / frame_h as f32;
     let view_aspect = view_w as f32 / view_h as f32;
-    if view_aspect > frame_aspect {
-        [frame_aspect / view_aspect, 1.0, 0.0, 0.0]
-    } else {
-        [1.0, view_aspect / frame_aspect, 0.0, 0.0]
+    match scale_mode {
+        ScaleMode::Fit => {
+            if view_aspect > frame_aspect {
+                [frame_aspect / view_aspect, 1.0, 0.0, 0.0]
+            } else {
+                [1.0, view_aspect / frame_aspect, 0.0, 0.0]
+            }
+        }
+        ScaleMode::Zoom => {
+            if view_aspect > frame_aspect {
+                [1.0, view_aspect / frame_aspect, 0.0, 0.0]
+            } else {
+                [frame_aspect / view_aspect, 1.0, 0.0, 0.0]
+            }
+        }
+        ScaleMode::Stretch => [1.0, 1.0, 0.0, 0.0],
     }
 }
 
@@ -1162,8 +1218,9 @@ fn compute_video_params(
     view_h: u32,
     sharpness: f32,
     color_mode: f32,
+    scale_mode: ScaleMode,
 ) -> VideoParams {
-    let pos_scale = aspect_scale(frame_w, frame_h, view_w, view_h);
+    let pos_scale = aspect_scale(frame_w, frame_h, view_w, view_h, scale_mode);
     let tw = tex_w.max(frame_w).max(1) as f32;
     let th = tex_h.max(frame_h).max(1) as f32;
     let fw = frame_w.max(1) as f32;
@@ -1243,16 +1300,30 @@ mod tests {
 
     #[test]
     fn computes_aspect_letterbox_scale() {
-        let exact = aspect_scale(1920, 1080, 1920, 1080);
+        let exact = aspect_scale(1920, 1080, 1920, 1080, ScaleMode::Fit);
         assert!((exact[0] - 1.0).abs() < 1e-5 && (exact[1] - 1.0).abs() < 1e-5);
 
-        let wide = aspect_scale(1920, 1080, 2560, 1080);
-        assert!(wide[0] < 1.0 && (wide[1] - 1.0).abs() < 1e-5);
+        // 16:9 stream on 21:9 ultrawide.
+        let wide_fit = aspect_scale(1920, 1080, 2560, 1080, ScaleMode::Fit);
+        assert!(wide_fit[0] < 1.0 && (wide_fit[1] - 1.0).abs() < 1e-5);
+        let wide_zoom = aspect_scale(1920, 1080, 2560, 1080, ScaleMode::Zoom);
+        assert!((wide_zoom[0] - 1.0).abs() < 1e-5 && (wide_zoom[1] - (4.0 / 3.0)).abs() < 1e-4);
+
+        // 16:9 stream on 16:10 (2880x1800) HDR display.
+        let laptop_fit = aspect_scale(1920, 1080, 2880, 1800, ScaleMode::Fit);
+        assert!((laptop_fit[0] - 1.0).abs() < 1e-5 && (laptop_fit[1] - 0.9).abs() < 1e-4);
+        let laptop_zoom = aspect_scale(1920, 1080, 2880, 1800, ScaleMode::Zoom);
+        assert!(
+            (laptop_zoom[0] - (10.0 / 9.0)).abs() < 1e-4 && (laptop_zoom[1] - 1.0).abs() < 1e-5
+        );
+        let laptop_stretch = aspect_scale(1920, 1080, 2880, 1800, ScaleMode::Stretch);
+        assert!((laptop_stretch[0] - 1.0).abs() < 1e-5 && (laptop_stretch[1] - 1.0).abs() < 1e-5);
     }
 
     #[test]
     fn computes_padded_surface_uv_crop_and_sharp_params() {
-        let hevc = compute_video_params(1920, 1080, 1920, 1152, 1920, 1080, 1.4, 1.0);
+        let hevc =
+            compute_video_params(1920, 1080, 1920, 1152, 1920, 1080, 1.4, 1.0, ScaleMode::Fit);
         assert!((hevc.uv_rect[0] - 1.0).abs() < 1e-6);
         assert!((hevc.uv_rect[1] - (1080.0 / 1152.0)).abs() < 1e-6);
         assert!(hevc.uv_clamp[1] < hevc.uv_rect[1]);
@@ -1262,7 +1333,17 @@ mod tests {
         assert!((hevc.sharp_params[2] - (1.0 / 1152.0)).abs() < 1e-6);
         assert!((hevc.sharp_params[3] - 1.0).abs() < 1e-6);
 
-        let h264 = compute_video_params(1920, 1080, 1920, 1088, 1920, 1080, -0.2, 0.0);
+        let h264 = compute_video_params(
+            1920,
+            1080,
+            1920,
+            1088,
+            1920,
+            1080,
+            -0.2,
+            0.0,
+            ScaleMode::Stretch,
+        );
         assert!((h264.uv_rect[1] - (1080.0 / 1088.0)).abs() < 1e-6);
         assert!((h264.sharp_params[0] - 0.0).abs() < 1e-6);
     }
