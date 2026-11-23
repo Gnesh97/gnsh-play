@@ -44,6 +44,11 @@ pub const MIC_CHANNELS: u8 = 2;
 pub const MIC_FRAME_SAMPLES: u32 = 480;
 pub const MIC_FRAME_PCM_LEN: usize = 960;
 
+const MAX_VIDEO_SAMPLE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OPUS_FRAME_SAMPLES: usize = 48_000;
+const MAX_HAPTICS_FRAME_BYTES: usize = 64 * 1024;
+const MAX_OSK_TEXT_CHARS: usize = 1024;
+
 const SOL_SOCKET: i32 = 0xFFFF;
 const SO_RCVBUF: i32 = 0x1002;
 const INVALID_SOCKET: usize = usize::MAX;
@@ -417,7 +422,8 @@ impl Ps5Session {
     }
 
     pub fn send_login_pin(&mut self, pin: &str) -> Result<()> {
-        let bytes = pin.as_bytes();
+        let valid = validate_login_pin(pin)?;
+        let bytes = valid.as_bytes();
         let err = unsafe {
             chiaki_session_set_login_pin(self.session.as_mut(), bytes.as_ptr(), bytes.len())
         };
@@ -716,6 +722,9 @@ unsafe extern "C" fn video_sample_cb(
     if buf.is_null() || buf_size == 0 || user.is_null() {
         return true;
     }
+    if buf_size > MAX_VIDEO_SAMPLE_BYTES {
+        return false;
+    }
     let arrived_at = Instant::now();
     let ctx = unsafe { &*(user.cast::<SessionCallbacksCtx>()) };
     ctx.video_bytes_total
@@ -738,8 +747,10 @@ unsafe extern "C" fn opus_settings_cb(channels: u32, rate: u32, user: *mut c_voi
         return;
     }
     let ctx = unsafe { &*(user.cast::<SessionCallbacksCtx>()) };
-    ctx.audio_channels.store(channels.max(1), Ordering::Relaxed);
-    ctx.audio_rate.store(rate.max(8_000), Ordering::Relaxed);
+    ctx.audio_channels
+        .store(channels.clamp(1, 8), Ordering::Relaxed);
+    ctx.audio_rate
+        .store(rate.clamp(8_000, 192_000), Ordering::Relaxed);
 }
 
 unsafe extern "C" fn opus_frame_cb(buf: *mut i16, samples_count: usize, user: *mut c_void) {
@@ -750,6 +761,9 @@ unsafe extern "C" fn opus_frame_cb(buf: *mut i16, samples_count: usize, user: *m
     let channels = ctx.audio_channels.load(Ordering::Relaxed);
     let sample_rate = ctx.audio_rate.load(Ordering::Relaxed);
     let total_samples = samples_count.saturating_mul(channels as usize);
+    if total_samples == 0 || total_samples > MAX_OPUS_FRAME_SAMPLES {
+        return;
+    }
     let samples = unsafe { std::slice::from_raw_parts(buf, total_samples) }.to_vec();
     let _ = ctx.audio_tx.try_send(AudioPcmFrame {
         samples,
@@ -799,7 +813,11 @@ pub fn haptics_bytes_to_i16(buf: &[u8]) -> Option<Vec<i16>> {
 }
 
 unsafe extern "C" fn haptics_frame_cb(buf: *mut u8, buf_size: usize, user: *mut c_void) {
-    if buf.is_null() || buf_size < 4 || !buf_size.is_multiple_of(4) || user.is_null() {
+    if buf.is_null()
+        || !(4..=MAX_HAPTICS_FRAME_BYTES).contains(&buf_size)
+        || !buf_size.is_multiple_of(4)
+        || user.is_null()
+    {
         return;
     }
     // SAFETY: libchiaki invokes haptics_sink.frame_cb synchronously with a valid buffer of buf_size
@@ -827,10 +845,22 @@ unsafe extern "C" fn haptics_frame_cb(buf: *mut u8, buf_size: usize, user: *mut 
     }
 }
 
-/// Strips NUL and newline characters from PS5 on-screen keyboard text while keeping full UTF-8.
+/// Validates a PS5 console login PIN (`1..=16` ASCII digits after trimming).
+pub fn validate_login_pin(pin: &str) -> Result<&str> {
+    let trimmed = pin.trim();
+    if trimmed.is_empty() || trimmed.len() > 16 || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(ProtoError::InvalidArg(
+            "login PIN must be 1..=16 ASCII digits".into(),
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Strips control characters from PS5 on-screen keyboard text and caps length while keeping full UTF-8.
 pub fn sanitize_osk_text(text: &str) -> String {
     text.chars()
-        .filter(|&c| !matches!(c, '\0' | '\r' | '\n'))
+        .filter(|c| !c.is_control())
+        .take(MAX_OSK_TEXT_CHARS)
         .collect()
 }
 
@@ -914,11 +944,11 @@ unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
             })
         },
         x if x == ChiakiEventType_CHIAKI_EVENT_KEYBOARD_OPEN => unsafe {
-            let text = c_str_opt(ev.__bindgen_anon_1.keyboard.text_str);
+            let text = sanitize_osk_text(&c_str_opt(ev.__bindgen_anon_1.keyboard.text_str));
             Some(SessionEvent::KeyboardOpen { text })
         },
         x if x == ChiakiEventType_CHIAKI_EVENT_KEYBOARD_TEXT_CHANGE => unsafe {
-            let text = c_str_opt(ev.__bindgen_anon_1.keyboard.text_str);
+            let text = sanitize_osk_text(&c_str_opt(ev.__bindgen_anon_1.keyboard.text_str));
             Some(SessionEvent::KeyboardTextChange { text })
         },
         x if x == ChiakiEventType_CHIAKI_EVENT_KEYBOARD_REMOTE_CLOSE => {
@@ -1024,9 +1054,25 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_osk_text_preserving_utf8_and_stripping_nul_newlines() {
-        let input = "Merhaba\0 PS5\r\nTürkçe çğışöü";
-        assert_eq!(sanitize_osk_text(input), "Merhaba PS5Türkçe çğışöü");
+    fn sanitizes_osk_text_and_validates_login_pin() {
+        let input = "Merhaba\0 PS5\x1b[31m\r\n\tTürkçe çğışöü";
+        assert_eq!(sanitize_osk_text(input), "Merhaba PS5[31mTürkçe çğışöü");
         assert_eq!(sanitize_osk_text(""), "");
+
+        let oversized = "a".repeat(MAX_OSK_TEXT_CHARS + 50);
+        assert_eq!(
+            sanitize_osk_text(&oversized).chars().count(),
+            MAX_OSK_TEXT_CHARS
+        );
+
+        assert_eq!(validate_login_pin(" 0451 ").unwrap(), "0451");
+        assert_eq!(
+            validate_login_pin("1234567890123456").unwrap(),
+            "1234567890123456"
+        );
+        assert!(validate_login_pin("").is_err());
+        assert!(validate_login_pin("   ").is_err());
+        assert!(validate_login_pin("12a4").is_err());
+        assert!(validate_login_pin("12345678901234567").is_err());
     }
 }

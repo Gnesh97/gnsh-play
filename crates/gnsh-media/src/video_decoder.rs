@@ -8,6 +8,9 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::core::Interface as _;
 
+const MAX_VIDEO_PACKET_BYTES: usize = 16 * 1024 * 1024;
+const MAX_VIDEO_DIMENSION: u32 = 8192;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaCodec {
     H264,
@@ -123,11 +126,18 @@ impl VideoDecoder {
         if annex_b.is_empty() {
             return Ok(Vec::new());
         }
+        if annex_b.len() > MAX_VIDEO_PACKET_BYTES {
+            bail!(
+                "video packet size {} exceeds 16 MiB safety limit",
+                annex_b.len()
+            );
+        }
+        let pkt_len = i32::try_from(annex_b.len()).context("video packet size exceeds i32")?;
 
         let mut frames = Vec::new();
         let mut send_err = unsafe {
             (*self.pkt).data = annex_b.as_ptr().cast_mut();
-            (*self.pkt).size = annex_b.len() as i32;
+            (*self.pkt).size = pkt_len;
             (*self.pkt).pts = pts;
             (*self.pkt).dts = pts;
             ffi::avcodec_send_packet(self.ctx, self.pkt)
@@ -139,7 +149,7 @@ impl VideoDecoder {
             }
             send_err = unsafe {
                 (*self.pkt).data = annex_b.as_ptr().cast_mut();
-                (*self.pkt).size = annex_b.len() as i32;
+                (*self.pkt).size = pkt_len;
                 (*self.pkt).pts = pts;
                 (*self.pkt).dts = pts;
                 ffi::avcodec_send_packet(self.ctx, self.pkt)
@@ -351,11 +361,14 @@ unsafe extern "C" fn select_d3d11_format(
 }
 
 unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<DecodedFrame>> {
+    if src.is_null() {
+        bail!("FFmpeg AVFrame pointer is null");
+    }
     let fmt = unsafe { (*src).format };
     let width = unsafe { (*src).width.max(0) as u32 };
     let height = unsafe { (*src).height.max(0) as u32 };
     let pts = unsafe { (*src).pts };
-    if width == 0 || height == 0 {
+    if width == 0 || height == 0 || width > MAX_VIDEO_DIMENSION || height > MAX_VIDEO_DIMENSION {
         return Ok(None);
     }
 
@@ -382,20 +395,23 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
     }
 
     if fmt == ffi::AVPixelFormat_AV_PIX_FMT_YUV420P {
-        let (y_ptr, u_ptr, v_ptr, ys, us, vs) = unsafe {
+        let (y_ptr, u_ptr, v_ptr, ys_raw, us_raw, vs_raw) = unsafe {
             (
                 (*src).data[0],
                 (*src).data[1],
                 (*src).data[2],
-                (*src).linesize[0] as usize,
-                (*src).linesize[1] as usize,
-                (*src).linesize[2] as usize,
+                (*src).linesize[0],
+                (*src).linesize[1],
+                (*src).linesize[2],
             )
         };
         let w = width as usize;
         let h = height as usize;
         let cw = w.div_ceil(2);
         let ch = h.div_ceil(2);
+        let ys = validate_plane_layout(y_ptr, ys_raw, w, h)?;
+        let us = validate_plane_layout(u_ptr, us_raw, cw, ch)?;
+        let vs = validate_plane_layout(v_ptr, vs_raw, cw, ch)?;
         let y = copy_plane(y_ptr, ys, w, h);
         let u = copy_plane(u_ptr, us, cw, ch);
         let v = copy_plane(v_ptr, vs, cw, ch);
@@ -414,18 +430,20 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
     }
 
     if fmt == ffi::AVPixelFormat_AV_PIX_FMT_NV12 {
-        let (y_ptr, uv_ptr, ys, uvs) = unsafe {
+        let (y_ptr, uv_ptr, ys_raw, uvs_raw) = unsafe {
             (
                 (*src).data[0],
                 (*src).data[1],
-                (*src).linesize[0] as usize,
-                (*src).linesize[1] as usize,
+                (*src).linesize[0],
+                (*src).linesize[1],
             )
         };
         let w = width as usize;
         let h = height as usize;
         let cw = w.div_ceil(2);
         let ch = h.div_ceil(2);
+        let ys = validate_plane_layout(y_ptr, ys_raw, w, h)?;
+        let uvs = validate_plane_layout(uv_ptr, uvs_raw, cw * 2, ch)?;
         let y = copy_plane(y_ptr, ys, w, h);
         let mut u = Vec::with_capacity(cw * ch);
         let mut v = Vec::with_capacity(cw * ch);
@@ -451,20 +469,23 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
     }
 
     if fmt == ffi::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
-        let (y_ptr, u_ptr, v_ptr, ys, us, vs) = unsafe {
+        let (y_ptr, u_ptr, v_ptr, ys_raw, us_raw, vs_raw) = unsafe {
             (
                 (*src).data[0],
                 (*src).data[1],
                 (*src).data[2],
-                (*src).linesize[0] as usize,
-                (*src).linesize[1] as usize,
-                (*src).linesize[2] as usize,
+                (*src).linesize[0],
+                (*src).linesize[1],
+                (*src).linesize[2],
             )
         };
         let w = width as usize;
         let h = height as usize;
         let cw = w.div_ceil(2);
         let ch = h.div_ceil(2);
+        let ys = validate_plane_layout(y_ptr, ys_raw, w * 2, h)?;
+        let us = validate_plane_layout(u_ptr, us_raw, cw * 2, ch)?;
+        let vs = validate_plane_layout(v_ptr, vs_raw, cw * 2, ch)?;
         let y = copy_plane_10le_to_u8(y_ptr, ys, w, h, 2);
         let u = copy_plane_10le_to_u8(u_ptr, us, cw, ch, 2);
         let v = copy_plane_10le_to_u8(v_ptr, vs, cw, ch, 2);
@@ -483,18 +504,20 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
     }
 
     if fmt == ffi::AVPixelFormat_AV_PIX_FMT_P010LE {
-        let (y_ptr, uv_ptr, ys, uvs) = unsafe {
+        let (y_ptr, uv_ptr, ys_raw, uvs_raw) = unsafe {
             (
                 (*src).data[0],
                 (*src).data[1],
-                (*src).linesize[0] as usize,
-                (*src).linesize[1] as usize,
+                (*src).linesize[0],
+                (*src).linesize[1],
             )
         };
         let w = width as usize;
         let h = height as usize;
         let cw = w.div_ceil(2);
         let ch = h.div_ceil(2);
+        let ys = validate_plane_layout(y_ptr, ys_raw, w * 2, h)?;
+        let uvs = validate_plane_layout(uv_ptr, uvs_raw, cw * 4, ch)?;
         let y = copy_plane_10le_to_u8(y_ptr, ys, w, h, 8);
         let mut u = Vec::with_capacity(cw * ch);
         let mut v = Vec::with_capacity(cw * ch);
@@ -521,6 +544,33 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
 
     tracing::warn!("Unsupported decoded pixel format {fmt}");
     Ok(None)
+}
+
+fn validate_plane_layout(
+    ptr: *const u8,
+    linesize: i32,
+    min_row_bytes: usize,
+    rows: usize,
+) -> Result<usize> {
+    if ptr.is_null() {
+        bail!("FFmpeg AVFrame plane pointer is null");
+    }
+    if linesize <= 0 {
+        bail!("FFmpeg AVFrame linesize ({linesize}) must be positive");
+    }
+    let stride = linesize as usize;
+    if stride < min_row_bytes {
+        bail!("FFmpeg AVFrame linesize ({stride}) is smaller than row width ({min_row_bytes})");
+    }
+    if rows > 0
+        && (rows - 1)
+            .checked_mul(stride)
+            .and_then(|o| o.checked_add(min_row_bytes))
+            .is_none()
+    {
+        bail!("FFmpeg AVFrame plane byte offset overflow");
+    }
+    Ok(stride)
 }
 
 fn copy_plane(src: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u8> {
@@ -642,5 +692,21 @@ mod tests {
         }
         let converted_msb = copy_plane_10le_to_u8(p010_buf.as_ptr(), 6, 3, 1, 8);
         assert_eq!(converted_msb, vec![0, 128, 255]);
+    }
+
+    #[test]
+    fn rejects_invalid_plane_layouts_and_oversized_packets() {
+        let byte = [0u8; 64];
+        assert!(validate_plane_layout(std::ptr::null(), 64, 16, 2).is_err());
+        assert!(validate_plane_layout(byte.as_ptr(), 0, 16, 2).is_err());
+        assert!(validate_plane_layout(byte.as_ptr(), -64, 16, 2).is_err());
+        assert!(validate_plane_layout(byte.as_ptr(), 8, 16, 2).is_err());
+        assert!(validate_plane_layout(byte.as_ptr(), i32::MAX, 16, usize::MAX).is_err());
+        assert_eq!(validate_plane_layout(byte.as_ptr(), 16, 16, 2).unwrap(), 16);
+
+        let mut decoder =
+            VideoDecoder::new(MediaCodec::H264, None).expect("FFmpeg H264 decoder initializes");
+        let oversized = vec![0u8; MAX_VIDEO_PACKET_BYTES + 1];
+        assert!(decoder.decode(&oversized).is_err());
     }
 }

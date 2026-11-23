@@ -65,6 +65,18 @@ struct StoredConsoleDisk {
     rp_key_dpapi: String,
 }
 
+fn sanitize_console_metadata(id: &str, name: &str) -> Result<(String, String)> {
+    let clean_id = gnsh_proto::sanitize_network_text(id, 64);
+    let clean_name = gnsh_proto::sanitize_network_text(name, 128);
+    if clean_id.is_empty() {
+        bail!("console id cannot be empty");
+    }
+    if clean_name.is_empty() {
+        bail!("console name cannot be empty");
+    }
+    Ok((clean_id, clean_name))
+}
+
 fn read_config_file(path: &Path) -> Result<String> {
     let meta =
         std::fs::metadata(path).with_context(|| format!("failed inspecting {}", path.display()))?;
@@ -124,6 +136,8 @@ impl ConsoleStore {
             let rp_key: [u8; 16] = rp_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("decrypted rp_key length != 16"))?;
+            let (id, name) = sanitize_console_metadata(&entry.id, &entry.name)
+                .context("invalid console metadata in consoles.json")?;
             let host = gnsh_proto::validate_console_host(&entry.host)
                 .context("invalid saved LAN host in consoles.json")?;
             let remote_host = match normalize_opt_host(entry.remote_host.as_deref()) {
@@ -137,8 +151,8 @@ impl ConsoleStore {
                 None => None,
             };
             out.push(SavedConsole {
-                id: entry.id,
-                name: entry.name,
+                id,
+                name,
                 host,
                 remote_host,
                 mac: entry.mac,
@@ -157,6 +171,8 @@ impl ConsoleStore {
         }
         let mut disk = Vec::with_capacity(consoles.len());
         for c in consoles {
+            let (valid_id, valid_name) = sanitize_console_metadata(&c.id, &c.name)
+                .context("cannot save console with invalid metadata")?;
             let valid_host = gnsh_proto::validate_console_host(&c.host)
                 .context("cannot save console with invalid LAN host")?;
             let valid_remote = match normalize_opt_host(c.remote_host.as_deref()) {
@@ -167,8 +183,8 @@ impl ConsoleStore {
                 None => None,
             };
             disk.push(StoredConsoleDisk {
-                id: c.id.clone(),
-                name: c.name.clone(),
+                id: valid_id,
+                name: valid_name,
                 host: valid_host,
                 remote_host: valid_remote,
                 mac: c.mac,
@@ -184,9 +200,31 @@ impl ConsoleStore {
     }
 }
 
+struct LocalAllocGuard(*mut u8);
+
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.cast())));
+            }
+        }
+    }
+}
+
+unsafe fn read_dpapi_output(output: CRYPT_INTEGER_BLOB) -> Result<Vec<u8>> {
+    let _guard = LocalAllocGuard(output.pbData);
+    if output.pbData.is_null() {
+        bail!("DPAPI returned null output buffer");
+    }
+    let slice = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    Ok(slice.to_vec())
+}
+
 fn dpapi_protect_b64(plain: &[u8]) -> Result<String> {
+    let cb_data = u32::try_from(plain.len()).context("DPAPI input exceeds u32")?;
     let input = CRYPT_INTEGER_BLOB {
-        cbData: plain.len() as u32,
+        cbData: cb_data,
         pbData: plain.as_ptr().cast_mut(),
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
@@ -201,17 +239,16 @@ fn dpapi_protect_b64(plain: &[u8]) -> Result<String> {
             &mut output,
         )
         .context("CryptProtectData failed")?;
-        let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let encoded = STANDARD.encode(slice);
-        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
-        Ok(encoded)
+        let bytes = read_dpapi_output(output)?;
+        Ok(STANDARD.encode(bytes))
     }
 }
 
 fn dpapi_unprotect_b64(b64: &str) -> Result<Vec<u8>> {
     let cipher = STANDARD.decode(b64).context("invalid base64 DPAPI blob")?;
+    let cb_data = u32::try_from(cipher.len()).context("DPAPI ciphertext exceeds u32")?;
     let input = CRYPT_INTEGER_BLOB {
-        cbData: cipher.len() as u32,
+        cbData: cb_data,
         pbData: cipher.as_ptr().cast_mut(),
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
@@ -226,9 +263,7 @@ fn dpapi_unprotect_b64(b64: &str) -> Result<Vec<u8>> {
             &mut output,
         )
         .context("CryptUnprotectData failed")?;
-        let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
-        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
-        Ok(slice)
+        read_dpapi_output(output)
     }
 }
 
@@ -277,7 +312,7 @@ mod tests {
         let legacy_json = raw
             .replace("    \"remote_host\": \"ps5.example.com\",\r\n", "")
             .replace("    \"remote_host\": \"ps5.example.com\",\n", "");
-        std::fs::write(&path, legacy_json).expect("write legacy json");
+        std::fs::write(&path, &legacy_json).expect("write legacy json");
         let legacy_loaded = store.load().expect("load legacy");
         assert_eq!(
             legacy_loaded,
@@ -286,6 +321,14 @@ mod tests {
                 ..expected
             }]
         );
+
+        // Tampered control characters in console id/name must be stripped on load/save, and empty metadata rejected.
+        let tampered_json = legacy_json.replace("\"PS5-LivingRoom\"", "\"PS5\\u001b[31m\\nSPOOF\"");
+        std::fs::write(&path, tampered_json).expect("write tampered json");
+        let sanitized_loaded = store.load().expect("load sanitized");
+        assert_eq!(sanitized_loaded[0].name, "PS5[31mSPOOF");
+        assert!(sanitize_console_metadata("", "PS5").is_err());
+        assert!(sanitize_console_metadata("id1", "\n\x1b").is_err());
 
         // Oversized config files > 1 MiB must be rejected before parsing.
         std::fs::write(&path, vec![b' '; (MAX_CONFIG_FILE_BYTES as usize) + 16])

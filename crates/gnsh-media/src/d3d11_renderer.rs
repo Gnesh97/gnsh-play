@@ -1158,6 +1158,13 @@ fn upload_plane(
         let dst_ptr = mapped.pData.cast::<u8>();
         let dst_stride = mapped.RowPitch as usize;
         let copy_w = width as usize;
+        if dst_ptr.is_null() || dst_stride < copy_w {
+            context.Unmap(tex, 0);
+            bail!(
+                "D3D11 Map returned invalid plane buffer (null={}, row_pitch={dst_stride}, width={copy_w})",
+                dst_ptr.is_null()
+            );
+        }
         for row in 0..height as usize {
             let src_start = row * src_stride;
             let src_end = src_start + copy_w;
@@ -1271,7 +1278,12 @@ pub fn compile_hlsl(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlo
 }
 
 pub fn blob_slice(blob: &ID3DBlob) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize()) }
+    let ptr = unsafe { blob.GetBufferPointer() };
+    let len = unsafe { blob.GetBufferSize() };
+    if ptr.is_null() || len == 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(ptr.cast(), len) }
 }
 
 #[cfg(test)]

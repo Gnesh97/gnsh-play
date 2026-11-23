@@ -1,5 +1,5 @@
 use crate::ffi;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use std::ffi::CStr;
 use std::os::raw::c_int;
 
@@ -156,6 +156,7 @@ impl AudioOutput {
         if samples.is_empty() {
             return Ok(());
         }
+        validate_audio_params(channels, sample_rate)?;
         if self.stream.is_null() || channels != self.channels || sample_rate != self.sample_rate {
             let next_stream = unsafe {
                 open_playback_stream(
@@ -175,7 +176,8 @@ impl AudioOutput {
             self.sample_rate = sample_rate;
         }
 
-        let bytes_len = std::mem::size_of_val(samples) as i32;
+        let bytes_len = i32::try_from(std::mem::size_of_val(samples))
+            .context("audio PCM buffer exceeds i32::MAX bytes")?;
         let max_queued = (self.sample_rate as usize
             * self.channels as usize
             * std::mem::size_of::<i16>()
@@ -326,7 +328,8 @@ impl HapticsAudioOutput {
             return Ok(());
         }
 
-        let bytes_len = std::mem::size_of_val(self.scratch_4ch.as_slice()) as i32;
+        let bytes_len = i32::try_from(std::mem::size_of_val(self.scratch_4ch.as_slice()))
+            .context("haptics PCM buffer exceeds i32::MAX bytes")?;
         // SAFETY: self.stream is a valid open SDL_AudioStream* owned by self, and scratch_4ch
         // provides initialized S16 bytes for the duration of SDL_PutAudioStreamData.
         unsafe {
@@ -505,12 +508,23 @@ fn find_playback_device_id(target_name: &str) -> Option<u32> {
     matched
 }
 
+fn validate_audio_params(channels: u32, sample_rate: u32) -> Result<(i32, i32)> {
+    if !(1..=8).contains(&channels) {
+        bail!("audio channel count {channels} out of valid 1..=8 range");
+    }
+    if !(8_000..=192_000).contains(&sample_rate) {
+        bail!("audio sample rate {sample_rate} Hz out of valid 8000..=192000 range");
+    }
+    Ok((channels as i32, sample_rate as i32))
+}
+
 unsafe fn open_playback_stream(
     channels: u32,
     sample_rate: u32,
     device_name: Option<&str>,
     volume: f32,
 ) -> Result<*mut ffi::SDL_AudioStream> {
+    let (valid_channels, valid_rate) = validate_audio_params(channels, sample_rate)?;
     let dev_id = match normalize_device_name(device_name) {
         Some(name) => match find_playback_device_id(&name) {
             Some(id) => id,
@@ -526,8 +540,8 @@ unsafe fn open_playback_stream(
     };
     let spec = ffi::SDL_AudioSpec {
         format: ffi::SDL_AudioFormat_SDL_AUDIO_S16,
-        channels: channels as i32,
-        freq: sample_rate as i32,
+        channels: valid_channels,
+        freq: valid_rate,
     };
     let stream =
         unsafe { ffi::SDL_OpenAudioDeviceStream(dev_id, &spec, None, std::ptr::null_mut()) };
@@ -592,5 +606,16 @@ mod tests {
 
         let devices = list_playback_devices();
         assert!(devices.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn rejects_out_of_range_audio_stream_parameters() {
+        assert_eq!(validate_audio_params(2, 48_000).unwrap(), (2, 48_000));
+        assert!(validate_audio_params(0, 48_000).is_err());
+        assert!(validate_audio_params(9, 48_000).is_err());
+        assert!(validate_audio_params(2, 4_000).is_err());
+        assert!(validate_audio_params(2, 384_000).is_err());
+        assert!(unsafe { open_playback_stream(0, 48_000, None, 1.0) }.is_err());
+        assert!(unsafe { open_playback_stream(2, 1_000, None, 1.0) }.is_err());
     }
 }
