@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Instant;
 
-const MOUSE_DECAY_TAU_SECS: f32 = 0.018;
-const MOUSE_BASE_SCALE: f32 = 1.0 / 35.0;
+const MOUSE_MIN_SAMPLE_WINDOW_SECS: f32 = 0.004;
+const MOUSE_REF_FRAME_SECS: f32 = 1.0 / 60.0;
+const MOUSE_STOP_DECAY_TAU_SECS: f32 = 0.0035;
+const MOUSE_BASE_SCALE: f32 = 1.0 / 14.0;
 const MOUSE_VEL_CUTOFF: f32 = 0.008;
 const MOUSE_VEL_ZERO_SNAP: f32 = 0.002;
-const MOUSE_RESPONSE_GAMMA: f32 = 0.85;
+const MOUSE_RESPONSE_GAMMA: f32 = 0.60;
 
 /// A single keyboard key or mouse button input usable in bindable presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -312,6 +314,7 @@ pub struct KbmEmulator {
     accum_dy: f32,
     vel_x: f32,
     vel_y: f32,
+    last_right_stick: (i16, i16),
     last_sample: Option<Instant>,
 }
 
@@ -352,6 +355,7 @@ impl KbmEmulator {
         self.accum_dy = 0.0;
         self.vel_x = 0.0;
         self.vel_y = 0.0;
+        self.last_right_stick = (0, 0);
         self.last_sample = None;
     }
 
@@ -362,21 +366,30 @@ impl KbmEmulator {
         }
     }
 
-    /// Samples current keyboard/mouse state and advances smoothed mouse-to-stick emulation.
+    /// Samples current keyboard/mouse state and advances mouse-to-stick emulation.
     pub fn sample_state(&mut self, config: KbmConfig, bindings: &KbmBindings) -> ControllerState {
         let now = Instant::now();
-        let dt_secs = self
-            .last_sample
-            .map(|prev| now.duration_since(prev).as_secs_f32().clamp(0.0005, 0.1))
-            .unwrap_or(0.004);
-        self.last_sample = Some(now);
-
-        let raw_dx = std::mem::take(&mut self.accum_dx);
-        let raw_dy = std::mem::take(&mut self.accum_dy);
-        let mut vel = (self.vel_x, self.vel_y);
-        let (right_x, right_y) = step_mouse_stick(&mut vel, (raw_dx, raw_dy), dt_secs, config);
-        self.vel_x = vel.0;
-        self.vel_y = vel.1;
+        let sample_dt = match self.last_sample {
+            None => Some(MOUSE_MIN_SAMPLE_WINDOW_SECS),
+            Some(prev) => {
+                let elapsed = now.duration_since(prev).as_secs_f32();
+                (elapsed >= MOUSE_MIN_SAMPLE_WINDOW_SECS)
+                    .then(|| elapsed.clamp(MOUSE_MIN_SAMPLE_WINDOW_SECS, 0.1))
+            }
+        };
+        let (right_x, right_y) = if let Some(dt_secs) = sample_dt {
+            self.last_sample = Some(now);
+            let raw_dx = std::mem::take(&mut self.accum_dx);
+            let raw_dy = std::mem::take(&mut self.accum_dy);
+            let mut vel = (self.vel_x, self.vel_y);
+            let stick = step_mouse_stick(&mut vel, (raw_dx, raw_dy), dt_secs, config);
+            self.vel_x = vel.0;
+            self.vel_y = vel.1;
+            self.last_right_stick = stick;
+            stick
+        } else {
+            self.last_right_stick
+        };
 
         let lx = f32::from(i8::from(self.is_pressed(bindings.move_right)))
             - f32::from(i8::from(self.is_pressed(bindings.move_left)));
@@ -422,31 +435,49 @@ impl KbmEmulator {
     }
 }
 
-/// Integrates raw relative mouse deltas into a smoothed, deadzone-boosted right stick value.
+/// Converts raw relative mouse deltas into a `dt`-normalized, deadzone-boosted right stick value.
 pub fn step_mouse_stick(
     vel: &mut (f32, f32),
     raw_delta: (f32, f32),
     dt_secs: f32,
     config: KbmConfig,
 ) -> (i16, i16) {
-    let dt = dt_secs.clamp(0.0005, 0.1);
-    let decay = (-dt / MOUSE_DECAY_TAU_SECS).exp();
-    let sens = (f32::from(config.sensitivity_pct.clamp(1, 100)) / 50.0).clamp(0.02, 4.0);
+    let dt = dt_secs.clamp(0.001, 0.1);
+    let decay = (-dt / MOUSE_STOP_DECAY_TAU_SECS).exp();
+    let sens = (f32::from(config.sensitivity_pct.clamp(1, 100)) / 50.0)
+        .powf(1.35)
+        .clamp(0.02, 6.0);
+    let frame_scale = (MOUSE_REF_FRAME_SECS / dt).clamp(0.25, 6.0);
 
-    vel.0 = vel.0 * decay + raw_delta.0 * sens * MOUSE_BASE_SCALE;
-    vel.1 = vel.1 * decay + raw_delta.1 * sens * MOUSE_BASE_SCALE;
+    let target_x = raw_delta.0 * frame_scale * sens * MOUSE_BASE_SCALE;
+    let target_y = raw_delta.1 * frame_scale * sens * MOUSE_BASE_SCALE;
 
-    let mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
+    if raw_delta.0.abs() > 1e-5 || raw_delta.1.abs() > 1e-5 {
+        vel.0 = target_x + vel.0 * decay * 0.2;
+        vel.1 = target_y + vel.1 * decay * 0.2;
+    } else {
+        vel.0 *= decay;
+        vel.1 *= decay;
+    }
+
+    let mut mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
     if !mag.is_finite() || mag < MOUSE_VEL_CUTOFF {
-        if mag < MOUSE_VEL_ZERO_SNAP {
+        if !mag.is_finite() || mag < MOUSE_VEL_ZERO_SNAP {
             *vel = (0.0, 0.0);
         }
         return (0, 0);
     }
 
-    let clamped = mag.min(1.0);
+    if mag > 1.0 {
+        // Keep stored velocity bounded so fast flicks don't leave a lingering stop tail.
+        let inv = 1.0 / mag;
+        vel.0 *= inv;
+        vel.1 *= inv;
+        mag = 1.0;
+    }
+
     let dz = f32::from(config.deadzone_pct.min(40)) / 100.0;
-    let out_mag = (dz + clamped.powf(MOUSE_RESPONSE_GAMMA) * (1.0 - dz)).clamp(0.0, 1.0);
+    let out_mag = (dz + mag.powf(MOUSE_RESPONSE_GAMMA) * (1.0 - dz)).clamp(0.0, 1.0);
     let nx = vel.0 / mag;
     let ny = (vel.1 / mag) * if config.invert_y { -1.0 } else { 1.0 };
 
@@ -615,10 +646,49 @@ mod tests {
 
         // Idle frames decay smoothly back to exact (0, 0).
         let mut final_stick = (rx, ry);
-        for _ in 0..30 {
+        for _ in 0..4 {
             final_stick = step_mouse_stick(&mut vel, (0.0, 0.0), 0.016, cfg);
         }
         assert_eq!(final_stick, (0, 0));
+    }
+
+    #[test]
+    fn mouse_stick_response_is_dt_independent_and_stops_within_20ms() {
+        let cfg = KbmConfig {
+            sensitivity_pct: 50,
+            deadzone_pct: 15,
+            invert_y: false,
+        };
+
+        // Equal physical speed (625 px/s): 2.5 px in 4 ms vs 10.0 px in 16 ms.
+        let mut vel_fast = (0.0, 0.0);
+        let (rx_4ms, _) = step_mouse_stick(&mut vel_fast, (2.5, 0.0), 0.004, cfg);
+        let mut vel_slow = (0.0, 0.0);
+        let (rx_16ms, _) = step_mouse_stick(&mut vel_slow, (10.0, 0.0), 0.016, cfg);
+        assert!(
+            (rx_4ms - rx_16ms).abs() <= 2,
+            "4ms ({rx_4ms}) and 16ms ({rx_16ms}) windows should match for equal speed"
+        );
+        assert!(
+            rx_4ms > 20_000,
+            "first sample must reach high turn deflection"
+        );
+
+        // Reversing hand direction flips output sign on the very next 4 ms sample.
+        let (rx_rev, _) = step_mouse_stick(&mut vel_fast, (-2.5, 0.0), 0.004, cfg);
+        assert!(
+            rx_rev < 0,
+            "expected immediate negative reversal, got {rx_rev}"
+        );
+
+        // Saturated flick stops cleanly to exact (0, 0) within 20 ms (5 x 4 ms ticks).
+        let mut vel_flick = (0.0, 0.0);
+        step_mouse_stick(&mut vel_flick, (80.0, 0.0), 0.004, cfg);
+        let mut stick = (i16::MAX, 0);
+        for _ in 0..5 {
+            stick = step_mouse_stick(&mut vel_flick, (0.0, 0.0), 0.004, cfg);
+        }
+        assert_eq!(stick, (0, 0));
     }
 
     #[test]
