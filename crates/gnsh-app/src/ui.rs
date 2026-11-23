@@ -2,7 +2,7 @@ use crate::AppState;
 use crate::storage::{SavedConsole, StoredSettings};
 use crate::stream::ActiveStream;
 use gnsh_input::{KbmAction, KbmBindings};
-use gnsh_media::ScaleMode;
+use gnsh_media::{ScaleMode, VideoFilterMode};
 use gnsh_proto::{
     ConsoleState, DiscoveredConsole, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, RegisteredConsole,
     VideoCodec, VideoPreset, decode_account_id_b64, exchange_redirect_url_for_account_id,
@@ -214,6 +214,13 @@ impl AppState {
                     render_scale_selector(ui, &mut self.settings.scale_mode);
 
                     ui.separator();
+                    render_filter_controls(
+                        ui,
+                        &mut self.settings.filter_mode,
+                        &mut self.settings.sharpness_pct,
+                    );
+
+                    ui.separator();
 
                     ui.add(
                         egui::Slider::new(
@@ -230,15 +237,6 @@ impl AppState {
                     ui.scope(|ui| {
                         ui.spacing_mut().slider_width = 70.0;
                         ui.add(
-                            egui::Slider::new(&mut self.settings.sharpness_pct, 0..=100)
-                                .clamping(egui::SliderClamping::Always)
-                                .suffix("%")
-                                .text("CAS"),
-                        )
-                        .on_hover_text(
-                            "Contrast Adaptive Sharpening (single-pass HLSL, 0% = off)",
-                        );
-                        ui.add(
                             egui::Slider::new(&mut self.settings.volume_pct, 0..=100)
                                 .clamping(egui::SliderClamping::Always)
                                 .suffix("%")
@@ -253,6 +251,14 @@ impl AppState {
                         "home_audio_device",
                         &self.audio_devices,
                         &mut self.settings.audio_device,
+                    );
+
+                    ui.label(egui::RichText::new("Mic:").weak());
+                    render_audio_device_combo(
+                        ui,
+                        "home_mic_device",
+                        &self.mic_devices,
+                        &mut self.settings.mic_device,
                     );
 
                     ui.checkbox(&mut self.settings.vsync, "VSync");
@@ -1106,6 +1112,52 @@ fn render_scale_selector(ui: &mut egui::Ui, scale_mode: &mut ScaleMode) {
         .on_hover_text("Stretch frame to fill entire window without cropping");
 }
 
+fn render_filter_controls(
+    ui: &mut egui::Ui,
+    filter_mode: &mut VideoFilterMode,
+    sharpness_pct: &mut u8,
+) {
+    ui.label(egui::RichText::new("Filter:").weak());
+    ui.selectable_value(filter_mode, VideoFilterMode::Bilinear, "Bilinear")
+        .on_hover_text("Fast bilinear scaling with no sharpening filter");
+    ui.selectable_value(filter_mode, VideoFilterMode::Cas, "CAS")
+        .on_hover_text("Single-pass HLSL Contrast Adaptive Sharpening");
+    ui.selectable_value(filter_mode, VideoFilterMode::Fsr1, "FSR 1.0")
+        .on_hover_text(
+            "AMD FidelityFX Super Resolution 1.0: 12-tap EASU edge-adaptive upscaling + RCAS sharpening",
+        );
+
+    let (slider_label, enabled, tooltip) = match *filter_mode {
+        VideoFilterMode::Bilinear => (
+            "Sharp",
+            false,
+            "Switch Filter to CAS or FSR 1.0 to adjust sharpening",
+        ),
+        VideoFilterMode::Cas => (
+            "CAS",
+            true,
+            "Contrast Adaptive Sharpening intensity (0-100%)",
+        ),
+        VideoFilterMode::Fsr1 => (
+            "RCAS",
+            true,
+            "FSR 1.0 RCAS sharpening intensity after EASU upscaling (0% = EASU only)",
+        ),
+    };
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = 70.0;
+        ui.add_enabled(
+            enabled,
+            egui::Slider::new(sharpness_pct, 0..=100)
+                .clamping(egui::SliderClamping::Always)
+                .suffix("%")
+                .text(slider_label),
+        )
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip);
+    });
+}
+
 fn render_audio_device_combo(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -1208,6 +1260,7 @@ pub(crate) fn render_streaming_ui(
     gamepad_name: Option<&str>,
     settings: &mut StreamSettings,
     audio_devices: &[String],
+    mic_devices: &[String],
     hdr_output_active: bool,
     mouse_locked: bool,
     open_keybinds: &mut bool,
@@ -1318,17 +1371,16 @@ pub(crate) fn render_streaming_ui(
                             render_scale_selector(ui, &mut settings.scale_mode);
 
                             ui.separator();
+                            render_filter_controls(
+                                ui,
+                                &mut settings.filter_mode,
+                                &mut settings.sharpness_pct,
+                            );
+                        });
+
+                        ui.horizontal(|ui| {
                             ui.scope(|ui| {
                                 ui.spacing_mut().slider_width = 70.0;
-                                ui.add(
-                                    egui::Slider::new(&mut settings.sharpness_pct, 0..=100)
-                                        .clamping(egui::SliderClamping::Always)
-                                        .suffix("%")
-                                        .text("CAS"),
-                                )
-                                .on_hover_text(
-                                    "Contrast Adaptive Sharpening (single-pass HLSL, 0% = off)",
-                                );
                                 ui.add(
                                     egui::Slider::new(&mut settings.volume_pct, 0..=100)
                                         .clamping(egui::SliderClamping::Always)
@@ -1345,6 +1397,15 @@ pub(crate) fn render_streaming_ui(
                                 "hud_audio_device",
                                 audio_devices,
                                 &mut settings.audio_device,
+                            );
+
+                            ui.separator();
+                            ui.label(egui::RichText::new("Mic:").weak());
+                            render_audio_device_combo(
+                                ui,
+                                "hud_mic_device",
+                                mic_devices,
+                                &mut settings.mic_device,
                             );
                         });
 
@@ -1399,10 +1460,22 @@ pub(crate) fn render_streaming_ui(
                         } else {
                             ""
                         };
-                        let cas_badge = if settings.sharpness_pct > 0 {
-                            format!("  |  CAS: {}%", settings.sharpness_pct)
-                        } else {
-                            String::new()
+                        let filter_badge = match settings.filter_mode {
+                            VideoFilterMode::Bilinear => String::new(),
+                            VideoFilterMode::Cas => {
+                                if settings.sharpness_pct > 0 {
+                                    format!("  |  CAS: {}%", settings.sharpness_pct)
+                                } else {
+                                    String::new()
+                                }
+                            }
+                            VideoFilterMode::Fsr1 => {
+                                if settings.sharpness_pct > 0 {
+                                    format!("  |  FSR 1.0 (RCAS {}%)", settings.sharpness_pct)
+                                } else {
+                                    "  |  FSR 1.0".to_string()
+                                }
+                            }
                         };
 
                         ui.label(
@@ -1423,7 +1496,7 @@ pub(crate) fn render_streaming_ui(
                                 decode_ms_text,
                                 decoder_badge,
                                 hdr_badge,
-                                cas_badge,
+                                filter_badge,
                                 udp_buf_text,
                                 pad_label,
                                 haptics_label

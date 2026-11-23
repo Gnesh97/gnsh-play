@@ -43,23 +43,19 @@ fn normalize_device_name(name: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Lists available SDL3 playback device names in system presentation order.
-pub fn list_playback_devices() -> Vec<String> {
-    if let Err(err) = ensure_sdl_audio_init() {
-        tracing::debug!("SDL audio init failed during playback device enumeration: {err:#}");
-        return Vec::new();
-    }
-
+fn collect_sdl_audio_devices(
+    getter: unsafe extern "C" fn(*mut c_int) -> *mut u32,
+) -> Vec<(u32, String)> {
     let mut count: c_int = 0;
     // SAFETY: count is a valid stack i32 pointer; SDL allocates the returned device ID array.
-    let ids = unsafe { ffi::SDL_GetAudioPlaybackDevices(&mut count) };
+    let ids = unsafe { getter(&mut count) };
     if ids.is_null() {
         return Vec::new();
     }
 
     let mut devices = Vec::new();
     if count > 0 {
-        // SAFETY: ids is non-null and holds `count` elements reported by SDL_GetAudioPlaybackDevices.
+        // SAFETY: ids is non-null and holds `count` elements reported by the SDL device getter.
         let slice = unsafe { std::slice::from_raw_parts(ids, count as usize) };
         for &dev_id in slice {
             let ptr = unsafe { ffi::SDL_GetAudioDeviceName(dev_id) };
@@ -70,15 +66,39 @@ pub fn list_playback_devices() -> Vec<String> {
                 .to_string_lossy()
                 .trim()
                 .to_string();
-            if !name.is_empty() && !devices.contains(&name) {
-                devices.push(name);
+            if !name.is_empty() && !devices.iter().any(|(_, existing)| existing == &name) {
+                devices.push((dev_id, name));
             }
         }
     }
 
-    // SAFETY: ids was allocated by SDL_GetAudioPlaybackDevices and must always be freed.
+    // SAFETY: ids was allocated by SDL and must always be freed.
     unsafe { ffi::SDL_free(ids.cast()) };
     devices
+}
+
+fn list_audio_devices(
+    getter: unsafe extern "C" fn(*mut c_int) -> *mut u32,
+    kind_label: &str,
+) -> Vec<String> {
+    if let Err(err) = ensure_sdl_audio_init() {
+        tracing::debug!("SDL audio init failed during {kind_label} device enumeration: {err:#}");
+        return Vec::new();
+    }
+    collect_sdl_audio_devices(getter)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// Lists available SDL3 playback device names in system presentation order.
+pub fn list_playback_devices() -> Vec<String> {
+    list_audio_devices(ffi::SDL_GetAudioPlaybackDevices, "playback")
+}
+
+/// Lists available SDL3 recording (microphone) device names in system presentation order.
+pub fn list_recording_devices() -> Vec<String> {
+    list_audio_devices(ffi::SDL_GetAudioRecordingDevices, "recording")
 }
 
 /// Low-latency PCM16 playback stream backed by SDL3.
@@ -364,6 +384,7 @@ impl Drop for HapticsAudioOutput {
 /// Low-latency 48 kHz stereo PCM16 recording capture stream backed by SDL3.
 pub struct MicCapture {
     stream: *mut ffi::SDL_AudioStream,
+    device_name: Option<String>,
     muted: bool,
 }
 
@@ -372,31 +393,34 @@ unsafe impl Send for MicCapture {}
 impl MicCapture {
     /// Opens the system default recording device in 48 kHz stereo S16 format, initially paused.
     pub fn new_default() -> Result<Self> {
+        Self::new_for_device(None)
+    }
+
+    /// Opens an SDL3 recording device targeting `device_name` (or system default if `None`), initially paused.
+    pub fn new_for_device(device_name: Option<&str>) -> Result<Self> {
         ensure_sdl_audio_init()?;
-        let dst_spec = ffi::SDL_AudioSpec {
-            format: ffi::SDL_AudioFormat_SDL_AUDIO_S16,
-            channels: 2,
-            freq: 48_000,
-        };
-        // SAFETY: SDL_AUDIO_DEVICE_DEFAULT_RECORDING opens the OS default capture device with dst_spec output.
-        let stream = unsafe {
-            ffi::SDL_OpenAudioDeviceStream(
-                SDL_AUDIO_DEVICE_DEFAULT_RECORDING,
-                &dst_spec,
-                None,
-                std::ptr::null_mut(),
-            )
-        };
-        if stream.is_null() {
-            bail!(
-                "SDL_OpenAudioDeviceStream(default mic) failed: {}",
-                sdl_error()
-            );
-        }
+        let normalized = normalize_device_name(device_name);
+        let stream = unsafe { open_recording_stream(normalized.as_deref(), true)? };
         Ok(Self {
             stream,
+            device_name: normalized,
             muted: true,
         })
+    }
+
+    /// Switches live microphone capture to `device_name` (or system default if `None`) preserving mute state.
+    pub fn switch_device(&mut self, device_name: Option<&str>) -> Result<()> {
+        let normalized = normalize_device_name(device_name);
+        let next_stream = unsafe { open_recording_stream(normalized.as_deref(), self.muted)? };
+        let old = std::mem::replace(&mut self.stream, next_stream);
+        if !old.is_null() {
+            // SAFETY: `old` was replaced above and is uniquely owned by self.
+            unsafe {
+                ffi::SDL_DestroyAudioStream(old);
+            }
+        }
+        self.device_name = normalized;
+        Ok(())
     }
 
     pub fn is_muted(&self) -> bool {
@@ -481,31 +505,28 @@ fn ensure_sdl_audio_init() -> Result<()> {
     Ok(())
 }
 
-fn find_playback_device_id(target_name: &str) -> Option<u32> {
-    let mut count: c_int = 0;
-    let ids = unsafe { ffi::SDL_GetAudioPlaybackDevices(&mut count) };
-    if ids.is_null() {
-        return None;
-    }
-
-    let mut matched = None;
-    if count > 0 {
-        let slice = unsafe { std::slice::from_raw_parts(ids, count as usize) };
-        for &dev_id in slice {
-            let ptr = unsafe { ffi::SDL_GetAudioDeviceName(dev_id) };
-            if ptr.is_null() {
-                continue;
+fn resolve_audio_device_id(
+    getter: unsafe extern "C" fn(*mut c_int) -> *mut u32,
+    device_name: Option<&str>,
+    default_id: u32,
+    kind_label: &str,
+) -> u32 {
+    match normalize_device_name(device_name) {
+        Some(target) => match collect_sdl_audio_devices(getter)
+            .into_iter()
+            .find(|(_, name)| name == &target)
+        {
+            Some((id, _)) => id,
+            None => {
+                tracing::warn!(
+                    device = %target,
+                    "Selected {kind_label} device unavailable; falling back to system default"
+                );
+                default_id
             }
-            let name = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-            if name.trim() == target_name {
-                matched = Some(dev_id);
-                break;
-            }
-        }
+        },
+        None => default_id,
     }
-
-    unsafe { ffi::SDL_free(ids.cast()) };
-    matched
 }
 
 fn validate_audio_params(channels: u32, sample_rate: u32) -> Result<(i32, i32)> {
@@ -525,19 +546,12 @@ unsafe fn open_playback_stream(
     volume: f32,
 ) -> Result<*mut ffi::SDL_AudioStream> {
     let (valid_channels, valid_rate) = validate_audio_params(channels, sample_rate)?;
-    let dev_id = match normalize_device_name(device_name) {
-        Some(name) => match find_playback_device_id(&name) {
-            Some(id) => id,
-            None => {
-                tracing::warn!(
-                    device = %name,
-                    "Selected playback device unavailable; falling back to system default"
-                );
-                SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK
-            }
-        },
-        None => SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-    };
+    let dev_id = resolve_audio_device_id(
+        ffi::SDL_GetAudioPlaybackDevices,
+        device_name,
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+        "playback",
+    );
     let spec = ffi::SDL_AudioSpec {
         format: ffi::SDL_AudioFormat_SDL_AUDIO_S16,
         channels: valid_channels,
@@ -554,6 +568,33 @@ unsafe fn open_playback_stream(
     if !unsafe { ffi::SDL_ResumeAudioStreamDevice(stream) } {
         unsafe { ffi::SDL_DestroyAudioStream(stream) };
         bail!("SDL_ResumeAudioStreamDevice failed: {}", sdl_error());
+    }
+    Ok(stream)
+}
+
+unsafe fn open_recording_stream(
+    device_name: Option<&str>,
+    muted: bool,
+) -> Result<*mut ffi::SDL_AudioStream> {
+    let dev_id = resolve_audio_device_id(
+        ffi::SDL_GetAudioRecordingDevices,
+        device_name,
+        SDL_AUDIO_DEVICE_DEFAULT_RECORDING,
+        "recording",
+    );
+    let dst_spec = ffi::SDL_AudioSpec {
+        format: ffi::SDL_AudioFormat_SDL_AUDIO_S16,
+        channels: 2,
+        freq: 48_000,
+    };
+    let stream =
+        unsafe { ffi::SDL_OpenAudioDeviceStream(dev_id, &dst_spec, None, std::ptr::null_mut()) };
+    if stream.is_null() {
+        bail!("SDL_OpenAudioDeviceStream(mic) failed: {}", sdl_error());
+    }
+    if !muted && !unsafe { ffi::SDL_ResumeAudioStreamDevice(stream) } {
+        unsafe { ffi::SDL_DestroyAudioStream(stream) };
+        bail!("SDL_ResumeAudioStreamDevice(mic) failed: {}", sdl_error());
     }
     Ok(stream)
 }
@@ -606,6 +647,9 @@ mod tests {
 
         let devices = list_playback_devices();
         assert!(devices.iter().all(|name| !name.is_empty()));
+
+        let mics = list_recording_devices();
+        assert!(mics.iter().all(|name| !name.is_empty()));
     }
 
     #[test]

@@ -12,7 +12,9 @@ use egui_d3d11::EguiD3d11Painter;
 use gnsh_input::{
     AppWindow, GamepadManager, KbmAction, KbmConfig, KbmEmulator, merge_controller_states,
 };
-use gnsh_media::{D3D11Renderer, list_playback_devices};
+use gnsh_media::{
+    D3D11Renderer, VideoRenderOptions, VideoRenderer, list_playback_devices, list_recording_devices,
+};
 use gnsh_proto::{
     ControllerState, DiscoveredConsole, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES,
     VideoCodec, discover_ps5_hosts, discover_ps5_lan, init_lib, wake_ps5,
@@ -248,6 +250,7 @@ fn run_gui() -> Result<()> {
         );
         if summary.audio_devices_changed {
             app.audio_devices = list_playback_devices();
+            app.mic_devices = list_recording_devices();
             if let AppMode::Streaming(ref stream) = app.mode {
                 stream.haptics_recheck.store(true, Ordering::Release);
                 stream.audio_device_recheck.store(true, Ordering::Release);
@@ -322,8 +325,15 @@ fn run_gui() -> Result<()> {
         let sharpness = f32::from(app.settings.sharpness_pct.min(100)) / 100.0;
         if let AppMode::Streaming(ref stream) = app.mode
             && let Some(ref latest) = stream.current_frame
-            && let Err(err) =
-                renderer.draw_video_frame(&latest.frame, sharpness, app.settings.scale_mode)
+            && let Err(err) = VideoRenderer::draw_video_frame(
+                &mut renderer,
+                &latest.frame,
+                VideoRenderOptions {
+                    filter_mode: app.settings.filter_mode,
+                    sharpness,
+                    scale_mode: app.settings.scale_mode,
+                },
+            )
         {
             tracing::warn!("draw_video_frame failed: {err:#}");
         }
@@ -493,6 +503,7 @@ pub(crate) struct AppState {
     pub(crate) saved_consoles: Vec<SavedConsole>,
     pub(crate) discovered_consoles: Vec<DiscoveredConsole>,
     pub(crate) audio_devices: Vec<String>,
+    pub(crate) mic_devices: Vec<String>,
     pub(crate) discovery_rx: Option<Receiver<std::result::Result<Vec<DiscoveredConsole>, String>>>,
     pub(crate) wake_rx: Option<Receiver<std::result::Result<String, String>>>,
     pub(crate) settings: StreamSettings,
@@ -520,6 +531,7 @@ impl AppState {
             saved_consoles,
             discovered_consoles: Vec::new(),
             audio_devices: list_playback_devices(),
+            mic_devices: list_recording_devices(),
             discovery_rx: None,
             wake_rx: None,
             settings,
@@ -1112,6 +1124,7 @@ impl AppState {
                     gamepad_name,
                     &mut self.settings,
                     &self.audio_devices,
+                    &self.mic_devices,
                     hdr_output_active,
                     mouse_locked,
                     &mut self.kbm_modal_open,
@@ -1120,7 +1133,7 @@ impl AppState {
         }
         self.render_kbm_bindings_modal(ui.ctx());
         if self.settings != prev_settings {
-            if let AppMode::Streaming(ref stream) = self.mode {
+            if let AppMode::Streaming(ref mut stream) = self.mode {
                 if self.settings.volume_pct != prev_settings.volume_pct {
                     stream
                         .volume_pct
@@ -1131,6 +1144,9 @@ impl AppState {
                         *guard = self.settings.audio_device.clone();
                     }
                     stream.audio_device_recheck.store(true, Ordering::Release);
+                }
+                if self.settings.mic_device != prev_settings.mic_device {
+                    stream.set_mic_device(self.settings.mic_device.clone());
                 }
             }
             self.persist_settings();

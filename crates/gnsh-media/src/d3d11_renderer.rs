@@ -1,6 +1,7 @@
+pub use crate::renderer::ScaleMode;
+use crate::renderer::{VideoFilterMode, VideoRenderOptions, VideoRenderer};
 use crate::video_decoder::{D3D11Frame, DecodedFrame};
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, HWND};
@@ -11,16 +12,16 @@ use windows::Win32::Graphics::Direct3D::{
     D3D11_SRV_DIMENSION_TEXTURE2DARRAY, ID3DBlob,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
-    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
-    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11Buffer,
-    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC,
+    D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_ARRAY_SRV,
+    D3D11_TEX2D_SRV, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11Buffer, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Multithread, ID3D11PixelShader, ID3D11RenderTargetView,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
@@ -322,6 +323,246 @@ float4 PSMain(PSIn i) : SV_TARGET {
 }
 "#;
 
+const FSR_EASU_PS_HLSL: &str = r#"
+Texture2D texSrc : register(t0);
+SamplerState sampLinear : register(s0);
+cbuffer FsrParams : register(b0) {
+    float4 src_size;    // x = src_w, y = src_h, z = 1/src_w, w = 1/src_h
+    float4 rcas_bounds; // unused in EASU
+    float4 rcas_params; // unused in EASU
+};
+
+struct PSIn {
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+void easu_set(
+    inout float2 dir,
+    inout float len,
+    float2 pp,
+    bool biS, bool biT, bool biU, bool biV,
+    float lA, float lB, float lC, float lD, float lE
+) {
+    float w = 0.0;
+    if (biS) w = (1.0 - pp.x) * (1.0 - pp.y);
+    if (biT) w = pp.x * (1.0 - pp.y);
+    if (biU) w = (1.0 - pp.x) * pp.y;
+    if (biV) w = pp.x * pp.y;
+
+    float dc = lD - lC;
+    float cb = lC - lB;
+    float lenX = max(abs(dc), abs(cb));
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = (lenX > 1e-5) ? saturate(abs(dirX) / lenX) : 0.0;
+    lenX *= lenX;
+    len += lenX * w;
+
+    float ec = lE - lC;
+    float ca = lC - lA;
+    float lenY = max(abs(ec), abs(ca));
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = (lenY > 1e-5) ? saturate(abs(dirY) / lenY) : 0.0;
+    lenY *= lenY;
+    len += lenY * w;
+}
+
+void easu_tap(
+    inout float3 aC,
+    inout float aW,
+    float2 off,
+    float2 dir,
+    float2 len2,
+    float lob,
+    float clp,
+    float3 c
+) {
+    float2 v;
+    v.x = (off.x * dir.x) + (off.y * dir.y);
+    v.y = (off.x * (-dir.y)) + (off.y * dir.x);
+    v *= len2;
+    float d2 = min(dot(v, v), clp);
+    float wB = (2.0 / 5.0) * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = (25.0 / 16.0) * wB - (25.0 / 16.0 - 1.0);
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+float4 PSMain(PSIn i) : SV_TARGET {
+    float2 pp = i.uv * src_size.xy - 0.5;
+    float2 fp = floor(pp);
+    float2 f = pp - fp;
+    float2 inv = src_size.zw;
+
+    float2 p0 = (fp + float2(0.0, 1.0)) * inv;
+    float2 p1 = (fp + float2(2.0, 1.0)) * inv;
+    float2 p2 = (fp + float2(1.0, 0.0)) * inv;
+    float2 p3 = (fp + float2(1.0, 2.0)) * inv;
+
+    float4 ijfeR = texSrc.GatherRed(sampLinear, p0);
+    float4 ijfeG = texSrc.GatherGreen(sampLinear, p0);
+    float4 ijfeB = texSrc.GatherBlue(sampLinear, p0);
+
+    float4 klhgR = texSrc.GatherRed(sampLinear, p1);
+    float4 klhgG = texSrc.GatherGreen(sampLinear, p1);
+    float4 klhgB = texSrc.GatherBlue(sampLinear, p1);
+
+    float4 bcR = texSrc.GatherRed(sampLinear, p2);
+    float4 bcG = texSrc.GatherGreen(sampLinear, p2);
+    float4 bcB = texSrc.GatherBlue(sampLinear, p2);
+
+    float4 noR = texSrc.GatherRed(sampLinear, p3);
+    float4 noG = texSrc.GatherGreen(sampLinear, p3);
+    float4 noB = texSrc.GatherBlue(sampLinear, p3);
+
+    float4 bczzL = 0.5 * bcG + 0.25 * (bcR + bcB);
+    float4 ijfeL = 0.5 * ijfeG + 0.25 * (ijfeR + ijfeB);
+    float4 klhgL = 0.5 * klhgG + 0.25 * (klhgR + klhgB);
+    float4 nozzL = 0.5 * noG + 0.25 * (noR + noB);
+
+    float bL = bczzL.w; float cL = bczzL.z;
+    float iL = ijfeL.x; float jL = ijfeL.y; float fL = ijfeL.z; float eL = ijfeL.w;
+    float kL = klhgL.x; float lL = klhgL.y; float hL = klhgL.z; float gL = klhgL.w;
+    float nL = nozzL.x; float oL = nozzL.y;
+
+    float2 dir = float2(0.0, 0.0);
+    float len = 0.0;
+    easu_set(dir, len, f, true,  false, false, false, bL, eL, fL, gL, jL);
+    easu_set(dir, len, f, false, true,  false, false, cL, fL, gL, hL, kL);
+    easu_set(dir, len, f, false, false, true,  false, fL, iL, jL, kL, nL);
+    easu_set(dir, len, f, false, false, false, true,  gL, jL, kL, lL, oL);
+
+    float dirR = dot(dir, dir);
+    bool zro = dirR < (1.0 / 32768.0);
+    dirR = rsqrt(max(dirR, 1e-8));
+    dir = zro ? float2(1.0, 0.0) : (dir * dirR);
+
+    len = len * 0.5;
+    len *= len;
+    float stretch = dot(dir, dir) * rcp(max(abs(dir.x), abs(dir.y)));
+    float2 len2 = float2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = rcp(lob);
+
+    float3 cb = float3(bcR.w, bcG.w, bcB.w);
+    float3 cc = float3(bcR.z, bcG.z, bcB.z);
+    float3 ce = float3(ijfeR.w, ijfeG.w, ijfeB.w);
+    float3 cf = float3(ijfeR.z, ijfeG.z, ijfeB.z);
+    float3 cg = float3(klhgR.w, klhgG.w, klhgB.w);
+    float3 ch = float3(klhgR.z, klhgG.z, klhgB.z);
+    float3 ci = float3(ijfeR.x, ijfeG.x, ijfeB.x);
+    float3 cj = float3(ijfeR.y, ijfeG.y, ijfeB.y);
+    float3 ck = float3(klhgR.x, klhgG.x, klhgB.x);
+    float3 cl = float3(klhgR.y, klhgG.y, klhgB.y);
+    float3 cn = float3(noR.x, noG.x, noB.x);
+    float3 co = float3(noR.y, noG.y, noB.y);
+
+    float3 aC = float3(0.0, 0.0, 0.0);
+    float aW = 0.0;
+    easu_tap(aC, aW, float2( 0.0, -1.0) - f, dir, len2, lob, clp, cb);
+    easu_tap(aC, aW, float2( 1.0, -1.0) - f, dir, len2, lob, clp, cc);
+    easu_tap(aC, aW, float2(-1.0,  0.0) - f, dir, len2, lob, clp, ce);
+    easu_tap(aC, aW, float2( 0.0,  0.0) - f, dir, len2, lob, clp, cf);
+    easu_tap(aC, aW, float2( 1.0,  0.0) - f, dir, len2, lob, clp, cg);
+    easu_tap(aC, aW, float2( 2.0,  0.0) - f, dir, len2, lob, clp, ch);
+    easu_tap(aC, aW, float2(-1.0,  1.0) - f, dir, len2, lob, clp, ci);
+    easu_tap(aC, aW, float2( 0.0,  1.0) - f, dir, len2, lob, clp, cj);
+    easu_tap(aC, aW, float2( 1.0,  1.0) - f, dir, len2, lob, clp, ck);
+    easu_tap(aC, aW, float2( 2.0,  1.0) - f, dir, len2, lob, clp, cl);
+    easu_tap(aC, aW, float2( 0.0,  2.0) - f, dir, len2, lob, clp, cn);
+    easu_tap(aC, aW, float2( 1.0,  2.0) - f, dir, len2, lob, clp, co);
+
+    float3 min4 = min(min(cf, cg), min(cj, ck));
+    float3 max4 = max(max(cf, cg), max(cj, ck));
+    return float4(saturate(clamp(aC / max(aW, 1e-5), min4, max4)), 1.0);
+}
+"#;
+
+const FSR_RCAS_PS_HLSL: &str = r#"
+Texture2D texEasu : register(t0);
+cbuffer FsrParams : register(b0) {
+    float4 src_size;
+    float4 rcas_bounds; // xy = min pixel (inclusive), zw = max pixel (inclusive)
+    float4 rcas_params; // x = sharpness (0..1)
+};
+
+struct PSIn {
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+float4 PSMain(PSIn i) : SV_TARGET {
+    int2 p = int2(i.pos.xy);
+    int2 lo = int2(rcas_bounds.xy);
+    int2 hi = int2(rcas_bounds.zw);
+    if (any(p < lo) || any(p > hi)) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    float3 b = texEasu.Load(int3(clamp(p + int2( 0, -1), lo, hi), 0)).rgb;
+    float3 d = texEasu.Load(int3(clamp(p + int2(-1,  0), lo, hi), 0)).rgb;
+    float3 e = texEasu.Load(int3(p, 0)).rgb;
+    float3 f = texEasu.Load(int3(clamp(p + int2( 1,  0), lo, hi), 0)).rgb;
+    float3 h = texEasu.Load(int3(clamp(p + int2( 0,  1), lo, hi), 0)).rgb;
+
+    float bL = 0.5 * b.g + 0.25 * (b.r + b.b);
+    float dL = 0.5 * d.g + 0.25 * (d.r + d.b);
+    float eL = 0.5 * e.g + 0.25 * (e.r + e.b);
+    float fL = 0.5 * f.g + 0.25 * (f.r + f.b);
+    float hL = 0.5 * h.g + 0.25 * (h.r + h.b);
+
+    float nz = 0.25 * (bL + dL + fL + hL) - eL;
+    float mxL = max(max(max(bL, dL), max(fL, hL)), eL);
+    float mnL = min(min(min(bL, dL), min(fL, hL)), eL);
+    nz = saturate(abs(nz) * rcp(max(mxL - mnL, 1e-5)));
+    nz = -0.5 * nz + 1.0;
+
+    float3 mn4 = min(min(b, d), min(f, h));
+    float3 mx4 = max(max(b, d), max(f, h));
+    float3 hitMin = -min(mn4, e) * rcp(max(4.0 * mx4, 1e-5));
+    float3 hitMax = (1.0 - max(mx4, e)) * rcp(min(4.0 * mn4 - 4.0, -1e-5));
+    float3 lobeRGB = max(hitMin, hitMax);
+    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0))
+        * saturate(rcas_params.x)
+        * nz;
+
+    float3 col = (lobe * (b + d + f + h) + e) * rcp(4.0 * lobe + 1.0);
+    return float4(saturate(col), 1.0);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FsrParams {
+    src_size: [f32; 4],
+    rcas_bounds: [f32; 4],
+    rcas_params: [f32; 4],
+}
+
+impl Default for FsrParams {
+    fn default() -> Self {
+        Self {
+            src_size: [1.0, 1.0, 1.0, 1.0],
+            rcas_bounds: [0.0, 0.0, 0.0, 0.0],
+            rcas_params: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+struct RenderTargetTex {
+    width: u32,
+    height: u32,
+    _tex: ID3D11Texture2D,
+    rtv: ID3D11RenderTargetView,
+    srv: ID3D11ShaderResourceView,
+}
+
 struct SwYuvTextures {
     width: u32,
     height: u32,
@@ -346,21 +587,11 @@ impl D3d11SrvCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ScaleMode {
-    #[default]
-    Fit,
-    Zoom,
-    Stretch,
-}
-
-impl ScaleMode {
-    fn key(self) -> u8 {
-        match self {
-            Self::Fit => 0,
-            Self::Zoom => 1,
-            Self::Stretch => 2,
-        }
+fn scale_mode_key(mode: ScaleMode) -> u8 {
+    match mode {
+        ScaleMode::Fit => 0,
+        ScaleMode::Zoom => 1,
+        ScaleMode::Stretch => 2,
     }
 }
 
@@ -393,11 +624,16 @@ pub struct D3D11Renderer {
     ps_nv12: ID3D11PixelShader,
     ps_p010: ID3D11PixelShader,
     ps_yuv420: ID3D11PixelShader,
+    ps_fsr_easu: ID3D11PixelShader,
+    ps_fsr_rcas: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     cb_params: ID3D11Buffer,
+    cb_fsr: ID3D11Buffer,
     d3d11_srv_cache: D3d11SrvCache,
     last_video_params_key: Option<VideoParamsKey>,
     sw_textures: Option<SwYuvTextures>,
+    fsr_src_rt: Option<RenderTargetTex>,
+    fsr_easu_rt: Option<RenderTargetTex>,
 }
 
 impl D3D11Renderer {
@@ -502,6 +738,8 @@ impl D3D11Renderer {
         let ps_nv12_blob = compile_hlsl(&nv12_src, s!("PSMain"), s!("ps_5_0"))?;
         let ps_p010_blob = compile_hlsl(&p010_src, s!("PSMain"), s!("ps_5_0"))?;
         let ps_yuv_blob = compile_hlsl(&yuv_src, s!("PSMain"), s!("ps_5_0"))?;
+        let ps_fsr_easu_blob = compile_hlsl(FSR_EASU_PS_HLSL, s!("PSMain"), s!("ps_5_0"))?;
+        let ps_fsr_rcas_blob = compile_hlsl(FSR_RCAS_PS_HLSL, s!("PSMain"), s!("ps_5_0"))?;
 
         let vs = unsafe {
             let mut out = None;
@@ -522,6 +760,16 @@ impl D3D11Renderer {
             let mut out = None;
             device.CreatePixelShader(blob_slice(&ps_yuv_blob), None, Some(&mut out))?;
             out.context("CreatePixelShader(YUV420) returned None")?
+        };
+        let ps_fsr_easu = unsafe {
+            let mut out = None;
+            device.CreatePixelShader(blob_slice(&ps_fsr_easu_blob), None, Some(&mut out))?;
+            out.context("CreatePixelShader(FSR EASU) returned None")?
+        };
+        let ps_fsr_rcas = unsafe {
+            let mut out = None;
+            device.CreatePixelShader(blob_slice(&ps_fsr_rcas_blob), None, Some(&mut out))?;
+            out.context("CreatePixelShader(FSR RCAS) returned None")?
         };
 
         let sampler_desc = D3D11_SAMPLER_DESC {
@@ -556,6 +804,23 @@ impl D3D11Renderer {
             out.context("CreateBuffer returned None")?
         };
 
+        let init_fsr = FsrParams::default();
+        let cb_fsr_desc = D3D11_BUFFER_DESC {
+            ByteWidth: std::mem::size_of::<FsrParams>() as u32,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            ..Default::default()
+        };
+        let cb_fsr_sub = D3D11_SUBRESOURCE_DATA {
+            pSysMem: (&init_fsr as *const FsrParams).cast(),
+            ..Default::default()
+        };
+        let cb_fsr = unsafe {
+            let mut out = None;
+            device.CreateBuffer(&cb_fsr_desc, Some(&cb_fsr_sub), Some(&mut out))?;
+            out.context("CreateBuffer(FSR CB) returned None")?
+        };
+
         Ok(Self {
             device,
             context,
@@ -572,11 +837,16 @@ impl D3D11Renderer {
             ps_nv12,
             ps_p010,
             ps_yuv420,
+            ps_fsr_easu,
+            ps_fsr_rcas,
             sampler,
             cb_params,
+            cb_fsr,
             d3d11_srv_cache: D3d11SrvCache::default(),
             last_video_params_key: None,
             sw_textures: None,
+            fsr_src_rt: None,
+            fsr_easu_rt: None,
         })
     }
 
@@ -616,6 +886,7 @@ impl D3D11Renderer {
         self.width = w;
         self.height = h;
         self.last_video_params_key = None;
+        self.fsr_easu_rt = None;
         Ok(())
     }
 
@@ -726,6 +997,8 @@ impl D3D11Renderer {
     pub fn clear_video_cache(&mut self) {
         self.d3d11_srv_cache.clear();
         self.last_video_params_key = None;
+        self.fsr_src_rt = None;
+        self.fsr_easu_rt = None;
     }
 
     pub fn begin_frame(&self, clear_rgba: [f32; 4]) {
@@ -758,20 +1031,60 @@ impl D3D11Renderer {
     pub fn draw_video_frame(
         &mut self,
         frame: &DecodedFrame,
-        sharpness: f32,
-        scale_mode: ScaleMode,
+        options: VideoRenderOptions,
     ) -> Result<()> {
-        self.bind_backbuffer();
+        let (fw, fh, tw, th, d3d_format, color_mode) = self.inspect_frame(frame);
+        let sharp = match options.filter_mode {
+            VideoFilterMode::Bilinear => 0.0,
+            VideoFilterMode::Cas | VideoFilterMode::Fsr1 => options.sharpness.clamp(0.0, 1.0),
+        };
 
-        let sharp = sharpness.clamp(0.0, 1.0);
-        let (fw, fh, tw, th, d3d_format, color_mode): (
-            u32,
-            u32,
-            u32,
-            u32,
-            Option<DXGI_FORMAT>,
-            f32,
-        ) = match frame {
+        if options.filter_mode == VideoFilterMode::Fsr1 {
+            let upscale = should_run_fsr_easu(fw, fh, self.width, self.height, options.scale_mode);
+            if upscale || sharp > 0.001 {
+                match self.draw_fsr1_frame(
+                    frame,
+                    fw,
+                    fh,
+                    tw,
+                    th,
+                    d3d_format,
+                    color_mode,
+                    sharp,
+                    options.scale_mode,
+                    upscale,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        tracing::warn!(
+                            "FSR 1.0 pass failed, falling back to single-pass draw: {err:#}"
+                        );
+                        self.fsr_src_rt = None;
+                        self.fsr_easu_rt = None;
+                    }
+                }
+            }
+        }
+
+        self.draw_source_to_target(
+            frame,
+            fw,
+            fh,
+            tw,
+            th,
+            d3d_format,
+            color_mode,
+            sharp,
+            options.scale_mode,
+            None,
+        )
+    }
+
+    fn inspect_frame(
+        &self,
+        frame: &DecodedFrame,
+    ) -> (u32, u32, u32, u32, Option<DXGI_FORMAT>, f32) {
+        match frame {
             DecodedFrame::D3D11(f) => {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 unsafe {
@@ -801,30 +1114,50 @@ impl D3D11Renderer {
                 };
                 (*width, *height, *width, *height, None, mode)
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_source_to_target(
+        &mut self,
+        frame: &DecodedFrame,
+        fw: u32,
+        fh: u32,
+        tw: u32,
+        th: u32,
+        d3d_format: Option<DXGI_FORMAT>,
+        color_mode: f32,
+        sharpness: f32,
+        scale_mode: ScaleMode,
+        target: Option<(&ID3D11RenderTargetView, u32, u32)>,
+    ) -> Result<()> {
+        let (target_w, target_h) = match target {
+            Some((rtv, w, h)) => {
+                bind_rt_target(&self.context, rtv, w, h);
+                (w, h)
+            }
+            None => {
+                self.bind_backbuffer();
+                (self.width, self.height)
+            }
         };
+
+        let sharp = sharpness.clamp(0.0, 1.0);
         let sharp_q = (sharp * 1000.0).round() as u32;
         let key = VideoParamsKey {
             fw,
             fh,
             tw,
             th,
-            vw: self.width,
-            vh: self.height,
+            vw: target_w,
+            vh: target_h,
             sharp_q,
             mode_bits: color_mode.to_bits(),
-            scale_mode: scale_mode.key(),
+            scale_mode: scale_mode_key(scale_mode),
         };
         if self.last_video_params_key != Some(key) {
             let params = compute_video_params(
-                fw,
-                fh,
-                tw,
-                th,
-                self.width,
-                self.height,
-                sharp,
-                color_mode,
-                scale_mode,
+                fw, fh, tw, th, target_w, target_h, sharp, color_mode, scale_mode,
             );
             unsafe {
                 self.context.UpdateSubresource(
@@ -872,6 +1205,143 @@ impl D3D11Renderer {
             self.context
                 .PSSetShaderResources(0, Some(&[None, None, None]));
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_fsr1_frame(
+        &mut self,
+        frame: &DecodedFrame,
+        fw: u32,
+        fh: u32,
+        tw: u32,
+        th: u32,
+        d3d_format: Option<DXGI_FORMAT>,
+        color_mode: f32,
+        sharp: f32,
+        scale_mode: ScaleMode,
+        upscale: bool,
+    ) -> Result<()> {
+        let vw = self.width;
+        let vh = self.height;
+        let pos_scale = aspect_scale(fw, fh, vw, vh, scale_mode);
+        let rcas_bounds = compute_rcas_bounds(pos_scale, vw, vh);
+        let fsr_params = FsrParams {
+            src_size: [
+                fw.max(1) as f32,
+                fh.max(1) as f32,
+                1.0 / (fw.max(1) as f32),
+                1.0 / (fh.max(1) as f32),
+            ],
+            rcas_bounds,
+            rcas_params: [sharp, 0.0, 0.0, 0.0],
+        };
+
+        if !upscale {
+            let (easu_rtv, easu_srv) =
+                ensure_render_target(&self.device, &mut self.fsr_easu_rt, vw, vh)?;
+            unsafe {
+                self.context
+                    .ClearRenderTargetView(&easu_rtv, &[0.0, 0.0, 0.0, 1.0]);
+            }
+            self.draw_source_to_target(
+                frame,
+                fw,
+                fh,
+                tw,
+                th,
+                d3d_format,
+                color_mode,
+                0.0,
+                scale_mode,
+                Some((&easu_rtv, vw, vh)),
+            )?;
+            unsafe {
+                self.context.OMSetRenderTargets(None, None);
+            }
+            self.bind_backbuffer();
+            draw_fsr_quad_pass(
+                &self.context,
+                &self.vs,
+                &self.ps_fsr_rcas,
+                &self.cb_params,
+                &self.cb_fsr,
+                &self.sampler,
+                &easu_srv,
+                [1.0, 1.0, 0.0, 0.0],
+                &fsr_params,
+            );
+            self.last_video_params_key = None;
+            return Ok(());
+        }
+
+        let (src_rtv, src_srv) = ensure_render_target(&self.device, &mut self.fsr_src_rt, fw, fh)?;
+        self.draw_source_to_target(
+            frame,
+            fw,
+            fh,
+            tw,
+            th,
+            d3d_format,
+            color_mode,
+            0.0,
+            ScaleMode::Stretch,
+            Some((&src_rtv, fw, fh)),
+        )?;
+        unsafe {
+            self.context.OMSetRenderTargets(None, None);
+        }
+
+        if sharp > 0.001 {
+            let (easu_rtv, easu_srv) =
+                ensure_render_target(&self.device, &mut self.fsr_easu_rt, vw, vh)?;
+            unsafe {
+                self.context
+                    .ClearRenderTargetView(&easu_rtv, &[0.0, 0.0, 0.0, 1.0]);
+            }
+            bind_rt_target(&self.context, &easu_rtv, vw, vh);
+            draw_fsr_quad_pass(
+                &self.context,
+                &self.vs,
+                &self.ps_fsr_easu,
+                &self.cb_params,
+                &self.cb_fsr,
+                &self.sampler,
+                &src_srv,
+                pos_scale,
+                &fsr_params,
+            );
+            unsafe {
+                self.context.OMSetRenderTargets(None, None);
+            }
+            self.bind_backbuffer();
+            draw_fsr_quad_pass(
+                &self.context,
+                &self.vs,
+                &self.ps_fsr_rcas,
+                &self.cb_params,
+                &self.cb_fsr,
+                &self.sampler,
+                &easu_srv,
+                [1.0, 1.0, 0.0, 0.0],
+                &fsr_params,
+            );
+        } else {
+            self.bind_backbuffer();
+            draw_fsr_quad_pass(
+                &self.context,
+                &self.vs,
+                &self.ps_fsr_easu,
+                &self.cb_params,
+                &self.cb_fsr,
+                &self.sampler,
+                &src_srv,
+                pos_scale,
+                &fsr_params,
+            );
+        }
+
+        self.last_video_params_key = None;
         Ok(())
     }
 
@@ -1019,9 +1489,57 @@ impl D3D11Renderer {
     }
 }
 
+impl VideoRenderer for D3D11Renderer {
+    fn viewport_size(&self) -> (u32, u32) {
+        self.viewport_size()
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.resize(width, height)
+    }
+
+    fn is_display_hdr(&self) -> bool {
+        self.is_display_hdr()
+    }
+
+    fn is_hdr_output_active(&self) -> bool {
+        self.is_hdr_output_active()
+    }
+
+    fn set_hdr_output(&mut self, enable: bool) -> Result<bool> {
+        self.set_hdr_output(enable)
+    }
+
+    fn wait_for_frame_latency(&self, timeout_ms: u32) {
+        self.wait_for_frame_latency(timeout_ms);
+    }
+
+    fn clear_video_cache(&mut self) {
+        self.clear_video_cache();
+    }
+
+    fn begin_frame(&self, clear_rgba: [f32; 4]) {
+        self.begin_frame(clear_rgba);
+    }
+
+    fn draw_video_frame(
+        &mut self,
+        frame: &DecodedFrame,
+        options: VideoRenderOptions,
+    ) -> Result<()> {
+        self.draw_video_frame(frame, options)
+    }
+
+    fn present(&self, vsync: bool) -> Result<()> {
+        self.present(vsync)
+    }
+}
+
 impl Drop for D3D11Renderer {
     fn drop(&mut self) {
         self.d3d11_srv_cache.clear();
+        self.fsr_src_rt = None;
+        self.fsr_easu_rt = None;
         if let Some(handle) = self.frame_latency_waitable.take()
             && !handle.is_invalid()
         {
@@ -1031,6 +1549,183 @@ impl Drop for D3D11Renderer {
             }
         }
     }
+}
+
+fn bind_rt_target(
+    context: &ID3D11DeviceContext,
+    rtv: &ID3D11RenderTargetView,
+    width: u32,
+    height: u32,
+) {
+    let vp = D3D11_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: width.max(1) as f32,
+        Height: height.max(1) as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    unsafe {
+        context.RSSetViewports(Some(&[vp]));
+        context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_fsr_quad_pass(
+    context: &ID3D11DeviceContext,
+    vs: &ID3D11VertexShader,
+    ps: &ID3D11PixelShader,
+    cb_params: &ID3D11Buffer,
+    cb_fsr: &ID3D11Buffer,
+    sampler: &ID3D11SamplerState,
+    src_srv: &ID3D11ShaderResourceView,
+    pos_scale: [f32; 4],
+    fsr_params: &FsrParams,
+) {
+    let vs_params = VideoParams {
+        pos_scale,
+        ..VideoParams::default()
+    };
+    unsafe {
+        context.UpdateSubresource(
+            cb_params,
+            0,
+            None,
+            (&vs_params as *const VideoParams).cast(),
+            0,
+            0,
+        );
+        context.UpdateSubresource(
+            cb_fsr,
+            0,
+            None,
+            (fsr_params as *const FsrParams).cast(),
+            0,
+            0,
+        );
+        context.IASetInputLayout(None);
+        context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        context.VSSetShader(vs, None);
+        context.VSSetConstantBuffers(0, Some(&[Some(cb_params.clone())]));
+        context.PSSetShader(ps, None);
+        context.PSSetConstantBuffers(0, Some(&[Some(cb_fsr.clone())]));
+        context.PSSetSamplers(0, Some(&[Some(sampler.clone())]));
+        context.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+        context.Draw(4, 0);
+        context.PSSetShaderResources(0, Some(&[None, None, None]));
+    }
+}
+
+fn ensure_render_target(
+    device: &ID3D11Device,
+    slot: &mut Option<RenderTargetTex>,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11RenderTargetView, ID3D11ShaderResourceView)> {
+    let w = width.max(1);
+    let h = height.max(1);
+    if slot
+        .as_ref()
+        .is_none_or(|rt| rt.width != w || rt.height != h)
+    {
+        *slot = Some(create_fsr_render_target(device, w, h)?);
+    }
+    let rt = slot.as_ref().expect("render target initialized");
+    Ok((rt.rtv.clone(), rt.srv.clone()))
+}
+
+fn create_fsr_render_target(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<RenderTargetTex> {
+    let format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width.max(1),
+        Height: height.max(1),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let tex = unsafe {
+        let mut out = None;
+        device.CreateTexture2D(&desc, None, Some(&mut out))?;
+        out.context("CreateTexture2D(FSR RT) returned None")?
+    };
+    let rtv = unsafe {
+        let mut out = None;
+        device.CreateRenderTargetView(&tex, None, Some(&mut out))?;
+        out.context("CreateRenderTargetView(FSR RT) returned None")?
+    };
+    let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
+        },
+    };
+    let srv = unsafe {
+        let mut out = None;
+        device.CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut out))?;
+        out.context("CreateShaderResourceView(FSR RT) returned None")?
+    };
+    Ok(RenderTargetTex {
+        width: width.max(1),
+        height: height.max(1),
+        _tex: tex,
+        rtv,
+        srv,
+    })
+}
+
+pub(crate) fn should_run_fsr_easu(
+    frame_w: u32,
+    frame_h: u32,
+    view_w: u32,
+    view_h: u32,
+    scale_mode: ScaleMode,
+) -> bool {
+    if frame_w == 0 || frame_h == 0 || view_w == 0 || view_h == 0 {
+        return false;
+    }
+    let pos_scale = aspect_scale(frame_w, frame_h, view_w, view_h, scale_mode);
+    let scaled_w = ((view_w as f32) * pos_scale[0]).round() as u32;
+    let scaled_h = ((view_h as f32) * pos_scale[1]).round() as u32;
+    scaled_w > frame_w || scaled_h > frame_h
+}
+
+pub(crate) fn compute_rcas_bounds(pos_scale: [f32; 4], view_w: u32, view_h: u32) -> [f32; 4] {
+    let vw = view_w.max(1) as f32;
+    let vh = view_h.max(1) as f32;
+    let left_ndc = (-pos_scale[0] + pos_scale[2]).clamp(-1.0, 1.0);
+    let right_ndc = (pos_scale[0] + pos_scale[2]).clamp(-1.0, 1.0);
+    let top_ndc = (pos_scale[1] + pos_scale[3]).clamp(-1.0, 1.0);
+    let bottom_ndc = (-pos_scale[1] + pos_scale[3]).clamp(-1.0, 1.0);
+
+    let left_edge = ((left_ndc + 1.0) * 0.5) * vw;
+    let right_edge = ((right_ndc + 1.0) * 0.5) * vw;
+    let top_edge = ((1.0 - top_ndc) * 0.5) * vh;
+    let bottom_edge = ((1.0 - bottom_ndc) * 0.5) * vh;
+
+    let max_valid_x = vw - 1.0;
+    let max_valid_y = vh - 1.0;
+    let min_x = (left_edge - 0.5).ceil().clamp(0.0, max_valid_x);
+    let max_x = (right_edge - 0.5).floor().clamp(min_x, max_valid_x);
+    let min_y = (top_edge - 0.5).ceil().clamp(0.0, max_valid_y);
+    let max_y = (bottom_edge - 0.5).floor().clamp(min_y, max_valid_y);
+    [min_x, min_y, max_x, max_y]
 }
 
 fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -1303,11 +1998,34 @@ mod tests {
             compile_hlsl(&p010_src, s!("PSMain"), s!("ps_5_0")).expect("P010 PS compiles");
         let ps_yuv =
             compile_hlsl(&yuv_src, s!("PSMain"), s!("ps_5_0")).expect("YUV420 PS compiles");
+        let ps_easu = compile_hlsl(FSR_EASU_PS_HLSL, s!("PSMain"), s!("ps_5_0"))
+            .expect("FSR 1.0 EASU PS compiles");
+        let ps_rcas = compile_hlsl(FSR_RCAS_PS_HLSL, s!("PSMain"), s!("ps_5_0"))
+            .expect("FSR 1.0 RCAS PS compiles");
 
         assert!(!blob_slice(&vs).is_empty());
         assert!(!blob_slice(&ps_nv12).is_empty());
         assert!(!blob_slice(&ps_p010).is_empty());
         assert!(!blob_slice(&ps_yuv).is_empty());
+        assert!(!blob_slice(&ps_easu).is_empty());
+        assert!(!blob_slice(&ps_rcas).is_empty());
+    }
+
+    #[test]
+    fn fsr_easu_bypass_and_rcas_bounds_math() {
+        assert!(should_run_fsr_easu(1920, 1080, 2880, 1800, ScaleMode::Fit));
+        assert!(!should_run_fsr_easu(1920, 1080, 1920, 1080, ScaleMode::Fit));
+        assert!(!should_run_fsr_easu(1920, 1080, 1280, 720, ScaleMode::Fit));
+        assert!(should_run_fsr_easu(1280, 720, 1920, 1080, ScaleMode::Fit));
+
+        let fit_bounds = compute_rcas_bounds([1.0, 0.9, 0.0, 0.0], 2880, 1800);
+        assert_eq!(fit_bounds, [0.0, 90.0, 2879.0, 1709.0]);
+
+        let zoom_bounds = compute_rcas_bounds([10.0 / 9.0, 1.0, 0.0, 0.0], 2880, 1800);
+        assert_eq!(zoom_bounds, [0.0, 0.0, 2879.0, 1799.0]);
+
+        let stretch_bounds = compute_rcas_bounds([1.0, 1.0, 0.0, 0.0], 1920, 1080);
+        assert_eq!(stretch_bounds, [0.0, 0.0, 1919.0, 1079.0]);
     }
 
     #[test]

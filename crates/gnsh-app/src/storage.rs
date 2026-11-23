@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use gnsh_input::KbmBindings;
-use gnsh_media::ScaleMode;
+use gnsh_media::{ScaleMode, VideoFilterMode};
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -360,10 +360,12 @@ mod tests {
             bitrate_kbps: 500_000,
             vsync: false,
             touchpad_touch: true,
+            filter_mode: VideoFilterMode::Fsr1,
             sharpness_pct: 250,
             scale_mode: ScaleMode::Zoom,
             volume_pct: 220,
             audio_device: Some("  Speakers (Realtek Audio) ".into()),
+            mic_device: Some("  USB Microphone ".into()),
             kbm_enabled: true,
             kbm_sensitivity_pct: 200,
             kbm_deadzone_pct: 90,
@@ -378,6 +380,7 @@ mod tests {
         assert_eq!(loaded.bitrate_kbps, 100_000);
         assert!(!loaded.vsync);
         assert!(loaded.touchpad_touch);
+        assert_eq!(loaded.filter_mode, VideoFilterMode::Fsr1);
         assert_eq!(loaded.sharpness_pct, 100);
         assert_eq!(loaded.scale_mode, ScaleMode::Zoom);
         assert_eq!(loaded.volume_pct, 100);
@@ -385,6 +388,7 @@ mod tests {
             loaded.audio_device.as_deref(),
             Some("Speakers (Realtek Audio)")
         );
+        assert_eq!(loaded.mic_device.as_deref(), Some("USB Microphone"));
         assert!(loaded.kbm_enabled);
         assert_eq!(loaded.kbm_sensitivity_pct, 100);
         assert_eq!(loaded.kbm_deadzone_pct, 40);
@@ -394,14 +398,16 @@ mod tests {
 
         std::fs::write(
             &path,
-            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   ", "kbm_sensitivity_pct": 0, "kbm_deadzone_pct": 80, "kbm_curve_pct": 10}"#,
+            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   ", "mic_device": "\t ", "kbm_sensitivity_pct": 0, "kbm_deadzone_pct": 80, "kbm_curve_pct": 10}"#,
         )
         .expect("write unclamped json");
         let clamped = store.load().expect("load clamped");
         assert_eq!(clamped.bitrate_kbps, 100_000);
+        assert_eq!(clamped.filter_mode, VideoFilterMode::Cas);
         assert_eq!(clamped.sharpness_pct, 100);
         assert_eq!(clamped.volume_pct, 100);
         assert_eq!(clamped.audio_device, None);
+        assert_eq!(clamped.mic_device, None);
         assert_eq!(clamped.preset, VideoPreset::P1080Fps60);
         assert_eq!(clamped.codec, VideoCodec::Hevc);
         assert_eq!(clamped.scale_mode, ScaleMode::Fit);
@@ -413,6 +419,7 @@ mod tests {
 
         std::fs::write(&path, r#"{"kbm_enabled": true}"#).expect("write missing curve json");
         let defaulted = store.load().expect("load missing curve");
+        assert_eq!(defaulted.filter_mode, VideoFilterMode::Bilinear);
         assert_eq!(defaulted.kbm_curve_pct, 100);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -428,10 +435,12 @@ pub struct StoredSettings {
     pub bitrate_kbps: u32,
     pub vsync: bool,
     pub touchpad_touch: bool,
+    pub filter_mode: VideoFilterMode,
     pub sharpness_pct: u8,
     pub scale_mode: ScaleMode,
     pub volume_pct: u8,
     pub audio_device: Option<String>,
+    pub mic_device: Option<String>,
     pub kbm_enabled: bool,
     pub kbm_sensitivity_pct: u8,
     pub kbm_deadzone_pct: u8,
@@ -448,10 +457,12 @@ impl Default for StoredSettings {
             bitrate_kbps: 30_000,
             vsync: true,
             touchpad_touch: false,
+            filter_mode: VideoFilterMode::Bilinear,
             sharpness_pct: 0,
             scale_mode: ScaleMode::Fit,
             volume_pct: 100,
             audio_device: None,
+            mic_device: None,
             kbm_enabled: false,
             kbm_sensitivity_pct: 50,
             kbm_deadzone_pct: 14,
@@ -460,6 +471,13 @@ impl Default for StoredSettings {
             kbm_bindings: KbmBindings::default(),
         }
     }
+}
+
+fn normalize_device_opt(opt: &mut Option<String>) {
+    *opt = opt
+        .take()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 }
 
 fn normalize_settings(settings: &mut StoredSettings) {
@@ -472,11 +490,8 @@ fn normalize_settings(settings: &mut StoredSettings) {
         settings.kbm_curve_pct = 100;
     }
     settings.kbm_curve_pct = settings.kbm_curve_pct.clamp(50, 150);
-    settings.audio_device = settings
-        .audio_device
-        .take()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    normalize_device_opt(&mut settings.audio_device);
+    normalize_device_opt(&mut settings.mic_device);
 }
 
 pub struct SettingsStore {
@@ -502,8 +517,16 @@ impl SettingsStore {
             return Ok(StoredSettings::default());
         }
         let raw = read_config_file(&self.path)?;
-        let mut parsed: StoredSettings =
+        let raw_val: serde_json::Value =
             serde_json::from_str(&raw).context("failed parsing settings.json")?;
+        let has_filter_mode = raw_val
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("filter_mode"));
+        let mut parsed: StoredSettings =
+            serde_json::from_value(raw_val).context("failed decoding settings.json")?;
+        if !has_filter_mode && parsed.sharpness_pct > 0 {
+            parsed.filter_mode = VideoFilterMode::Cas;
+        }
         normalize_settings(&mut parsed);
         Ok(parsed)
     }

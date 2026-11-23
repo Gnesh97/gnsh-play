@@ -136,6 +136,7 @@ pub(crate) struct ActiveStream {
     pub(crate) audio_device: Arc<Mutex<Option<String>>>,
     pub(crate) audio_device_recheck: Arc<AtomicBool>,
     pub(crate) mic_capture: Option<MicCapture>,
+    pub(crate) mic_device: Option<String>,
     pub(crate) mic_muted: bool,
     pub(crate) mic_toggle_requested: bool,
     pub(crate) mic_error: Option<String>,
@@ -282,6 +283,7 @@ impl ActiveStream {
             audio_device,
             audio_device_recheck,
             mic_capture: None,
+            mic_device: settings.mic_device.clone(),
             mic_muted: true,
             mic_toggle_requested: false,
             mic_error: None,
@@ -367,7 +369,7 @@ impl ActiveStream {
         };
         let target_muted = !self.mic_muted;
         if !target_muted && self.mic_capture.is_none() {
-            match MicCapture::new_default() {
+            match MicCapture::new_for_device(self.mic_device.as_deref()) {
                 Ok(cap) => self.mic_capture = Some(cap),
                 Err(err) => {
                     let msg = format!("{err:#}");
@@ -398,6 +400,26 @@ impl ActiveStream {
         self.mic_error = None;
         gamepads.set_mic_led(target_muted);
         tracing::info!(muted = target_muted, "Stream microphone state changed");
+    }
+
+    pub(crate) fn set_mic_device(&mut self, device_name: Option<String>) {
+        self.mic_device = device_name;
+        if let Some(cap) = self.mic_capture.as_mut() {
+            match cap.switch_device(self.mic_device.as_deref()) {
+                Ok(()) => {
+                    self.mic_error = None;
+                    tracing::info!(
+                        device = self.mic_device.as_deref().unwrap_or("System Default"),
+                        "Switched microphone capture device"
+                    );
+                }
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    tracing::warn!("Microphone capture device switch failed: {msg}");
+                    self.mic_error = Some(msg);
+                }
+            }
+        }
     }
 
     pub(crate) fn shutdown(&mut self) {
