@@ -1,17 +1,20 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use gnsh_input::KbmBindings;
 use gnsh_media::ScaleMode;
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SavedConsole {
     pub id: String,
     pub name: String,
@@ -21,6 +24,21 @@ pub struct SavedConsole {
     pub psn_account_id: String,
     pub regist_key: [u8; 16],
     pub rp_key: [u8; 16],
+}
+
+impl fmt::Debug for SavedConsole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SavedConsole")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("remote_host", &self.remote_host)
+            .field("mac", &self.mac)
+            .field("psn_account_id", &self.psn_account_id)
+            .field("regist_key", &"<redacted>")
+            .field("rp_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SavedConsole {
@@ -45,6 +63,19 @@ struct StoredConsoleDisk {
     psn_account_id_dpapi: String,
     regist_key_dpapi: String,
     rp_key_dpapi: String,
+}
+
+fn read_config_file(path: &Path) -> Result<String> {
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("failed inspecting {}", path.display()))?;
+    if meta.len() > MAX_CONFIG_FILE_BYTES {
+        bail!(
+            "refusing oversized config {} ({} bytes exceeds 1 MiB limit)",
+            path.display(),
+            meta.len()
+        );
+    }
+    std::fs::read_to_string(path).with_context(|| format!("failed reading {}", path.display()))
 }
 
 fn normalize_opt_host(host: Option<&str>) -> Option<String> {
@@ -78,8 +109,7 @@ impl ConsoleStore {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let raw = std::fs::read_to_string(&self.path)
-            .with_context(|| format!("failed reading {}", self.path.display()))?;
+        let raw = read_config_file(&self.path)?;
         let entries: Vec<StoredConsoleDisk> =
             serde_json::from_str(&raw).context("failed parsing consoles.json")?;
         let mut out = Vec::with_capacity(entries.len());
@@ -94,8 +124,18 @@ impl ConsoleStore {
             let rp_key: [u8; 16] = rp_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("decrypted rp_key length != 16"))?;
-            let host = gnsh_proto::normalize_console_host(&entry.host);
-            let remote_host = normalize_opt_host(entry.remote_host.as_deref());
+            let host = gnsh_proto::validate_console_host(&entry.host)
+                .context("invalid saved LAN host in consoles.json")?;
+            let remote_host = match normalize_opt_host(entry.remote_host.as_deref()) {
+                Some(r) => match gnsh_proto::validate_console_host(&r) {
+                    Ok(valid) => Some(valid),
+                    Err(err) => {
+                        tracing::warn!(host = %r, "Ignoring unsafe remote_host in consoles.json: {err:#}");
+                        None
+                    }
+                },
+                None => None,
+            };
             out.push(SavedConsole {
                 id: entry.id,
                 name: entry.name,
@@ -117,11 +157,20 @@ impl ConsoleStore {
         }
         let mut disk = Vec::with_capacity(consoles.len());
         for c in consoles {
+            let valid_host = gnsh_proto::validate_console_host(&c.host)
+                .context("cannot save console with invalid LAN host")?;
+            let valid_remote = match normalize_opt_host(c.remote_host.as_deref()) {
+                Some(r) => Some(
+                    gnsh_proto::validate_console_host(&r)
+                        .context("cannot save console with invalid remote host")?,
+                ),
+                None => None,
+            };
             disk.push(StoredConsoleDisk {
                 id: c.id.clone(),
                 name: c.name.clone(),
-                host: gnsh_proto::normalize_console_host(&c.host),
-                remote_host: normalize_opt_host(c.remote_host.as_deref()),
+                host: valid_host,
+                remote_host: valid_remote,
                 mac: c.mac,
                 psn_account_id_dpapi: dpapi_protect_b64(c.psn_account_id.as_bytes())?,
                 regist_key_dpapi: dpapi_protect_b64(&c.regist_key)?,
@@ -206,6 +255,11 @@ mod tests {
             rp_key: [0xAA; 16],
         };
 
+        let dbg_text = format!("{sample:?}");
+        assert!(!dbg_text.contains("49")); // raw byte values from "1a2b..."
+        assert!(!dbg_text.contains("170")); // raw byte value 0xAA from rp_key
+        assert!(dbg_text.contains("<redacted>"));
+
         store.save(std::slice::from_ref(&sample)).expect("save");
         let raw = std::fs::read_to_string(&path).expect("read json");
         assert!(!raw.contains("1a2b3c4d"));
@@ -232,6 +286,11 @@ mod tests {
                 ..expected
             }]
         );
+
+        // Oversized config files > 1 MiB must be rejected before parsing.
+        std::fs::write(&path, vec![b' '; (MAX_CONFIG_FILE_BYTES as usize) + 16])
+            .expect("write oversized file");
+        assert!(store.load().is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -399,8 +458,7 @@ impl SettingsStore {
         if !self.path.exists() {
             return Ok(StoredSettings::default());
         }
-        let raw = std::fs::read_to_string(&self.path)
-            .with_context(|| format!("failed reading {}", self.path.display()))?;
+        let raw = read_config_file(&self.path)?;
         let mut parsed: StoredSettings =
             serde_json::from_str(&raw).context("failed parsing settings.json")?;
         normalize_settings(&mut parsed);

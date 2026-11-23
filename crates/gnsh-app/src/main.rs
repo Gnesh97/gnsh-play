@@ -445,9 +445,24 @@ fn handle_platform_commands(window: &AppWindow, commands: &[egui::OutputCommand]
     }
 }
 
+fn is_safe_https_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.len() <= 2048
+        && trimmed
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        && trimmed.len() > 8
+        && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn open_url(url: &str) {
+    let trimmed = url.trim();
+    if !is_safe_https_url(trimmed) {
+        tracing::warn!(url = trimmed, "Blocked unsafe URL before ShellExecuteW");
+        return;
+    }
     let op = HSTRING::from("open");
-    let target = HSTRING::from(url);
+    let target = HSTRING::from(trimmed);
     let ret = unsafe {
         ShellExecuteW(
             Some(HWND::default()),
@@ -460,7 +475,7 @@ fn open_url(url: &str) {
     };
     if (ret.0 as isize) <= 32 {
         tracing::warn!(
-            url,
+            url = trimmed,
             code = ret.0 as isize,
             "ShellExecuteW failed opening URL"
         );
@@ -659,8 +674,7 @@ impl AppState {
                                     || format_mac_id(s.mac)
                                         .eq_ignore_ascii_case(disc.host_id.trim())
                             })
-                            && !host_matches_remote_probe(saved, &disc.addr)
-                            && saved.host != disc.addr
+                            && should_auto_update_lan_host(saved, &disc.addr)
                         {
                             saved.host = disc.addr.clone();
                             updated_ip = true;
@@ -1160,5 +1174,73 @@ impl AppState {
                 )));
             }
         }
+    }
+}
+
+fn should_auto_update_lan_host(saved: &SavedConsole, disc_addr: &str) -> bool {
+    let Ok(existing_ip) = saved.host.trim().parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(discovered_ip) = disc_addr.trim().parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    existing_ip.is_private()
+        && discovered_ip.is_private()
+        && !host_matches_remote_probe(saved, disc_addr)
+        && saved.host != disc_addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_console() -> SavedConsole {
+        SavedConsole {
+            id: "001122334455".into(),
+            name: "PS5".into(),
+            host: "192.168.1.50".into(),
+            remote_host: Some("85.100.12.34".into()),
+            mac: [0, 0x11, 0x22, 0x33, 0x44, 0x55],
+            psn_account_id: "AQIDBAUGBwg=".into(),
+            regist_key: *b"1a2b3c4d\0\0\0\0\0\0\0\0",
+            rp_key: [0xAA; 16],
+        }
+    }
+
+    #[test]
+    fn lan_auto_update_rejects_public_or_remote_ips_and_allows_private_dhcp() {
+        let saved = sample_console();
+        assert!(!should_auto_update_lan_host(&saved, "85.100.12.34"));
+        assert!(!should_auto_update_lan_host(
+            &SavedConsole {
+                remote_host: None,
+                ..saved.clone()
+            },
+            "85.100.12.34"
+        ));
+        assert!(!should_auto_update_lan_host(&saved, "192.168.1.50"));
+        assert!(should_auto_update_lan_host(&saved, "192.168.1.55"));
+
+        let hostname_saved = SavedConsole {
+            host: "my-ps5.local".into(),
+            ..saved
+        };
+        assert!(!should_auto_update_lan_host(
+            &hostname_saved,
+            "192.168.1.55"
+        ));
+    }
+
+    #[test]
+    fn url_launcher_allows_https_and_rejects_dangerous_schemes() {
+        assert!(is_safe_https_url(
+            "https://auth.api.sonyentertainmentnetwork.com/login"
+        ));
+        assert!(!is_safe_https_url("http://example.com"));
+        assert!(!is_safe_https_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_safe_https_url(r"\\attacker\share\payload.exe"));
+        assert!(!is_safe_https_url("javascript:alert(1)"));
+        assert!(!is_safe_https_url("https://example.com/\nfoo"));
+        assert!(!is_safe_https_url("https://"));
     }
 }

@@ -1,4 +1,4 @@
-use crate::discovery::normalize_console_host;
+use crate::discovery::{sanitize_network_text, validate_console_host};
 use crate::log::ChiakiLogger;
 use crate::psn_auth::decode_account_id_b64;
 use crate::{ProtoError, Result, check_chiaki, init_lib};
@@ -8,10 +8,11 @@ use gnsh_chiaki_sys::{
     chiaki_regist_start, chiaki_regist_stop,
 };
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::os::raw::c_void;
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredConsole {
     pub host_name: String,
     pub host_mac: [u8; 6],
@@ -19,6 +20,19 @@ pub struct RegisteredConsole {
     pub regist_key: [u8; 16],
     pub rp_key: [u8; 16],
     pub psn_account_id: String,
+}
+
+impl fmt::Debug for RegisteredConsole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegisteredConsole")
+            .field("host_name", &self.host_name)
+            .field("host_mac", &self.host_mac)
+            .field("addr", &self.addr)
+            .field("regist_key", &"<redacted>")
+            .field("rp_key", &"<redacted>")
+            .field("psn_account_id", &self.psn_account_id)
+            .finish()
+    }
 }
 
 impl RegisteredConsole {
@@ -49,9 +63,10 @@ unsafe extern "C" fn regist_cb(event: *mut ChiakiRegistEvent, user: *mut c_void)
         && !ev.registered_host.is_null()
     {
         let host = unsafe { &*ev.registered_host };
-        let nickname = unsafe { CStr::from_ptr(host.server_nickname.as_ptr()) }
+        let raw_nickname = unsafe { CStr::from_ptr(host.server_nickname.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let nickname = sanitize_network_text(&raw_nickname, 128);
         let mut regist_key = [0u8; 16];
         for (dst, &src) in regist_key.iter_mut().zip(host.rp_regist_key.iter()) {
             *dst = src as u8;
@@ -74,7 +89,7 @@ unsafe extern "C" fn regist_cb(event: *mut ChiakiRegistEvent, user: *mut c_void)
     }
 }
 
-/// Registers this client with a PS5 on LAN using an 8-digit PIN from PS5 Remote Play settings.
+/// Registers this client with a PS5 using an 8-digit PIN from PS5 Remote Play settings.
 pub fn register_ps5(
     host: &str,
     psn_account_id_b64: &str,
@@ -87,19 +102,16 @@ pub fn register_ps5(
             "PS5 PIN must be at most 8 digits".into(),
         ));
     }
-    let normalized_host = normalize_console_host(host);
-    if normalized_host.is_empty() {
-        return Err(ProtoError::InvalidArg("host cannot be empty".into()));
-    }
+    let validated_host = validate_console_host(host)?;
     let account_bytes = decode_account_id_b64(psn_account_id_b64)?;
-    let c_host = CString::new(normalized_host.as_str())
+    let c_host = CString::new(validated_host.as_str())
         .map_err(|_| ProtoError::InvalidArg("host contains interior NUL".into()))?;
 
     let mut logger = ChiakiLogger::new(false);
     let (tx, rx) = crossbeam_channel::bounded(1);
     let ctx_ptr = Box::into_raw(Box::new(RegistContext {
         tx,
-        addr: normalized_host,
+        addr: validated_host,
         psn_account_id: psn_account_id_b64.trim().to_string(),
     }));
 

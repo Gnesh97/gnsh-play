@@ -28,6 +28,7 @@ use gnsh_chiaki_sys::{
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::net::Ipv4Addr;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -102,7 +103,7 @@ pub enum VideoPreset {
     P1080Fps60,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Ps5SessionConfig {
     pub host: String,
     pub regist_key: [u8; 16],
@@ -111,6 +112,20 @@ pub struct Ps5SessionConfig {
     pub codec: VideoCodec,
     pub bitrate_kbps: u32,
     pub enable_dualsense: bool,
+}
+
+impl fmt::Debug for Ps5SessionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ps5SessionConfig")
+            .field("host", &self.host)
+            .field("regist_key", &"<redacted>")
+            .field("rp_key", &"<redacted>")
+            .field("preset", &self.preset)
+            .field("codec", &self.codec)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("enable_dualsense", &self.enable_dualsense)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -205,10 +220,7 @@ unsafe impl Send for Ps5Session {}
 impl Ps5Session {
     pub fn start(config: Ps5SessionConfig) -> Result<(Self, SessionChannels)> {
         init_lib()?;
-        let normalized_host = crate::discovery::normalize_console_host(&config.host);
-        if normalized_host.is_empty() {
-            return Err(ProtoError::InvalidArg("host cannot be empty".into()));
-        }
+        let normalized_host = crate::discovery::validate_console_host(&config.host)?;
         let c_host = CString::new(normalized_host.as_str())
             .map_err(|_| ProtoError::InvalidArg("host contains interior NUL".into()))?;
 
@@ -860,7 +872,7 @@ unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
                 && q.reason
                     != ChiakiQuitReason_CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN;
             Some(SessionEvent::Quit {
-                reason: detail,
+                reason: crate::discovery::sanitize_network_text(&detail, 256),
                 is_error,
             })
         },
@@ -892,7 +904,9 @@ unsafe extern "C" fn event_cb(event: *mut ChiakiEvent, user: *mut c_void) {
             let nick = CStr::from_ptr(ev.__bindgen_anon_1.server_nickname.as_ptr())
                 .to_string_lossy()
                 .into_owned();
-            Some(SessionEvent::Nickname(nick))
+            Some(SessionEvent::Nickname(
+                crate::discovery::sanitize_network_text(&nick, 128),
+            ))
         },
         x if x == ChiakiEventType_CHIAKI_EVENT_LOGIN_PIN_REQUEST => unsafe {
             Some(SessionEvent::LoginPinRequested {

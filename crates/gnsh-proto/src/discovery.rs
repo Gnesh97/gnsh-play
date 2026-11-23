@@ -120,6 +120,19 @@ unsafe fn cstr_to_string(ptr: *const std::os::raw::c_char) -> String {
     }
 }
 
+const MAX_UNICAST_DISCOVERY_TARGETS: usize = 32;
+
+/// Strips control characters (including ANSI escapes and CR/LF) from untrusted network text
+/// and truncates cleanly to `max_chars`.
+pub fn sanitize_network_text(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 unsafe extern "C" fn discovery_cb(
     hosts: *mut ChiakiDiscoveryHost,
     hosts_count: usize,
@@ -146,14 +159,21 @@ unsafe extern "C" fn discovery_cb(
             }
             _ => ConsoleState::Unknown,
         };
+        let host_id = sanitize_network_text(&unsafe { cstr_to_string(host.host_id) }, 64);
+        let host_name = sanitize_network_text(&unsafe { cstr_to_string(host.host_name) }, 128);
+        let addr = sanitize_network_text(&unsafe { cstr_to_string(host.host_addr) }, 64);
+        let system_version =
+            sanitize_network_text(&unsafe { cstr_to_string(host.system_version) }, 32);
+        let running_app_name =
+            sanitize_network_text(&unsafe { cstr_to_string(host.running_app_name) }, 128);
         list.push(DiscoveredConsole {
-            host_id: unsafe { cstr_to_string(host.host_id) },
-            host_name: unsafe { cstr_to_string(host.host_name) },
-            addr: unsafe { cstr_to_string(host.host_addr) },
+            host_id,
+            host_name,
+            addr,
             state,
             is_ps5,
-            system_version: unsafe { cstr_to_string(host.system_version) },
-            running_app_name: unsafe { cstr_to_string(host.running_app_name) },
+            system_version,
+            running_app_name,
         });
     }
     if let Ok(mut guard) = collected.lock() {
@@ -162,7 +182,7 @@ unsafe extern "C" fn discovery_cb(
 }
 
 /// Normalizes a LAN IP, hostname, or remote DDNS address by trimming whitespace and removing
-/// optional `http(s)://` prefixes, path suffixes, and explicit `:port` suffixes.
+/// optional `http(s)://` prefixes, path/query/fragment suffixes, and explicit `:port` suffixes.
 pub fn normalize_console_host(raw: &str) -> String {
     let mut s = raw.trim();
     if s.get(..8)
@@ -175,7 +195,7 @@ pub fn normalize_console_host(raw: &str) -> String {
     {
         s = &s[7..];
     }
-    if let Some((head, _)) = s.split_once('/') {
+    if let Some((head, _)) = s.split_once(['/', '?', '#']) {
         s = head;
     }
     if let Some((host_part, port_part)) = s.rsplit_once(':')
@@ -188,16 +208,77 @@ pub fn normalize_console_host(raw: &str) -> String {
     s.trim().to_string()
 }
 
-/// Resolves an IPv4 literal or hostname (normalizing URL/`port` syntax first) to an `Ipv4Addr`.
-pub fn resolve_host_ipv4(host: &str) -> Option<Ipv4Addr> {
-    let normalized = normalize_console_host(host);
-    if normalized.is_empty() {
-        return None;
+/// Validates and normalizes a console host (IPv4 or RFC 1123 hostname), rejecting userinfo `@`,
+/// control/whitespace characters, injection delimiters, invalid labels, and dangerous IP ranges.
+pub fn validate_console_host(raw: &str) -> Result<String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return Err(ProtoError::InvalidArg(
+            "host contains control characters".into(),
+        ));
     }
-    if let Ok(ip) = normalized.parse::<Ipv4Addr>() {
+    let host = normalize_console_host(raw);
+    if host.is_empty() || host.len() > 253 {
+        return Err(ProtoError::InvalidArg(
+            "host must be 1..=253 characters".into(),
+        ));
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '@' || c == ';')
+    {
+        return Err(ProtoError::InvalidArg(
+            "host contains disallowed characters".into(),
+        ));
+    }
+
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        if ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
+            || ip == Ipv4Addr::new(169, 254, 169, 254)
+        {
+            return Err(ProtoError::InvalidArg(format!(
+                "refusing unsafe or non-unicast IPv4 host: {ip}"
+            )));
+        }
+        return Ok(host);
+    }
+
+    let hostname = host.strip_suffix('.').unwrap_or(&host);
+    if hostname.is_empty() {
+        return Err(ProtoError::InvalidArg("host cannot be empty".into()));
+    }
+    let labels: Vec<&str> = hostname.split('.').collect();
+    for label in &labels {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(ProtoError::InvalidArg(format!(
+                "invalid hostname syntax: {host}"
+            )));
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|tld| tld.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(ProtoError::InvalidArg(format!(
+            "invalid numeric host: {host}"
+        )));
+    }
+    Ok(host)
+}
+
+/// Validates and resolves an IPv4 literal or hostname to an `Ipv4Addr`.
+pub fn resolve_host_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let validated = validate_console_host(host).ok()?;
+    if let Ok(ip) = validated.parse::<Ipv4Addr>() {
         return Some(ip);
     }
-    (normalized.as_str(), 9302u16)
+    (validated.as_str(), 9302u16)
         .to_socket_addrs()
         .ok()?
         .find_map(|addr| match addr {
@@ -206,7 +287,7 @@ pub fn resolve_host_ipv4(host: &str) -> Option<Ipv4Addr> {
         })
 }
 
-/// Discovers PS5 consoles on LAN broadcasts plus any extra unicast LAN/WAN/VPN hosts.
+/// Discovers PS5 consoles on LAN broadcasts plus any extra validated unicast LAN/WAN/VPN hosts.
 pub fn discover_ps5_hosts(
     timeout: Duration,
     extra_hosts: &[String],
@@ -219,12 +300,17 @@ pub fn discover_ps5_hosts(
 
     let mut target_ips = ipv4_broadcast_addrs();
     let mut seen: HashSet<Ipv4Addr> = target_ips.iter().copied().collect();
+    let mut unicast_count = 0usize;
     for host in extra_hosts {
+        if unicast_count >= MAX_UNICAST_DISCOVERY_TARGETS {
+            break;
+        }
         if let Some(ip) = resolve_host_ipv4(host)
             && !ip.is_unspecified()
             && seen.insert(ip)
         {
             target_ips.push(ip);
+            unicast_count += 1;
         }
     }
 
@@ -280,11 +366,8 @@ pub fn discover_ps5_lan(timeout: Duration) -> Result<Vec<DiscoveredConsole>> {
 /// Sends a DDP wake-up packet to a PS5 console host (LAN or port-forwarded WAN) using its hex registration key.
 pub fn wake_ps5(host: &str, regist_key_hex: &str) -> Result<()> {
     init_lib()?;
-    let normalized = normalize_console_host(host);
-    if normalized.is_empty() {
-        return Err(ProtoError::InvalidArg("host cannot be empty".into()));
-    }
-    let c_host = CString::new(normalized.as_str())
+    let validated = validate_console_host(host)?;
+    let c_host = CString::new(validated.as_str())
         .map_err(|_| ProtoError::InvalidArg("host contains interior NUL".into()))?;
     let credential = parse_regist_key_credential(regist_key_hex)?;
 
@@ -317,10 +400,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_and_resolves_console_hosts() {
+    fn normalizes_resolves_and_rejects_malicious_hosts_and_escape_payloads() {
         assert_eq!(normalize_console_host("192.168.1.50:9295"), "192.168.1.50");
         assert_eq!(
-            normalize_console_host("http://my-ps5.duckdns.org:987/"),
+            normalize_console_host("http://my-ps5.duckdns.org:987/?q=1#frag"),
             "my-ps5.duckdns.org"
         );
         assert_eq!(normalize_console_host("100.64.0.1"), "100.64.0.1");
@@ -329,6 +412,26 @@ mod tests {
             Some(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(resolve_host_ipv4("   "), None);
+
+        assert!(validate_console_host("my-ps5.duckdns.org").is_ok());
+        assert!(validate_console_host("192.168.1.50").is_ok());
+        assert!(validate_console_host("user:pass@evil.com").is_err());
+        assert!(validate_console_host("192.168.1.1;cmd").is_err());
+        assert!(validate_console_host("192.168.1.1 foo").is_err());
+        assert!(validate_console_host("192.168.1.1\nFAKE").is_err());
+        assert!(validate_console_host("0.0.0.0").is_err());
+        assert!(validate_console_host("255.255.255.255").is_err());
+        assert!(validate_console_host("224.0.0.1").is_err());
+        assert!(validate_console_host("169.254.169.254").is_err());
+        assert!(validate_console_host("-bad.host").is_err());
+        let long_host = format!("{}.example.com", "a".repeat(250));
+        assert!(validate_console_host(&long_host).is_err());
+
+        assert_eq!(
+            sanitize_network_text("PS5\x1b[31m\nFAKE LOG\r\n", 32),
+            "PS5[31mFAKE LOG"
+        );
+        assert_eq!(sanitize_network_text("abcdef", 3), "abc");
     }
 
     #[test]

@@ -470,32 +470,40 @@ impl AppState {
 
         if save_requested {
             let trimmed_name = modal.name.trim().to_string();
-            let normalized_host = gnsh_proto::normalize_console_host(&modal.host);
-            let normalized_remote = gnsh_proto::normalize_console_host(&modal.remote_host);
             if trimmed_name.is_empty() {
                 modal.error = Some("Console name cannot be empty.".into());
                 self.edit_modal = Some(modal);
                 return;
             }
-            if normalized_host.is_empty() {
-                modal.error = Some("LAN Host / IP cannot be empty.".into());
-                self.edit_modal = Some(modal);
-                return;
-            }
+            let valid_host = match gnsh_proto::validate_console_host(&modal.host) {
+                Ok(h) => h,
+                Err(err) => {
+                    modal.error = Some(format!("Invalid LAN Host / IP: {err}"));
+                    self.edit_modal = Some(modal);
+                    return;
+                }
+            };
+            let remote_opt = if modal.remote_host.trim().is_empty() {
+                None
+            } else {
+                match gnsh_proto::validate_console_host(&modal.remote_host) {
+                    Ok(r) => Some(r),
+                    Err(err) => {
+                        modal.error = Some(format!("Invalid Remote / WAN / VPN Host: {err}"));
+                        self.edit_modal = Some(modal);
+                        return;
+                    }
+                }
+            };
             let Some(console) = self.saved_consoles.get(modal.index).cloned() else {
                 self.status_banner =
                     Some(StatusBanner::error("Selected console no longer exists."));
                 return;
             };
-            let remote_opt = if normalized_remote.is_empty() {
-                None
-            } else {
-                Some(normalized_remote)
-            };
             let prev = console.clone();
             if let Some(slot) = self.saved_consoles.get_mut(modal.index) {
                 slot.name = trimmed_name;
-                slot.host = normalized_host;
+                slot.host = valid_host;
                 slot.remote_host = remote_opt;
             }
             match self.store.save(&self.saved_consoles) {
@@ -1010,12 +1018,14 @@ fn render_register_modal_contents(ui: &mut egui::Ui, modal: &mut RegisterModal) 
 }
 
 fn trigger_register_worker(modal: &mut RegisterModal) {
-    let host = gnsh_proto::normalize_console_host(&modal.host);
-    if host.is_empty() {
-        modal.notice = None;
-        modal.error = Some("Enter the target PS5 host or IP address.".into());
-        return;
-    }
+    let host = match gnsh_proto::validate_console_host(&modal.host) {
+        Ok(h) => h,
+        Err(err) => {
+            modal.notice = None;
+            modal.error = Some(format!("Invalid PS5 host / IP: {err}"));
+            return;
+        }
+    };
 
     let account_id = modal.psn_account_id.trim().to_string();
     if account_id.is_empty() {

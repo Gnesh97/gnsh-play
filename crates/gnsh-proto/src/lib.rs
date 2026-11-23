@@ -12,7 +12,7 @@ use thiserror::Error;
 pub use controller::ControllerState;
 pub use discovery::{
     ConsoleState, DiscoveredConsole, discover_ps5_hosts, discover_ps5_lan, normalize_console_host,
-    resolve_host_ipv4, wake_ps5,
+    resolve_host_ipv4, sanitize_network_text, validate_console_host, wake_ps5,
 };
 pub use psn_auth::{
     PSN_LOGIN_URL, decode_account_id_b64, encode_account_id_u64,

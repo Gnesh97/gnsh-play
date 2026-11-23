@@ -1,10 +1,15 @@
 use crate::{ProtoError, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use std::io::Read as _;
+use std::time::Duration;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::HSTRING;
+
+const MAX_PSN_RESPONSE_BYTES: u64 = 64 * 1024;
+const PSN_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub const PSN_CLIENT_ID: &str = "ba495a24-818c-472b-b12d-ff231c1b5745";
 pub const PSN_CLIENT_SECRET: &str = "mvaiZkRsAsI1IBkY";
@@ -38,7 +43,18 @@ pub fn extract_code_from_redirect_url(input: &str) -> Result<String> {
             && k == "code"
             && !v.is_empty()
         {
-            return Ok(percent_decode(v));
+            let decoded = percent_decode(v);
+            if decoded.is_empty()
+                || decoded.len() > 512
+                || !decoded
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '~' | '+'))
+            {
+                return Err(ProtoError::PsnAuth(
+                    "redirect URL contains invalid `code` characters".to_string(),
+                ));
+            }
+            return Ok(decoded);
         }
     }
     Err(ProtoError::PsnAuth(
@@ -85,6 +101,36 @@ pub fn decode_account_id_b64(input: &str) -> Result<[u8; 8]> {
     Ok(out)
 }
 
+fn read_capped_body(resp: &mut ureq::http::Response<ureq::Body>) -> Result<String> {
+    let mut raw = String::new();
+    resp.body_mut()
+        .as_reader()
+        .take(MAX_PSN_RESPONSE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|e| ProtoError::PsnAuth(format!("reading response body failed: {e}")))?;
+    if raw.len() as u64 > MAX_PSN_RESPONSE_BYTES {
+        return Err(ProtoError::PsnAuth(
+            "PSN response exceeded 64 KiB safety limit".into(),
+        ));
+    }
+    Ok(raw)
+}
+
+fn validate_access_token(token: &str) -> Result<()> {
+    if token.is_empty()
+        || token.len() > 2048
+        || token.contains("..")
+        || !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '~' | '+' | '/'))
+    {
+        return Err(ProtoError::PsnAuth(
+            "invalid `access_token` format in token response".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn exchange_redirect_url_for_account_id(redirect_url: &str) -> Result<String> {
     let code = extract_code_from_redirect_url(redirect_url)?;
     let basic_auth = format!(
@@ -94,33 +140,37 @@ pub fn exchange_redirect_url_for_account_id(redirect_url: &str) -> Result<String
     let body =
         format!("grant_type=authorization_code&code={code}&redirect_uri={PSN_REDIRECT_URI}&");
 
-    let mut token_resp = ureq::post(PSN_TOKEN_URL)
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(PSN_HTTP_TIMEOUT))
+            .https_only(true)
+            .build(),
+    );
+
+    let mut token_resp = agent
+        .post(PSN_TOKEN_URL)
         .header("Authorization", &basic_auth)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send(body)
         .map_err(|e| ProtoError::PsnAuth(format!("token request failed: {e}")))?;
 
-    let token_raw = token_resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| ProtoError::PsnAuth(format!("reading token body failed: {e}")))?;
+    let token_raw = read_capped_body(&mut token_resp)?;
     let token_json: serde_json::Value = serde_json::from_str(&token_raw)
         .map_err(|e| ProtoError::PsnAuth(format!("invalid token JSON: {e}")))?;
     let access_token = token_json
         .get("access_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProtoError::PsnAuth("missing `access_token` in token response".into()))?;
+    validate_access_token(access_token)?;
 
     let info_url = format!("{PSN_TOKEN_URL}/{access_token}");
-    let mut info_resp = ureq::get(&info_url)
+    let mut info_resp = agent
+        .get(&info_url)
         .header("Authorization", &basic_auth)
         .call()
         .map_err(|e| ProtoError::PsnAuth(format!("account info request failed: {e}")))?;
 
-    let info_raw = info_resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| ProtoError::PsnAuth(format!("reading account info body failed: {e}")))?;
+    let info_raw = read_capped_body(&mut info_resp)?;
     let info_json: serde_json::Value = serde_json::from_str(&info_raw)
         .map_err(|e| ProtoError::PsnAuth(format!("invalid account info JSON: {e}")))?;
 
@@ -152,6 +202,26 @@ mod tests {
         assert_eq!(code, "v3.AbCd123+xyz");
 
         assert!(extract_code_from_redirect_url("https://example.com/?foo=bar").is_err());
+        assert!(
+            extract_code_from_redirect_url(
+                "https://remoteplay.dl.playstation.net/redirect?code=abc%26grant_type=evil"
+            )
+            .is_err()
+        );
+        assert!(
+            extract_code_from_redirect_url(
+                "https://remoteplay.dl.playstation.net/redirect?code=../../etc/passwd"
+            )
+            .is_err()
+        );
+        assert!(
+            extract_code_from_redirect_url(
+                "https://remoteplay.dl.playstation.net/redirect?code=abc%0d%0aevil"
+            )
+            .is_err()
+        );
+        assert!(validate_access_token("../../admin").is_err());
+        assert!(validate_access_token("tok?query=1").is_err());
     }
 
     #[test]
