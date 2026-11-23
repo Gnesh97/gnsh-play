@@ -28,7 +28,7 @@ use gnsh_chiaki_sys::{
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::Ipv4Addr;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -205,7 +205,11 @@ unsafe impl Send for Ps5Session {}
 impl Ps5Session {
     pub fn start(config: Ps5SessionConfig) -> Result<(Self, SessionChannels)> {
         init_lib()?;
-        let c_host = CString::new(config.host.trim())
+        let normalized_host = crate::discovery::normalize_console_host(&config.host);
+        if normalized_host.is_empty() {
+            return Err(ProtoError::InvalidArg("host cannot be empty".into()));
+        }
+        let c_host = CString::new(normalized_host.as_str())
             .map_err(|_| ProtoError::InvalidArg("host contains interior NUL".into()))?;
 
         let mut logger = ChiakiLogger::new(false);
@@ -336,7 +340,7 @@ impl Ps5Session {
             return check_chiaki(start_err).and_then(|_| unreachable!());
         }
 
-        let rtt_probe = RttProbe::start(config.host.trim());
+        let rtt_probe = RttProbe::start(&normalized_host);
         let handle = Self {
             session,
             opus_decoder,
@@ -518,7 +522,7 @@ impl RttProbe {
     fn start(host: &str) -> Self {
         let live_rtt_us = Arc::new(AtomicU32::new(0));
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
-        let thread = resolve_ipv4(host).and_then(|addr| {
+        let thread = crate::discovery::resolve_host_ipv4(host).and_then(|addr| {
             let rtt_ref = Arc::clone(&live_rtt_us);
             let stop_ref = Arc::clone(&stop);
             thread::Builder::new()
@@ -582,20 +586,6 @@ impl Drop for RttProbe {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn resolve_ipv4(host: &str) -> Option<Ipv4Addr> {
-    let trimmed = host.trim();
-    if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
-        return Some(ip);
-    }
-    (trimmed, 9295u16)
-        .to_socket_addrs()
-        .ok()?
-        .find_map(|addr| match addr {
-            SocketAddr::V4(v4) => Some(*v4.ip()),
-            SocketAddr::V6(_) => None,
-        })
 }
 
 fn icmp_ping_with_handle(handle: *mut c_void, addr: Ipv4Addr, timeout_ms: u32) -> Option<u32> {

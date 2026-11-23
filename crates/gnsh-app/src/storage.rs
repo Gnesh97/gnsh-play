@@ -16,6 +16,7 @@ pub struct SavedConsole {
     pub id: String,
     pub name: String,
     pub host: String,
+    pub remote_host: Option<String>,
     pub mac: [u8; 6],
     pub psn_account_id: String,
     pub regist_key: [u8; 16],
@@ -38,10 +39,17 @@ struct StoredConsoleDisk {
     id: String,
     name: String,
     host: String,
+    #[serde(default)]
+    remote_host: Option<String>,
     mac: [u8; 6],
     psn_account_id_dpapi: String,
     regist_key_dpapi: String,
     rp_key_dpapi: String,
+}
+
+fn normalize_opt_host(host: Option<&str>) -> Option<String> {
+    host.map(gnsh_proto::normalize_console_host)
+        .filter(|s| !s.is_empty())
 }
 
 pub struct ConsoleStore {
@@ -86,10 +94,13 @@ impl ConsoleStore {
             let rp_key: [u8; 16] = rp_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("decrypted rp_key length != 16"))?;
+            let host = gnsh_proto::normalize_console_host(&entry.host);
+            let remote_host = normalize_opt_host(entry.remote_host.as_deref());
             out.push(SavedConsole {
                 id: entry.id,
                 name: entry.name,
-                host: entry.host,
+                host,
+                remote_host,
                 mac: entry.mac,
                 psn_account_id,
                 regist_key,
@@ -109,7 +120,8 @@ impl ConsoleStore {
             disk.push(StoredConsoleDisk {
                 id: c.id.clone(),
                 name: c.name.clone(),
-                host: c.host.clone(),
+                host: gnsh_proto::normalize_console_host(&c.host),
+                remote_host: normalize_opt_host(c.remote_host.as_deref()),
                 mac: c.mac,
                 psn_account_id_dpapi: dpapi_protect_b64(c.psn_account_id.as_bytes())?,
                 regist_key_dpapi: dpapi_protect_b64(&c.regist_key)?,
@@ -187,6 +199,7 @@ mod tests {
             id: "001122334455".into(),
             name: "PS5-LivingRoom".into(),
             host: "192.168.1.50".into(),
+            remote_host: Some("ps5.example.com:9295".into()),
             mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
             psn_account_id: "AQIDBAUGBwg=".into(),
             regist_key: *b"1a2b3c4d\0\0\0\0\0\0\0\0",
@@ -199,8 +212,26 @@ mod tests {
         assert!(!raw.contains("AQIDBAUGBwg="));
 
         let loaded = store.load().expect("load");
-        assert_eq!(loaded, vec![sample]);
+        let expected = SavedConsole {
+            remote_host: Some("ps5.example.com".into()),
+            ..sample
+        };
+        assert_eq!(loaded, vec![expected.clone()]);
         assert_eq!(loaded[0].regist_key_hex(), "1a2b3c4d");
+
+        // Legacy consoles.json without `remote_host` must load cleanly with `remote_host: None`.
+        let legacy_json = raw
+            .replace("    \"remote_host\": \"ps5.example.com\",\r\n", "")
+            .replace("    \"remote_host\": \"ps5.example.com\",\n", "");
+        std::fs::write(&path, legacy_json).expect("write legacy json");
+        let legacy_loaded = store.load().expect("load legacy");
+        assert_eq!(
+            legacy_loaded,
+            vec![SavedConsole {
+                remote_host: None,
+                ..expected
+            }]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

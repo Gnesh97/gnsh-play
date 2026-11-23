@@ -10,7 +10,10 @@ use std::sync::OnceLock;
 use thiserror::Error;
 
 pub use controller::ControllerState;
-pub use discovery::{ConsoleState, DiscoveredConsole, discover_ps5_lan, wake_ps5};
+pub use discovery::{
+    ConsoleState, DiscoveredConsole, discover_ps5_hosts, discover_ps5_lan, normalize_console_host,
+    resolve_host_ipv4, wake_ps5,
+};
 pub use psn_auth::{
     PSN_LOGIN_URL, decode_account_id_b64, encode_account_id_u64,
     exchange_redirect_url_for_account_id, extract_code_from_redirect_url,

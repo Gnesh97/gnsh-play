@@ -1,3 +1,4 @@
+use crate::discovery::normalize_console_host;
 use crate::log::ChiakiLogger;
 use crate::psn_auth::decode_account_id_b64;
 use crate::{ProtoError, Result, check_chiaki, init_lib};
@@ -86,15 +87,19 @@ pub fn register_ps5(
             "PS5 PIN must be at most 8 digits".into(),
         ));
     }
+    let normalized_host = normalize_console_host(host);
+    if normalized_host.is_empty() {
+        return Err(ProtoError::InvalidArg("host cannot be empty".into()));
+    }
     let account_bytes = decode_account_id_b64(psn_account_id_b64)?;
-    let c_host = CString::new(host.trim())
+    let c_host = CString::new(normalized_host.as_str())
         .map_err(|_| ProtoError::InvalidArg("host contains interior NUL".into()))?;
 
     let mut logger = ChiakiLogger::new(false);
     let (tx, rx) = crossbeam_channel::bounded(1);
     let ctx_ptr = Box::into_raw(Box::new(RegistContext {
         tx,
-        addr: host.trim().to_string(),
+        addr: normalized_host,
         psn_account_id: psn_account_id_b64.trim().to_string(),
     }));
 

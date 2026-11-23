@@ -10,7 +10,7 @@ use gnsh_chiaki_sys::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::raw::c_void;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -161,16 +161,75 @@ unsafe extern "C" fn discovery_cb(
     }
 }
 
-/// Discovers PS5 consoles on the local IPv4 LAN within `timeout`.
-pub fn discover_ps5_lan(timeout: Duration) -> Result<Vec<DiscoveredConsole>> {
+/// Normalizes a LAN IP, hostname, or remote DDNS address by trimming whitespace and removing
+/// optional `http(s)://` prefixes, path suffixes, and explicit `:port` suffixes.
+pub fn normalize_console_host(raw: &str) -> String {
+    let mut s = raw.trim();
+    if s.get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        s = &s[8..];
+    } else if s
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        s = &s[7..];
+    }
+    if let Some((head, _)) = s.split_once('/') {
+        s = head;
+    }
+    if let Some((host_part, port_part)) = s.rsplit_once(':')
+        && !host_part.contains(':')
+        && !port_part.is_empty()
+        && port_part.chars().all(|c| c.is_ascii_digit())
+    {
+        s = host_part;
+    }
+    s.trim().to_string()
+}
+
+/// Resolves an IPv4 literal or hostname (normalizing URL/`port` syntax first) to an `Ipv4Addr`.
+pub fn resolve_host_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let normalized = normalize_console_host(host);
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = normalized.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+    (normalized.as_str(), 9302u16)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| match addr {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
+        })
+}
+
+/// Discovers PS5 consoles on LAN broadcasts plus any extra unicast LAN/WAN/VPN hosts.
+pub fn discover_ps5_hosts(
+    timeout: Duration,
+    extra_hosts: &[String],
+) -> Result<Vec<DiscoveredConsole>> {
     init_lib()?;
     let mut logger = ChiakiLogger::new(false);
 
     let collected = Box::new(Mutex::new(Vec::<DiscoveredConsole>::new()));
     let collected_ptr = Box::into_raw(collected);
 
+    let mut target_ips = ipv4_broadcast_addrs();
+    let mut seen: HashSet<Ipv4Addr> = target_ips.iter().copied().collect();
+    for host in extra_hosts {
+        if let Some(ip) = resolve_host_ipv4(host)
+            && !ip.is_unspecified()
+            && seen.insert(ip)
+        {
+            target_ips.push(ip);
+        }
+    }
+
     let mut send_addr = ipv4_to_sockaddr_storage(Ipv4Addr::BROADCAST);
-    let mut bcast_addrs: Vec<sockaddr_storage> = ipv4_broadcast_addrs()
+    let mut bcast_addrs: Vec<sockaddr_storage> = target_ips
         .into_iter()
         .map(ipv4_to_sockaddr_storage)
         .collect();
@@ -213,10 +272,19 @@ pub fn discover_ps5_lan(timeout: Duration) -> Result<Vec<DiscoveredConsole>> {
     Ok(hosts)
 }
 
-/// Sends a DDP wake-up packet to a PS5 console on LAN using its hex registration key.
+/// Discovers PS5 consoles on the local IPv4 LAN within `timeout`.
+pub fn discover_ps5_lan(timeout: Duration) -> Result<Vec<DiscoveredConsole>> {
+    discover_ps5_hosts(timeout, &[])
+}
+
+/// Sends a DDP wake-up packet to a PS5 console host (LAN or port-forwarded WAN) using its hex registration key.
 pub fn wake_ps5(host: &str, regist_key_hex: &str) -> Result<()> {
     init_lib()?;
-    let c_host = CString::new(host.trim())
+    let normalized = normalize_console_host(host);
+    if normalized.is_empty() {
+        return Err(ProtoError::InvalidArg("host cannot be empty".into()));
+    }
+    let c_host = CString::new(normalized.as_str())
         .map_err(|_| ProtoError::InvalidArg("host contains interior NUL".into()))?;
     let credential = parse_regist_key_credential(regist_key_hex)?;
 
@@ -247,6 +315,21 @@ pub(crate) fn parse_regist_key_credential(regist_key_hex: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_and_resolves_console_hosts() {
+        assert_eq!(normalize_console_host("192.168.1.50:9295"), "192.168.1.50");
+        assert_eq!(
+            normalize_console_host("http://my-ps5.duckdns.org:987/"),
+            "my-ps5.duckdns.org"
+        );
+        assert_eq!(normalize_console_host("100.64.0.1"), "100.64.0.1");
+        assert_eq!(
+            resolve_host_ipv4("127.0.0.1:9295"),
+            Some(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(resolve_host_ipv4("   "), None);
+    }
 
     #[test]
     fn validates_regist_key_hex_for_wakeup() {
