@@ -234,6 +234,7 @@ mod tests {
             kbm_enabled: true,
             kbm_sensitivity_pct: 200,
             kbm_deadzone_pct: 90,
+            kbm_curve_pct: 250,
             kbm_invert_y: true,
             kbm_bindings: custom_bindings.clone(),
         };
@@ -254,12 +255,13 @@ mod tests {
         assert!(loaded.kbm_enabled);
         assert_eq!(loaded.kbm_sensitivity_pct, 100);
         assert_eq!(loaded.kbm_deadzone_pct, 40);
+        assert_eq!(loaded.kbm_curve_pct, 150);
         assert!(loaded.kbm_invert_y);
         assert_eq!(loaded.kbm_bindings, custom_bindings);
 
         std::fs::write(
             &path,
-            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   ", "kbm_sensitivity_pct": 0, "kbm_deadzone_pct": 80}"#,
+            r#"{"bitrate_kbps": 999999, "sharpness_pct": 180, "volume_pct": 250, "audio_device": "   ", "kbm_sensitivity_pct": 0, "kbm_deadzone_pct": 80, "kbm_curve_pct": 10}"#,
         )
         .expect("write unclamped json");
         let clamped = store.load().expect("load clamped");
@@ -273,7 +275,12 @@ mod tests {
         assert!(!clamped.kbm_enabled);
         assert_eq!(clamped.kbm_sensitivity_pct, 1);
         assert_eq!(clamped.kbm_deadzone_pct, 40);
+        assert_eq!(clamped.kbm_curve_pct, 50);
         assert!(!clamped.kbm_invert_y);
+
+        std::fs::write(&path, r#"{"kbm_enabled": true}"#).expect("write missing curve json");
+        let defaulted = store.load().expect("load missing curve");
+        assert_eq!(defaulted.kbm_curve_pct, 100);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -295,6 +302,7 @@ pub struct StoredSettings {
     pub kbm_enabled: bool,
     pub kbm_sensitivity_pct: u8,
     pub kbm_deadzone_pct: u8,
+    pub kbm_curve_pct: u8,
     pub kbm_invert_y: bool,
     pub kbm_bindings: KbmBindings,
 }
@@ -314,6 +322,7 @@ impl Default for StoredSettings {
             kbm_enabled: false,
             kbm_sensitivity_pct: 50,
             kbm_deadzone_pct: 14,
+            kbm_curve_pct: 100,
             kbm_invert_y: false,
             kbm_bindings: KbmBindings::default(),
         }
@@ -326,6 +335,10 @@ fn normalize_settings(settings: &mut StoredSettings) {
     settings.volume_pct = settings.volume_pct.min(100);
     settings.kbm_sensitivity_pct = settings.kbm_sensitivity_pct.clamp(1, 100);
     settings.kbm_deadzone_pct = settings.kbm_deadzone_pct.min(40);
+    if settings.kbm_curve_pct == 0 {
+        settings.kbm_curve_pct = 100;
+    }
+    settings.kbm_curve_pct = settings.kbm_curve_pct.clamp(50, 150);
     settings.audio_device = settings
         .audio_device
         .take()

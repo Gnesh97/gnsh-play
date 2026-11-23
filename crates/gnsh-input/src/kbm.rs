@@ -295,6 +295,7 @@ impl KbmBindings {
 pub struct KbmConfig {
     pub sensitivity_pct: u8,
     pub deadzone_pct: u8,
+    pub curve_pct: u8,
     pub invert_y: bool,
 }
 
@@ -303,6 +304,7 @@ impl Default for KbmConfig {
         Self {
             sensitivity_pct: 50,
             deadzone_pct: 14,
+            curve_pct: 100,
             invert_y: false,
         }
     }
@@ -472,22 +474,31 @@ pub fn step_mouse_stick(
         let uy = inst_y / inst_mag;
         vel.0 = ux * new_mag;
         vel.1 = uy * new_mag;
-    } else {
+    } else if inst_mag > 1e-5 {
         let prev_mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
         if prev_mag > 1.0 {
             let drain = MOUSE_FLICK_DRAIN_RATE * (1.0 - 0.5 * inst_mag) * norm_dt;
             let next_mag = (prev_mag - drain).max(inst_mag);
-            vel.0 *= next_mag / prev_mag;
-            vel.1 *= next_mag / prev_mag;
-        } else if inst_mag > 1e-5 {
+            let ux = inst_x / inst_mag;
+            let uy = inst_y / inst_mag;
+            vel.0 = ux * next_mag;
+            vel.1 = uy * next_mag;
+        } else {
             let alpha = 1.0 - (-dt / MOUSE_ACTIVE_SMOOTH_TAU_SECS).exp();
             vel.0 = vel.0 * (1.0 - alpha) + inst_x * alpha;
             vel.1 = vel.1 * (1.0 - alpha) + inst_y * alpha;
-        } else {
-            let decay = (-dt / MOUSE_STOP_DECAY_TAU_SECS).exp();
-            vel.0 *= decay;
-            vel.1 *= decay;
         }
+    } else {
+        // Shed excess carryover immediately once hand stops so crosshair never overshoots.
+        let prev_mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
+        if prev_mag > 1.0 {
+            let inv = 1.0 / prev_mag;
+            vel.0 *= inv;
+            vel.1 *= inv;
+        }
+        let decay = (-dt / MOUSE_STOP_DECAY_TAU_SECS).exp();
+        vel.0 *= decay;
+        vel.1 *= decay;
     }
 
     let mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
@@ -500,12 +511,41 @@ pub fn step_mouse_stick(
 
     let clamped = mag.min(1.0);
     let dz = f32::from(config.deadzone_pct.min(40)) / 100.0;
-    let out_mag = (dz + clamped.powf(MOUSE_RESPONSE_GAMMA) * (1.0 - dz)).clamp(0.0, 1.0);
+    let raw_curve = if config.curve_pct == 0 {
+        100
+    } else {
+        config.curve_pct.clamp(50, 150)
+    };
+    let gamma = (MOUSE_RESPONSE_GAMMA * (f32::from(raw_curve) / 100.0).powf(1.2)).clamp(0.45, 2.20);
+    let out_mag = (dz + clamped.powf(gamma) * (1.0 - dz)).clamp(0.0, 1.0);
     let nx = vel.0 / mag;
     let ny = (vel.1 / mag) * if config.invert_y { -1.0 } else { 1.0 };
 
-    let rx = (nx * out_mag * 32767.0).round().clamp(-32767.0, 32767.0) as i16;
-    let ry = (ny * out_mag * 32767.0).round().clamp(-32767.0, 32767.0) as i16;
+    let mut out_x = nx * out_mag;
+    let mut out_y = ny * out_mag;
+    if dz > 0.0 && nx.abs() > 0.02 && ny.abs() > 0.02 {
+        // Lift minor axis gently above console axial deadzones to keep shallow diagonals smooth.
+        let axial_floor = dz * 0.35;
+        let lift_axis = |val: f32, dir: f32| -> f32 {
+            let blend = ((dir.abs() - 0.02) / 0.18).clamp(0.0, 1.0);
+            let min_v = axial_floor * blend;
+            if val.abs() < min_v {
+                min_v.copysign(val)
+            } else {
+                val
+            }
+        };
+        out_x = lift_axis(out_x, nx);
+        out_y = lift_axis(out_y, ny);
+        let norm = (out_x * out_x + out_y * out_y).sqrt();
+        if norm > 1.0 {
+            out_x /= norm;
+            out_y /= norm;
+        }
+    }
+
+    let rx = (out_x * 32767.0).round().clamp(-32767.0, 32767.0) as i16;
+    let ry = (out_y * 32767.0).round().clamp(-32767.0, 32767.0) as i16;
     (rx, ry)
 }
 
@@ -649,6 +689,7 @@ mod tests {
         let cfg = KbmConfig {
             sensitivity_pct: 50,
             deadzone_pct: 20,
+            curve_pct: 100,
             invert_y: false,
         };
         let (rx, ry) = step_mouse_stick(&mut vel, (10.0, -5.0), 0.016, cfg);
@@ -680,6 +721,7 @@ mod tests {
         let cfg = KbmConfig {
             sensitivity_pct: 50,
             deadzone_pct: 15,
+            curve_pct: 100,
             invert_y: false,
         };
 
@@ -705,17 +747,43 @@ mod tests {
         let (rx_fast_turn, _) = step_mouse_stick(&mut vel_fast_turn, (35.0, 0.0), 0.016, cfg);
         assert_eq!(rx_fast_turn, 32_767);
 
-        // Fast flick holds full saturation carryover on the next idle tick, then drains cleanly.
+        // Fast flick holds 100% carryover while still moving, then stops cleanly within 24 ms on idle.
         let mut vel_flick = (0.0, 0.0);
         let (rx_flick, _) = step_mouse_stick(&mut vel_flick, (80.0, 0.0), 0.008, cfg);
         assert_eq!(rx_flick, 32_767);
-        let (rx_after_1, _) = step_mouse_stick(&mut vel_flick, (0.0, 0.0), 0.008, cfg);
-        assert_eq!(rx_after_1, 32_767);
+        let (rx_follow, _) = step_mouse_stick(&mut vel_flick, (2.0, 0.0), 0.008, cfg);
+        assert_eq!(rx_follow, 32_767);
         let mut stick = (i16::MAX, 0);
-        for _ in 0..11 {
+        for _ in 0..3 {
             stick = step_mouse_stick(&mut vel_flick, (0.0, 0.0), 0.008, cfg);
         }
         assert_eq!(stick, (0, 0));
+
+        // Lower curve_pct boosts mid-speed output relative to higher curve_pct.
+        let mut vel_low_curve = (0.0, 0.0);
+        let (rx_low_curve, _) = step_mouse_stick(
+            &mut vel_low_curve,
+            (6.0, 0.0),
+            0.016,
+            KbmConfig {
+                curve_pct: 60,
+                ..cfg
+            },
+        );
+        let mut vel_high_curve = (0.0, 0.0);
+        let (rx_high_curve, _) = step_mouse_stick(
+            &mut vel_high_curve,
+            (6.0, 0.0),
+            0.016,
+            KbmConfig {
+                curve_pct: 140,
+                ..cfg
+            },
+        );
+        assert!(
+            rx_low_curve > rx_high_curve,
+            "expected curve 60% ({rx_low_curve}) > curve 140% ({rx_high_curve})"
+        );
 
         // Opposite mouse movement during active flick carryover reverses sign immediately.
         let mut vel_rev = (0.0, 0.0);

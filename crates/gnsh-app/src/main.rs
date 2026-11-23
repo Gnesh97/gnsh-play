@@ -1847,6 +1847,7 @@ impl AppState {
                         KbmConfig {
                             sensitivity_pct: self.settings.kbm_sensitivity_pct,
                             deadzone_pct: self.settings.kbm_deadzone_pct,
+                            curve_pct: self.settings.kbm_curve_pct,
                             invert_y: self.settings.kbm_invert_y,
                         },
                         &self.settings.kbm_bindings,
@@ -2913,6 +2914,15 @@ fn render_kbm_controls(
                 .text("DZ"),
         )
         .on_hover_text("Radial deadzone boost to overcome the game's inner analog deadzone");
+        ui.add(
+            egui::Slider::new(&mut settings.kbm_curve_pct, 50..=150)
+                .clamping(egui::SliderClamping::Always)
+                .suffix("%")
+                .text("Curve"),
+        )
+        .on_hover_text(
+            "Aim response curve: <100% boosts low-mid speed to counter console exponential curves; >100% increases slow micro-aim precision (default 100%)",
+        );
     });
     ui.checkbox(&mut settings.kbm_invert_y, "Inv Y")
         .on_hover_text("Invert vertical mouse camera axis");
