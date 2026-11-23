@@ -4,13 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Instant;
 
-const MOUSE_MIN_SAMPLE_WINDOW_SECS: f32 = 0.004;
+const MOUSE_MIN_SAMPLE_WINDOW_SECS: f32 = 0.008;
 const MOUSE_REF_FRAME_SECS: f32 = 1.0 / 60.0;
+const MOUSE_ACTIVE_SMOOTH_TAU_SECS: f32 = 0.005;
 const MOUSE_STOP_DECAY_TAU_SECS: f32 = 0.0035;
-const MOUSE_BASE_SCALE: f32 = 1.0 / 14.0;
+const MOUSE_BASE_SCALE: f32 = 1.0 / 30.0;
+const MOUSE_MAX_FLICK_VEL: f32 = 3.4;
+const MOUSE_FLICK_DRAIN_RATE: f32 = 0.60;
 const MOUSE_VEL_CUTOFF: f32 = 0.008;
 const MOUSE_VEL_ZERO_SNAP: f32 = 0.002;
-const MOUSE_RESPONSE_GAMMA: f32 = 0.60;
+const MOUSE_RESPONSE_GAMMA: f32 = 1.15;
 
 /// A single keyboard key or mouse button input usable in bindable presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -435,7 +438,8 @@ impl KbmEmulator {
     }
 }
 
-/// Converts raw relative mouse deltas into a `dt`-normalized, deadzone-boosted right stick value.
+/// Converts raw relative mouse deltas into a `dt`-normalized, progressive-curve,
+/// deadzone-boosted right stick value with bounded fast-flick carryover.
 pub fn step_mouse_stick(
     vel: &mut (f32, f32),
     raw_delta: (f32, f32),
@@ -443,24 +447,50 @@ pub fn step_mouse_stick(
     config: KbmConfig,
 ) -> (i16, i16) {
     let dt = dt_secs.clamp(0.001, 0.1);
-    let decay = (-dt / MOUSE_STOP_DECAY_TAU_SECS).exp();
+    let norm_dt = (dt / MOUSE_REF_FRAME_SECS).clamp(0.1, 4.0);
     let sens = (f32::from(config.sensitivity_pct.clamp(1, 100)) / 50.0)
         .powf(1.35)
         .clamp(0.02, 6.0);
-    let frame_scale = (MOUSE_REF_FRAME_SECS / dt).clamp(0.25, 6.0);
 
-    let target_x = raw_delta.0 * frame_scale * sens * MOUSE_BASE_SCALE;
-    let target_y = raw_delta.1 * frame_scale * sens * MOUSE_BASE_SCALE;
+    let inst_x = (raw_delta.0 * sens * MOUSE_BASE_SCALE) / norm_dt;
+    let inst_y = (raw_delta.1 * sens * MOUSE_BASE_SCALE) / norm_dt;
+    let inst_mag = (inst_x * inst_x + inst_y * inst_y).sqrt();
 
-    if raw_delta.0.abs() > 1e-5 || raw_delta.1.abs() > 1e-5 {
-        vel.0 = target_x + vel.0 * decay * 0.2;
-        vel.1 = target_y + vel.1 * decay * 0.2;
-    } else {
-        vel.0 *= decay;
-        vel.1 *= decay;
+    if raw_delta.0.abs() > 1e-5 && inst_x * vel.0 < 0.0 {
+        vel.0 = 0.0;
+    }
+    if raw_delta.1.abs() > 1e-5 && inst_y * vel.1 < 0.0 {
+        vel.1 = 0.0;
     }
 
-    let mut mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
+    if inst_mag > 1.0 {
+        // Carry unconsumed fast-flick displacement above full stick deflection (capped).
+        let prev_mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt().max(1.0);
+        let excess = (inst_mag - 1.0) * norm_dt;
+        let new_mag = (prev_mag + excess).min(MOUSE_MAX_FLICK_VEL);
+        let ux = inst_x / inst_mag;
+        let uy = inst_y / inst_mag;
+        vel.0 = ux * new_mag;
+        vel.1 = uy * new_mag;
+    } else {
+        let prev_mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
+        if prev_mag > 1.0 {
+            let drain = MOUSE_FLICK_DRAIN_RATE * (1.0 - 0.5 * inst_mag) * norm_dt;
+            let next_mag = (prev_mag - drain).max(inst_mag);
+            vel.0 *= next_mag / prev_mag;
+            vel.1 *= next_mag / prev_mag;
+        } else if inst_mag > 1e-5 {
+            let alpha = 1.0 - (-dt / MOUSE_ACTIVE_SMOOTH_TAU_SECS).exp();
+            vel.0 = vel.0 * (1.0 - alpha) + inst_x * alpha;
+            vel.1 = vel.1 * (1.0 - alpha) + inst_y * alpha;
+        } else {
+            let decay = (-dt / MOUSE_STOP_DECAY_TAU_SECS).exp();
+            vel.0 *= decay;
+            vel.1 *= decay;
+        }
+    }
+
+    let mag = (vel.0 * vel.0 + vel.1 * vel.1).sqrt();
     if !mag.is_finite() || mag < MOUSE_VEL_CUTOFF {
         if !mag.is_finite() || mag < MOUSE_VEL_ZERO_SNAP {
             *vel = (0.0, 0.0);
@@ -468,16 +498,9 @@ pub fn step_mouse_stick(
         return (0, 0);
     }
 
-    if mag > 1.0 {
-        // Keep stored velocity bounded so fast flicks don't leave a lingering stop tail.
-        let inv = 1.0 / mag;
-        vel.0 *= inv;
-        vel.1 *= inv;
-        mag = 1.0;
-    }
-
+    let clamped = mag.min(1.0);
     let dz = f32::from(config.deadzone_pct.min(40)) / 100.0;
-    let out_mag = (dz + mag.powf(MOUSE_RESPONSE_GAMMA) * (1.0 - dz)).clamp(0.0, 1.0);
+    let out_mag = (dz + clamped.powf(MOUSE_RESPONSE_GAMMA) * (1.0 - dz)).clamp(0.0, 1.0);
     let nx = vel.0 / mag;
     let ny = (vel.1 / mag) * if config.invert_y { -1.0 } else { 1.0 };
 
@@ -653,42 +676,55 @@ mod tests {
     }
 
     #[test]
-    fn mouse_stick_response_is_dt_independent_and_stops_within_20ms() {
+    fn mouse_stick_progressive_curve_and_flick_carryover() {
         let cfg = KbmConfig {
             sensitivity_pct: 50,
             deadzone_pct: 15,
             invert_y: false,
         };
 
-        // Equal physical speed (625 px/s): 2.5 px in 4 ms vs 10.0 px in 16 ms.
-        let mut vel_fast = (0.0, 0.0);
-        let (rx_4ms, _) = step_mouse_stick(&mut vel_fast, (2.5, 0.0), 0.004, cfg);
-        let mut vel_slow = (0.0, 0.0);
-        let (rx_16ms, _) = step_mouse_stick(&mut vel_slow, (10.0, 0.0), 0.016, cfg);
+        // Equal physical speed (500 px/s) across 2 x 8 ms vs 1 x 16 ms produces matching output.
+        let mut vel_8ms = (0.0, 0.0);
+        step_mouse_stick(&mut vel_8ms, (4.0, 0.0), 0.008, cfg);
+        let (rx_8ms, _) = step_mouse_stick(&mut vel_8ms, (4.0, 0.0), 0.008, cfg);
+        let mut vel_16ms = (0.0, 0.0);
+        let (rx_16ms, _) = step_mouse_stick(&mut vel_16ms, (8.0, 0.0), 0.016, cfg);
         assert!(
-            (rx_4ms - rx_16ms).abs() <= 2,
-            "4ms ({rx_4ms}) and 16ms ({rx_16ms}) windows should match for equal speed"
-        );
-        assert!(
-            rx_4ms > 20_000,
-            "first sample must reach high turn deflection"
+            (rx_8ms - rx_16ms).abs() <= 2,
+            "8ms ({rx_8ms}) and 16ms ({rx_16ms}) windows should match for equal speed"
         );
 
-        // Reversing hand direction flips output sign on the very next 4 ms sample.
-        let (rx_rev, _) = step_mouse_stick(&mut vel_fast, (-2.5, 0.0), 0.004, cfg);
+        // Slow micro-aim stays gentle while fast turns reach full stick deflection.
+        let mut vel_slow_aim = (0.0, 0.0);
+        let (rx_slow_aim, _) = step_mouse_stick(&mut vel_slow_aim, (2.0, 0.0), 0.016, cfg);
         assert!(
-            rx_rev < 0,
-            "expected immediate negative reversal, got {rx_rev}"
+            rx_slow_aim > 0 && rx_slow_aim < 10_000,
+            "slow aim should stay gentle (< 10000), got {rx_slow_aim}"
         );
+        let mut vel_fast_turn = (0.0, 0.0);
+        let (rx_fast_turn, _) = step_mouse_stick(&mut vel_fast_turn, (35.0, 0.0), 0.016, cfg);
+        assert_eq!(rx_fast_turn, 32_767);
 
-        // Saturated flick stops cleanly to exact (0, 0) within 20 ms (5 x 4 ms ticks).
+        // Fast flick holds full saturation carryover on the next idle tick, then drains cleanly.
         let mut vel_flick = (0.0, 0.0);
-        step_mouse_stick(&mut vel_flick, (80.0, 0.0), 0.004, cfg);
+        let (rx_flick, _) = step_mouse_stick(&mut vel_flick, (80.0, 0.0), 0.008, cfg);
+        assert_eq!(rx_flick, 32_767);
+        let (rx_after_1, _) = step_mouse_stick(&mut vel_flick, (0.0, 0.0), 0.008, cfg);
+        assert_eq!(rx_after_1, 32_767);
         let mut stick = (i16::MAX, 0);
-        for _ in 0..5 {
-            stick = step_mouse_stick(&mut vel_flick, (0.0, 0.0), 0.004, cfg);
+        for _ in 0..11 {
+            stick = step_mouse_stick(&mut vel_flick, (0.0, 0.0), 0.008, cfg);
         }
         assert_eq!(stick, (0, 0));
+
+        // Opposite mouse movement during active flick carryover reverses sign immediately.
+        let mut vel_rev = (0.0, 0.0);
+        step_mouse_stick(&mut vel_rev, (80.0, 0.0), 0.008, cfg);
+        let (rx_rev, _) = step_mouse_stick(&mut vel_rev, (-4.0, 0.0), 0.008, cfg);
+        assert!(
+            rx_rev < 0,
+            "expected immediate negative reversal during carryover, got {rx_rev}"
+        );
     }
 
     #[test]
