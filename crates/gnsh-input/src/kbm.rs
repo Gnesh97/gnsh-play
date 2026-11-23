@@ -32,6 +32,89 @@ impl KbmInput {
     }
 }
 
+/// Bindable DualSense actions exposed in the KB+M keybind editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KbmAction {
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    L2,
+    R2,
+    L1,
+    R1,
+    L3,
+    R3,
+    Cross,
+    Circle,
+    Square,
+    Triangle,
+    DpadUp,
+    DpadDown,
+    DpadLeft,
+    DpadRight,
+    Touchpad,
+    Options,
+    Share,
+    Ps,
+}
+
+impl KbmAction {
+    /// Complete ordered list of all bindable DualSense actions.
+    pub const ALL: [KbmAction; 22] = [
+        Self::MoveUp,
+        Self::MoveDown,
+        Self::MoveLeft,
+        Self::MoveRight,
+        Self::L2,
+        Self::R2,
+        Self::L1,
+        Self::R1,
+        Self::L3,
+        Self::R3,
+        Self::Cross,
+        Self::Circle,
+        Self::Square,
+        Self::Triangle,
+        Self::DpadUp,
+        Self::DpadDown,
+        Self::DpadLeft,
+        Self::DpadRight,
+        Self::Touchpad,
+        Self::Options,
+        Self::Share,
+        Self::Ps,
+    ];
+
+    /// Human-readable display label for the keybind UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MoveUp => "Left Stick Up",
+            Self::MoveDown => "Left Stick Down",
+            Self::MoveLeft => "Left Stick Left",
+            Self::MoveRight => "Left Stick Right",
+            Self::L2 => "L2 (Aim / Brake)",
+            Self::R2 => "R2 (Fire / Gas)",
+            Self::L1 => "L1",
+            Self::R1 => "R1",
+            Self::L3 => "L3 (Sprint)",
+            Self::R3 => "R3 (Melee)",
+            Self::Cross => "Cross (X)",
+            Self::Circle => "Circle (O)",
+            Self::Square => "Square ([])",
+            Self::Triangle => "Triangle (/\\)",
+            Self::DpadUp => "D-Pad Up",
+            Self::DpadDown => "D-Pad Down",
+            Self::DpadLeft => "D-Pad Left",
+            Self::DpadRight => "D-Pad Right",
+            Self::Touchpad => "Touchpad Click",
+            Self::Options => "Options",
+            Self::Share => "Create / Share",
+            Self::Ps => "PS Button",
+        }
+    }
+}
+
 /// Complete customizable keyboard + mouse to DualSense mapping schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -90,6 +173,84 @@ impl Default for KbmBindings {
 }
 
 impl KbmBindings {
+    fn slot_mut(&mut self, action: KbmAction) -> &mut KbmInput {
+        match action {
+            KbmAction::MoveUp => &mut self.move_up,
+            KbmAction::MoveDown => &mut self.move_down,
+            KbmAction::MoveLeft => &mut self.move_left,
+            KbmAction::MoveRight => &mut self.move_right,
+            KbmAction::L2 => &mut self.l2,
+            KbmAction::R2 => &mut self.r2,
+            KbmAction::L1 => &mut self.l1,
+            KbmAction::R1 => &mut self.r1,
+            KbmAction::L3 => &mut self.l3,
+            KbmAction::R3 => &mut self.r3,
+            KbmAction::Cross => &mut self.cross,
+            KbmAction::Circle => &mut self.circle,
+            KbmAction::Square => &mut self.square,
+            KbmAction::Triangle => &mut self.triangle,
+            KbmAction::DpadUp => &mut self.dpad_up,
+            KbmAction::DpadDown => &mut self.dpad_down,
+            KbmAction::DpadLeft => &mut self.dpad_left,
+            KbmAction::DpadRight => &mut self.dpad_right,
+            KbmAction::Touchpad => &mut self.touchpad,
+            KbmAction::Options => &mut self.options,
+            KbmAction::Share => &mut self.share,
+            KbmAction::Ps => &mut self.ps,
+        }
+    }
+
+    /// Returns the input currently bound to `action`.
+    pub fn get(&self, action: KbmAction) -> KbmInput {
+        match action {
+            KbmAction::MoveUp => self.move_up,
+            KbmAction::MoveDown => self.move_down,
+            KbmAction::MoveLeft => self.move_left,
+            KbmAction::MoveRight => self.move_right,
+            KbmAction::L2 => self.l2,
+            KbmAction::R2 => self.r2,
+            KbmAction::L1 => self.l1,
+            KbmAction::R1 => self.r1,
+            KbmAction::L3 => self.l3,
+            KbmAction::R3 => self.r3,
+            KbmAction::Cross => self.cross,
+            KbmAction::Circle => self.circle,
+            KbmAction::Square => self.square,
+            KbmAction::Triangle => self.triangle,
+            KbmAction::DpadUp => self.dpad_up,
+            KbmAction::DpadDown => self.dpad_down,
+            KbmAction::DpadLeft => self.dpad_left,
+            KbmAction::DpadRight => self.dpad_right,
+            KbmAction::Touchpad => self.touchpad,
+            KbmAction::Options => self.options,
+            KbmAction::Share => self.share,
+            KbmAction::Ps => self.ps,
+        }
+    }
+
+    /// Assigns `new_input` to `action`, automatically swapping if another action already uses it.
+    pub fn set(&mut self, action: KbmAction, new_input: KbmInput) {
+        let prev_input = self.get(action);
+        if prev_input == new_input {
+            return;
+        }
+        for other in KbmAction::ALL {
+            if other != action && self.get(other) == new_input {
+                *self.slot_mut(other) = prev_input;
+                break;
+            }
+        }
+        *self.slot_mut(action) = new_input;
+    }
+
+    /// Returns `true` for window/stream shortcuts reserved against rebinding.
+    pub fn is_reserved_shortcut(input: KbmInput) -> bool {
+        matches!(
+            input,
+            KbmInput::Key(ffi::SDLK_ESCAPE | ffi::SDLK_F3 | ffi::SDLK_F8 | ffi::SDLK_F11)
+        )
+    }
+
     /// Returns a concise multi-line summary of the active keyboard and mouse bindings.
     pub fn summary_tooltip(&self) -> String {
         format!(
@@ -488,5 +649,41 @@ mod tests {
         assert_eq!((merged.l2, merged.r2), (200, 255));
         assert_eq!((merged.left_x, merged.left_y), (-12_000, 4_000));
         assert_eq!((merged.right_x, merged.right_y), (18_000, -9_000));
+    }
+
+    #[test]
+    fn rebinding_covers_all_actions_swaps_duplicates_and_respects_reserved_keys() {
+        let mut bindings = KbmBindings::default();
+        for action in KbmAction::ALL {
+            let current = bindings.get(action);
+            bindings.set(action, current);
+            assert!(!KbmAction::label(action).is_empty());
+        }
+
+        let orig_cross = bindings.get(KbmAction::Cross);
+        let orig_square = bindings.get(KbmAction::Square);
+        assert_ne!(orig_cross, orig_square);
+
+        // Assigning Square's key to Cross must swap them without dropping either binding.
+        bindings.set(KbmAction::Cross, orig_square);
+        assert_eq!(bindings.get(KbmAction::Cross), orig_square);
+        assert_eq!(bindings.get(KbmAction::Square), orig_cross);
+
+        assert!(KbmBindings::is_reserved_shortcut(KbmInput::Key(
+            ffi::SDLK_ESCAPE
+        )));
+        assert!(KbmBindings::is_reserved_shortcut(KbmInput::Key(
+            ffi::SDLK_F3
+        )));
+        assert!(KbmBindings::is_reserved_shortcut(KbmInput::Key(
+            ffi::SDLK_F8
+        )));
+        assert!(KbmBindings::is_reserved_shortcut(KbmInput::Key(
+            ffi::SDLK_F11
+        )));
+        assert!(!KbmBindings::is_reserved_shortcut(KbmInput::Key(
+            ffi::SDLK_E
+        )));
+        assert!(!KbmBindings::is_reserved_shortcut(KbmInput::MouseButton(1)));
     }
 }

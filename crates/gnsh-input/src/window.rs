@@ -1,6 +1,6 @@
 use crate::ffi;
 use crate::gamepad::GamepadManager;
-use crate::kbm::KbmEmulator;
+use crate::kbm::{KbmBindings, KbmEmulator, KbmInput};
 use anyhow::Context;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
@@ -18,6 +18,7 @@ pub struct WindowEventSummary {
     pub toggle_mic: bool,
     pub go_home: bool,
     pub audio_devices_changed: bool,
+    pub last_kbm_input: Option<KbmInput>,
 }
 
 /// Desktop SDL3 window exposing a Win32 `HWND` and translating events into `egui::RawInput`.
@@ -203,6 +204,9 @@ impl AppWindow {
                 ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_DOWN
                 | ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_UP => {
                     let btn = unsafe { event.button };
+                    if event_type == ffi::SDL_EventType_SDL_EVENT_MOUSE_BUTTON_DOWN && btn.down {
+                        summary.last_kbm_input = Some(KbmInput::MouseButton(btn.button));
+                    }
                     if self.mouse_locked {
                         kbm.on_mouse_button(btn.button, btn.down);
                     } else {
@@ -312,6 +316,10 @@ impl AppWindow {
                 ffi::SDLK_ESCAPE => summary.escape_pressed = true,
                 ffi::SDLK_HOME if !modifiers.ctrl && !modifiers.alt => summary.go_home = true,
                 _ => {}
+            }
+            let candidate = KbmInput::Key(key_ev.key);
+            if !KbmBindings::is_reserved_shortcut(candidate) {
+                summary.last_kbm_input = Some(candidate);
             }
         }
 

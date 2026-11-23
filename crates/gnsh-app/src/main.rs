@@ -6,7 +6,10 @@ mod storage;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, select};
 use egui_d3d11::EguiD3d11Painter;
-use gnsh_input::{AppWindow, GamepadManager, KbmConfig, KbmEmulator, merge_controller_states};
+use gnsh_input::{
+    AppWindow, GamepadManager, KbmAction, KbmBindings, KbmConfig, KbmEmulator,
+    merge_controller_states,
+};
 use gnsh_media::{
     AudioOutput, D3D11Renderer, DecodedFrame, HapticsAudioOutput, MediaCodec, MicCapture,
     ScaleMode, VideoDecoder, list_playback_devices, volume_pct_to_gain,
@@ -350,12 +353,37 @@ fn run_gui() -> Result<()> {
 
         let prev_mouse_locked = window.is_relative_mouse_mode();
         let mut escape_for_shortcuts = summary.escape_pressed;
-        if summary.escape_pressed && prev_mouse_locked {
+        let mut toggle_mic_for_shortcuts = summary.toggle_mic;
+        let mut go_home_for_shortcuts = summary.go_home;
+        if app.kbm_modal_open {
+            toggle_mic_for_shortcuts = false;
+            go_home_for_shortcuts = false;
+            if let Some(action) = app.kbm_listening_action {
+                if summary.escape_pressed {
+                    app.kbm_listening_action = None;
+                    escape_for_shortcuts = false;
+                    raw_input.events.clear();
+                } else if let Some(input) = summary.last_kbm_input {
+                    app.settings.kbm_bindings.set(action, input);
+                    app.persist_settings();
+                    app.kbm_listening_action = None;
+                    raw_input.events.clear();
+                }
+            } else if summary.escape_pressed {
+                app.kbm_modal_open = false;
+                escape_for_shortcuts = false;
+                raw_input.events.clear();
+            }
+        }
+        if escape_for_shortcuts && prev_mouse_locked {
             window.set_relative_mouse_mode(false);
             kbm.clear_state();
             escape_for_shortcuts = false;
         }
-        if summary.toggle_mouse_lock && matches!(app.mode, AppMode::Streaming(_)) {
+        if summary.toggle_mouse_lock
+            && !app.kbm_modal_open
+            && matches!(app.mode, AppMode::Streaming(_))
+        {
             if !app.settings.kbm_enabled {
                 app.settings.kbm_enabled = true;
                 app.persist_settings();
@@ -372,8 +400,8 @@ fn run_gui() -> Result<()> {
         app.handle_shortcuts(
             summary.toggle_hud,
             escape_for_shortcuts,
-            summary.toggle_mic,
-            summary.go_home,
+            toggle_mic_for_shortcuts,
+            go_home_for_shortcuts,
         );
         if summary.audio_devices_changed {
             app.audio_devices = list_playback_devices();
@@ -420,6 +448,8 @@ fn run_gui() -> Result<()> {
             || got_new_frame
             || hdr_mode_changed
             || lock_state_changed
+            || app.kbm_modal_open
+            || summary.last_kbm_input.is_some()
             || !raw_input.events.is_empty()
             || summary.resized.is_some()
             || summary.toggle_fullscreen
@@ -456,6 +486,7 @@ fn run_gui() -> Result<()> {
         }
 
         let draw_egui = !is_streaming
+            || app.kbm_modal_open
             || matches!(
                 &app.mode,
                 AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some() || s.osk_prompt.is_some()
@@ -534,6 +565,7 @@ fn run_gui() -> Result<()> {
             }
         }
         let allow_mouse_lock = app.settings.kbm_enabled
+            && !app.kbm_modal_open
             && matches!(
                 &app.mode,
                 AppMode::Streaming(s) if s.pin_prompt.is_none() && s.osk_prompt.is_none()
@@ -1378,6 +1410,8 @@ struct AppState {
     settings: StreamSettings,
     status_banner: Option<StatusBanner>,
     register_modal: Option<RegisterModal>,
+    kbm_modal_open: bool,
+    kbm_listening_action: Option<KbmAction>,
     mode: AppMode,
     pending_home_action: Option<HomeAction>,
     pending_stream_connect: Option<usize>,
@@ -1402,6 +1436,8 @@ impl AppState {
             settings,
             status_banner,
             register_modal: None,
+            kbm_modal_open: false,
+            kbm_listening_action: None,
             mode: AppMode::Home,
             pending_home_action: None,
             pending_stream_connect: None,
@@ -1803,6 +1839,7 @@ impl AppState {
                 let pad_state = gamepads.poll_state(self.settings.touchpad_touch);
                 let kbm_active = self.settings.kbm_enabled
                     && mouse_locked
+                    && !self.kbm_modal_open
                     && stream.pin_prompt.is_none()
                     && stream.osk_prompt.is_none();
                 let kbm_state = if kbm_active {
@@ -1932,9 +1969,11 @@ impl AppState {
                     &self.audio_devices,
                     hdr_output_active,
                     mouse_locked,
+                    &mut self.kbm_modal_open,
                 );
             }
         }
+        self.render_kbm_bindings_modal(ui.ctx());
         if self.settings != prev_settings {
             if let AppMode::Streaming(ref stream) = self.mode {
                 if self.settings.volume_pct != prev_settings.volume_pct {
@@ -2115,7 +2154,12 @@ impl AppState {
                         );
 
                     ui.separator();
-                    render_kbm_controls(ui, &mut self.settings, None);
+                    render_kbm_controls(
+                        ui,
+                        &mut self.settings,
+                        None,
+                        &mut self.kbm_modal_open,
+                    );
                 });
             });
 
@@ -2720,13 +2764,111 @@ fn render_audio_device_combo(
         });
 }
 
+impl AppState {
+    fn render_kbm_bindings_modal(&mut self, ctx: &egui::Context) {
+        if !self.kbm_modal_open {
+            self.kbm_listening_action = None;
+            return;
+        }
+        let mut open = self.kbm_modal_open;
+        let mut close_clicked = false;
+        egui::Window::new("KB+M DualSense Keybindings")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                if let Some(listening) = self.kbm_listening_action {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Listening for {}: Press any key or mouse button (Esc to cancel)",
+                            listening.label()
+                        ))
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 208, 122)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Click any action below to bind a keyboard key or mouse button (1-5). Duplicate bindings swap automatically. Reserved: Esc, F3, F8, F11.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("kbm_bindings_grid")
+                            .num_columns(2)
+                            .striped(true)
+                            .spacing([24.0, 6.0])
+                            .show(ui, |ui| {
+                                for action in KbmAction::ALL {
+                                    ui.label(action.label());
+                                    let is_listening = self.kbm_listening_action == Some(action);
+                                    let btn_label = if is_listening {
+                                        "> Press key/mouse <".to_string()
+                                    } else {
+                                        self.settings.kbm_bindings.get(action).label()
+                                    };
+                                    let mut button = egui::Button::new(
+                                        egui::RichText::new(btn_label).color(egui::Color32::WHITE),
+                                    );
+                                    if is_listening {
+                                        button = button.fill(egui::Color32::from_rgb(0, 112, 209));
+                                    }
+                                    if ui.add_sized([165.0, 22.0], button).clicked() {
+                                        self.kbm_listening_action = if is_listening {
+                                            None
+                                        } else {
+                                            Some(action)
+                                        };
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reset to Defaults").clicked() {
+                        self.settings.kbm_bindings = KbmBindings::default();
+                        self.kbm_listening_action = None;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                });
+            });
+
+        if !open || close_clicked {
+            self.kbm_modal_open = false;
+            self.kbm_listening_action = None;
+        }
+    }
+}
+
 fn render_kbm_controls(
     ui: &mut egui::Ui,
     settings: &mut StreamSettings,
     mouse_lock: Option<(bool, &mut bool)>,
+    open_keybinds: &mut bool,
 ) {
     ui.checkbox(&mut settings.kbm_enabled, "KB+M")
         .on_hover_text(settings.kbm_bindings.summary_tooltip());
+    if ui
+        .button("Keybinds...")
+        .on_hover_text("Customize keyboard & mouse bindings for all DualSense buttons")
+        .clicked()
+    {
+        *open_keybinds = true;
+    }
     if !settings.kbm_enabled {
         return;
     }
@@ -2776,6 +2918,7 @@ fn render_kbm_controls(
         .on_hover_text("Invert vertical mouse camera axis");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_streaming_ui(
     ui: &mut egui::Ui,
     stream: &mut ActiveStream,
@@ -2784,6 +2927,7 @@ fn render_streaming_ui(
     audio_devices: &[String],
     hdr_output_active: bool,
     mouse_locked: bool,
+    open_keybinds: &mut bool,
 ) {
     if stream.show_hud {
         egui::Area::new(egui::Id::unique("stream_hud"))
@@ -2926,6 +3070,7 @@ fn render_streaming_ui(
                                 ui,
                                 settings,
                                 Some((mouse_locked, &mut stream.mouse_lock_toggle_requested)),
+                                open_keybinds,
                             );
                         });
 
