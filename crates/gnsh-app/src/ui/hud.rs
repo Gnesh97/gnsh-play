@@ -104,7 +104,13 @@ fn render_hud_top_pill(
     let (decode_ms_text, decoder_badge) = match &stream.current_frame {
         Some(info) => (
             format!("{:.2} ms", info.decode_ms),
-            if info.is_hw { "D3D11VA" } else { "SW" },
+            if !info.is_hw {
+                "SW"
+            } else if active_renderer_short == "D3D12" {
+                "D3D12VA"
+            } else {
+                "D3D11VA"
+            },
         ),
         None => ("-- ms".to_string(), "Pending"),
     };

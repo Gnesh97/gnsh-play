@@ -1,6 +1,6 @@
 use crate::egui_d3d11::{clip_rect_to_scissor, color_image_to_rgba8};
 use anyhow::{Context as _, Result, bail};
-use gnsh_media::{UiMeshDraw, UiTextureWrap, VulkanPlaceboRenderer};
+use gnsh_media::{UiMeshDraw, UiOverlayRenderer, UiTextureWrap};
 use std::collections::HashMap;
 
 pub(crate) struct EguiPlaceboPainter {
@@ -18,7 +18,7 @@ impl EguiPlaceboPainter {
 
     pub fn update_textures(
         &mut self,
-        renderer: &mut VulkanPlaceboRenderer,
+        renderer: &mut impl UiOverlayRenderer,
         delta: &egui::TexturesDelta,
     ) -> Result<()> {
         for (id, deltas) in &delta.set {
@@ -61,7 +61,7 @@ impl EguiPlaceboPainter {
 
     pub fn paint(
         &mut self,
-        renderer: &mut VulkanPlaceboRenderer,
+        renderer: &mut impl UiOverlayRenderer,
         screen_size_px: (u32, u32),
         pixels_per_point: f32,
         hdr_output: bool,
@@ -115,7 +115,7 @@ impl EguiPlaceboPainter {
 
     pub fn free_textures(
         &mut self,
-        renderer: &mut VulkanPlaceboRenderer,
+        renderer: &mut impl UiOverlayRenderer,
         delta: &egui::TexturesDelta,
     ) {
         for id in &delta.free {

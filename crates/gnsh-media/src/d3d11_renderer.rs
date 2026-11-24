@@ -39,7 +39,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::core::{BOOL, Interface as _, PCSTR, s};
 
-const VIDEO_VS_HLSL: &str = r#"
+pub(crate) const VIDEO_VS_HLSL: &str = r#"
 cbuffer VideoParams : register(b0) {
     float4 pos_scale;    // xy = scale, zw = offset
     float4 uv_rect;      // xy = active scale, zw = offset
@@ -72,7 +72,7 @@ VSOut VSMain(uint vid : SV_VertexID) {
 }
 "#;
 
-const HLSL_COLOR_CAS_HELPERS: &str = r#"
+pub(crate) const HLSL_COLOR_CAS_HELPERS: &str = r#"
 float3 cas_filter(float3 c, float3 n, float3 s, float3 w, float3 e, float sharpness) {
     float3 min_c = min(c, min(min(n, s), min(w, e)));
     float3 max_c = max(c, max(max(n, s), max(w, e)));
@@ -143,7 +143,7 @@ float3 pq_bt2020_to_sdr_srgb(float3 pq) {
 }
 "#;
 
-const NV12_ARRAY_PS_BODY: &str = r#"
+pub(crate) const NV12_ARRAY_PS_BODY: &str = r#"
 Texture2DArray<float> texY  : register(t0);
 Texture2DArray<float2> texUV : register(t1);
 SamplerState sampLinear : register(s0);
@@ -192,7 +192,7 @@ float4 PSMain(PSIn i) : SV_TARGET {
 }
 "#;
 
-const P010_ARRAY_PS_BODY: &str = r#"
+pub(crate) const P010_ARRAY_PS_BODY: &str = r#"
 Texture2DArray<float> texY  : register(t0);
 Texture2DArray<float2> texUV : register(t1);
 SamplerState sampLinear : register(s0);
@@ -243,12 +243,12 @@ float4 PSMain(PSIn i) : SV_TARGET {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct VideoParams {
-    pos_scale: [f32; 4],
-    uv_rect: [f32; 4],
-    uv_clamp: [f32; 4],
+pub(crate) struct VideoParams {
+    pub(crate) pos_scale: [f32; 4],
+    pub(crate) uv_rect: [f32; 4],
+    pub(crate) uv_clamp: [f32; 4],
     // x = sharpness (0..=1), y = 1.0/tex_w, z = 1.0/tex_h, w = color mode flag
-    sharp_params: [f32; 4],
+    pub(crate) sharp_params: [f32; 4],
 }
 
 impl Default for VideoParams {
@@ -262,7 +262,7 @@ impl Default for VideoParams {
     }
 }
 
-const YUV420_PS_BODY: &str = r#"
+pub(crate) const YUV420_PS_BODY: &str = r#"
 Texture2D<float> texY : register(t0);
 Texture2D<float> texU : register(t1);
 Texture2D<float> texV : register(t2);
@@ -323,7 +323,7 @@ float4 PSMain(PSIn i) : SV_TARGET {
 }
 "#;
 
-const FSR_EASU_PS_HLSL: &str = r#"
+pub(crate) const FSR_EASU_PS_HLSL: &str = r#"
 Texture2D texSrc : register(t0);
 SamplerState sampLinear : register(s0);
 cbuffer FsrParams : register(b0) {
@@ -484,7 +484,7 @@ float4 PSMain(PSIn i) : SV_TARGET {
 }
 "#;
 
-const FSR_RCAS_PS_HLSL: &str = r#"
+pub(crate) const FSR_RCAS_PS_HLSL: &str = r#"
 Texture2D texEasu : register(t0);
 cbuffer FsrParams : register(b0) {
     float4 src_size;
@@ -539,10 +539,10 @@ float4 PSMain(PSIn i) : SV_TARGET {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct FsrParams {
-    src_size: [f32; 4],
-    rcas_bounds: [f32; 4],
-    rcas_params: [f32; 4],
+pub(crate) struct FsrParams {
+    pub(crate) src_size: [f32; 4],
+    pub(crate) rcas_bounds: [f32; 4],
+    pub(crate) rcas_params: [f32; 4],
 }
 
 impl Default for FsrParams {
@@ -1126,6 +1126,7 @@ impl D3D11Renderer {
                 };
                 (*width, *height, *width, *height, None, mode)
             }
+            DecodedFrame::D3D12(f) => (f.width, f.height, f.width, f.height, None, 0.0),
         }
     }
 
@@ -1199,6 +1200,9 @@ impl D3D11Renderer {
             DecodedFrame::D3D11(d3d_frame) => {
                 let fmt = d3d_format.expect("D3D11 format populated");
                 self.draw_d3d11_frame(d3d_frame, tw, th, fmt)?;
+            }
+            DecodedFrame::D3D12(_) => {
+                bail!("D3D11Renderer cannot consume zero-copy D3D12 frames directly");
             }
             DecodedFrame::SoftwareYuv420 {
                 y,
@@ -1913,7 +1917,7 @@ fn upload_plane(
     Ok(())
 }
 
-fn unpack_nv12_chroma(
+pub(crate) fn unpack_nv12_chroma(
     uv: &[u8],
     uv_stride: usize,
     width: u32,
@@ -1939,7 +1943,7 @@ fn unpack_nv12_chroma(
     (u, v, cw)
 }
 
-fn unpack_p010_to_yuv8(
+pub(crate) fn unpack_p010_to_yuv8(
     y: &[u8],
     uv: &[u8],
     y_stride: usize,
@@ -1981,7 +1985,7 @@ fn unpack_p010_to_yuv8(
     (y8, u8_buf, v8_buf, w, cw)
 }
 
-fn aspect_scale(
+pub(crate) fn aspect_scale(
     frame_w: u32,
     frame_h: u32,
     view_w: u32,
@@ -2016,7 +2020,7 @@ fn aspect_scale(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_video_params(
+pub(crate) fn compute_video_params(
     frame_w: u32,
     frame_h: u32,
     tex_w: u32,

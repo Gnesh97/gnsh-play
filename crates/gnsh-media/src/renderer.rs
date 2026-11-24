@@ -59,7 +59,43 @@ impl Default for VideoRenderOptions {
     }
 }
 
-/// Backend-agnostic video presentation interface (implemented by `D3D11Renderer`, extensible to Vulkan/`libplacebo`).
+/// Texture wrap mode for UI overlay meshes painted onto `Vulkan` or `D3D12` swapchains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiTextureWrap {
+    ClampToEdge,
+    Repeat,
+    MirroredRepeat,
+}
+
+/// Draw parameters for one scissored egui mesh rendered over a `UiOverlayRenderer`.
+pub struct UiMeshDraw<'a> {
+    pub tex_id: u64,
+    pub linear_filter: bool,
+    pub wrap: UiTextureWrap,
+    pub vertices_bytes: &'a [u8],
+    pub indices: &'a [u32],
+    pub scissor: [i32; 4],
+    pub screen_size_pts: [f32; 2],
+    pub hdr_paper_white_nits: f32,
+}
+
+/// Shared safe UI texture & mesh overlay interface implemented by `VulkanPlaceboRenderer` and `D3D12Renderer`.
+pub trait UiOverlayRenderer {
+    fn upsert_ui_texture(&mut self, id: u64, w: u32, h: u32, rgba: &[u8]) -> Result<()>;
+    fn update_ui_texture_region(
+        &mut self,
+        id: u64,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+    ) -> Result<()>;
+    fn free_ui_texture(&mut self, id: u64);
+    fn draw_ui_mesh(&mut self, draw: UiMeshDraw<'_>) -> Result<()>;
+}
+
+/// Backend-agnostic video presentation interface (implemented by `D3D11Renderer`, `VulkanPlaceboRenderer`, `D3D12Renderer`).
 pub trait VideoRenderer {
     fn viewport_size(&self) -> (u32, u32);
     fn resize(&mut self, width: u32, height: u32) -> Result<()>;

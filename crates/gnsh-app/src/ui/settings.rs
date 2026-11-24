@@ -72,7 +72,7 @@ pub(crate) fn render_renderer_backend_selector(ui: &mut egui::Ui, backend: &mut 
             );
         ui.selectable_value(backend, RendererBackend::D3D12, "D3D12")
             .on_hover_text(
-                "Direct3D 12 + D3D12VA coming in Milestone 3B (falls back to Direct3D 11 for now).",
+                "Native Direct3D 12 renderer with zero-copy D3D12VA decode + HLSL CAS / FSR 1.0. Restart required.",
             );
     });
 }

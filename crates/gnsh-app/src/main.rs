@@ -22,8 +22,8 @@ use gnsh_input::{
     AppWindow, GamepadManager, KbmAction, KbmConfig, KbmEmulator, merge_controller_states,
 };
 use gnsh_media::{
-    D3D11Renderer, DecoderHardware, RendererBackend, VideoRenderOptions, VideoRenderer,
-    VulkanPlaceboRenderer, list_playback_devices, list_recording_devices,
+    D3D11Renderer, D3D12Renderer, DecoderHardware, RendererBackend, VideoRenderOptions,
+    VideoRenderer, VulkanPlaceboRenderer, list_playback_devices, list_recording_devices,
 };
 use gnsh_proto::{
     ControllerState, DiscoveredConsole, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES,
@@ -277,10 +277,38 @@ enum ActiveBackend {
         renderer: D3D11Renderer,
         egui: EguiD3d11Painter,
     },
+    D3D12 {
+        renderer: Box<D3D12Renderer>,
+        egui: EguiPlaceboPainter,
+    },
     Vulkan {
         renderer: VulkanPlaceboRenderer,
         egui: EguiPlaceboPainter,
     },
+}
+
+fn paint_egui_overlay<R: VideoRenderer + gnsh_media::UiOverlayRenderer>(
+    label: &str,
+    renderer: &mut R,
+    egui: &mut EguiPlaceboPainter,
+    textures_delta: &egui::TexturesDelta,
+    pixels_per_point: f32,
+    clipped: &[egui::ClippedPrimitive],
+    hdr_output_active: bool,
+) {
+    if let Err(err) = egui.update_textures(renderer, textures_delta) {
+        tracing::warn!("{label} egui texture upload failed: {err:#}");
+    }
+    if let Err(err) = egui.paint(
+        renderer,
+        renderer.viewport_size(),
+        pixels_per_point,
+        hdr_output_active,
+        clipped,
+    ) {
+        tracing::warn!("{label} egui paint failed: {err:#}");
+    }
+    egui.free_textures(renderer, textures_delta);
 }
 
 impl ActiveBackend {
@@ -344,10 +372,35 @@ impl ActiveBackend {
                     }
                 }
             }
-        } else if requested == RendererBackend::D3D12 && initial_banner.is_none() {
-            *initial_banner = Some(StatusBanner::info(
-                "Direct3D 12 arrives in Milestone 3B; currently running Direct3D 11.",
-            ));
+        } else if requested == RendererBackend::D3D12 {
+            let window = AppWindow::new("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT)
+                .context("failed creating application window")?;
+            apply_window_icon(window.hwnd());
+            let (init_w, init_h) = window.size();
+            match D3D12Renderer::new(window.hwnd(), init_w, init_h) {
+                Ok(renderer) => {
+                    return Ok((
+                        window,
+                        Self::D3D12 {
+                            renderer: Box::new(renderer),
+                            egui: EguiPlaceboPainter::new(),
+                        },
+                    ));
+                }
+                Err(err) => {
+                    tracing::warn!("Direct3D 12 init failed, using Direct3D 11: {err:#}");
+                    if initial_banner.is_none() {
+                        *initial_banner = Some(StatusBanner::info(format!(
+                            "Direct3D 12 unavailable ({err}); fell back to Direct3D 11."
+                        )));
+                    }
+                    let renderer = D3D11Renderer::new(window.hwnd(), init_w, init_h)
+                        .context("failed initializing D3D11 fallback renderer")?;
+                    let egui = EguiD3d11Painter::new(renderer.device())
+                        .context("failed initializing egui D3D11 painter")?;
+                    return Ok((window, Self::D3D11 { renderer, egui }));
+                }
+            }
         }
 
         let window = AppWindow::new("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT)
@@ -364,6 +417,7 @@ impl ActiveBackend {
     fn label(&self) -> &'static str {
         match self {
             Self::D3D11 { .. } => "Direct3D 11",
+            Self::D3D12 { .. } => "Direct3D 12",
             Self::Vulkan { .. } => "Vulkan (libplacebo)",
         }
     }
@@ -371,6 +425,7 @@ impl ActiveBackend {
     fn short_label(&self) -> &'static str {
         match self {
             Self::D3D11 { .. } => "D3D11",
+            Self::D3D12 { .. } => "D3D12",
             Self::Vulkan { .. } => "Vulkan",
         }
     }
@@ -380,6 +435,9 @@ impl ActiveBackend {
             Self::D3D11 { renderer, .. } => {
                 DecoderHardware::D3D11ZeroCopy(renderer.device().clone())
             }
+            Self::D3D12 { renderer, .. } => {
+                DecoderHardware::D3D12ZeroCopy(renderer.device().clone())
+            }
             Self::Vulkan { .. } => DecoderHardware::D3D11Transfer,
         }
     }
@@ -387,6 +445,7 @@ impl ActiveBackend {
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         match self {
             Self::D3D11 { renderer, .. } => VideoRenderer::resize(renderer, width, height),
+            Self::D3D12 { renderer, .. } => VideoRenderer::resize(renderer.as_mut(), width, height),
             Self::Vulkan { renderer, .. } => VideoRenderer::resize(renderer, width, height),
         }
     }
@@ -394,6 +453,9 @@ impl ActiveBackend {
     fn wait_for_frame_latency(&self, timeout_ms: u32) {
         match self {
             Self::D3D11 { renderer, .. } => renderer.wait_for_frame_latency(timeout_ms),
+            Self::D3D12 { renderer, .. } => {
+                VideoRenderer::wait_for_frame_latency(renderer.as_ref(), timeout_ms)
+            }
             Self::Vulkan { renderer, .. } => renderer.wait_for_frame_latency(timeout_ms),
         }
     }
@@ -401,6 +463,7 @@ impl ActiveBackend {
     fn clear_video_cache(&mut self) {
         match self {
             Self::D3D11 { renderer, .. } => renderer.clear_video_cache(),
+            Self::D3D12 { renderer, .. } => VideoRenderer::clear_video_cache(renderer.as_mut()),
             Self::Vulkan { renderer, .. } => renderer.clear_video_cache(),
         }
     }
@@ -408,6 +471,7 @@ impl ActiveBackend {
     fn is_hdr_output_active(&self) -> bool {
         match self {
             Self::D3D11 { renderer, .. } => VideoRenderer::is_hdr_output_active(renderer),
+            Self::D3D12 { renderer, .. } => VideoRenderer::is_hdr_output_active(renderer.as_ref()),
             Self::Vulkan { renderer, .. } => VideoRenderer::is_hdr_output_active(renderer),
         }
     }
@@ -415,13 +479,16 @@ impl ActiveBackend {
     fn set_hdr_output(&mut self, enable: bool) -> Result<bool> {
         match self {
             Self::D3D11 { renderer, .. } => VideoRenderer::set_hdr_output(renderer, enable),
+            Self::D3D12 { renderer, .. } => {
+                VideoRenderer::set_hdr_output(renderer.as_mut(), enable)
+            }
             Self::Vulkan { renderer, .. } => VideoRenderer::set_hdr_output(renderer, enable),
         }
     }
 
     fn set_vsync(&mut self, vsync: bool) -> Result<()> {
         match self {
-            Self::D3D11 { .. } => Ok(()),
+            Self::D3D11 { .. } | Self::D3D12 { .. } => Ok(()),
             Self::Vulkan { renderer, .. } => renderer.set_vsync(vsync),
         }
     }
@@ -429,6 +496,9 @@ impl ActiveBackend {
     fn begin_frame(&self, clear_rgba: [f32; 4]) {
         match self {
             Self::D3D11 { renderer, .. } => VideoRenderer::begin_frame(renderer, clear_rgba),
+            Self::D3D12 { renderer, .. } => {
+                VideoRenderer::begin_frame(renderer.as_ref(), clear_rgba)
+            }
             Self::Vulkan { renderer, .. } => VideoRenderer::begin_frame(renderer, clear_rgba),
         }
     }
@@ -441,6 +511,9 @@ impl ActiveBackend {
         match self {
             Self::D3D11 { renderer, .. } => {
                 VideoRenderer::draw_video_frame(renderer, frame, options)
+            }
+            Self::D3D12 { renderer, .. } => {
+                VideoRenderer::draw_video_frame(renderer.as_mut(), frame, options)
             }
             Self::Vulkan { renderer, .. } => {
                 VideoRenderer::draw_video_frame(renderer, frame, options)
@@ -475,27 +548,31 @@ impl ActiveBackend {
                 }
                 egui.free_textures(textures_delta);
             }
-            Self::Vulkan { renderer, egui } => {
-                if let Err(err) = egui.update_textures(renderer, textures_delta) {
-                    tracing::warn!("Vulkan egui texture upload failed: {err:#}");
-                }
-                if let Err(err) = egui.paint(
-                    renderer,
-                    VideoRenderer::viewport_size(renderer),
-                    pixels_per_point,
-                    hdr_output_active,
-                    clipped,
-                ) {
-                    tracing::warn!("Vulkan egui paint failed: {err:#}");
-                }
-                egui.free_textures(renderer, textures_delta);
-            }
+            Self::D3D12 { renderer, egui } => paint_egui_overlay(
+                "D3D12",
+                renderer.as_mut(),
+                egui,
+                textures_delta,
+                pixels_per_point,
+                clipped,
+                hdr_output_active,
+            ),
+            Self::Vulkan { renderer, egui } => paint_egui_overlay(
+                "Vulkan",
+                renderer,
+                egui,
+                textures_delta,
+                pixels_per_point,
+                clipped,
+                hdr_output_active,
+            ),
         }
     }
 
     fn present(&self, vsync: bool) -> Result<()> {
         match self {
             Self::D3D11 { renderer, .. } => VideoRenderer::present(renderer, vsync),
+            Self::D3D12 { renderer, .. } => VideoRenderer::present(renderer.as_ref(), vsync),
             Self::Vulkan { renderer, .. } => VideoRenderer::present(renderer, vsync),
         }
     }

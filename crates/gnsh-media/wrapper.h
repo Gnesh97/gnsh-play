@@ -5,6 +5,7 @@
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/hwcontext_d3d12va.h>
 #include <libavutil/pixfmt.h>
 #include <libplacebo/dither.h>
 #include <libplacebo/renderer.h>

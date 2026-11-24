@@ -1,5 +1,8 @@
 use crate::ffi;
-use crate::renderer::{ScaleMode, VideoFilterMode, VideoRenderOptions, VideoRenderer};
+use crate::renderer::{
+    ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode, VideoRenderOptions,
+    VideoRenderer,
+};
 use crate::video_decoder::DecodedFrame;
 use anyhow::{Context, Result, bail};
 use std::cell::Cell;
@@ -83,34 +86,12 @@ struct UiPushConstants {
     flipped: f32,
 }
 
-/// Texture wrap mode for UI overlay meshes painted onto the `libplacebo` swapchain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiTextureWrap {
-    ClampToEdge,
-    Repeat,
-    MirroredRepeat,
-}
-
-impl UiTextureWrap {
-    fn to_pl(self) -> ffi::pl_tex_address_mode {
-        match self {
-            Self::ClampToEdge => ffi::pl_tex_address_mode_PL_TEX_ADDRESS_CLAMP,
-            Self::Repeat => ffi::pl_tex_address_mode_PL_TEX_ADDRESS_REPEAT,
-            Self::MirroredRepeat => ffi::pl_tex_address_mode_PL_TEX_ADDRESS_MIRROR,
-        }
+fn map_ui_wrap_mode(wrap: UiTextureWrap) -> ffi::pl_tex_address_mode {
+    match wrap {
+        UiTextureWrap::ClampToEdge => ffi::pl_tex_address_mode_PL_TEX_ADDRESS_CLAMP,
+        UiTextureWrap::Repeat => ffi::pl_tex_address_mode_PL_TEX_ADDRESS_REPEAT,
+        UiTextureWrap::MirroredRepeat => ffi::pl_tex_address_mode_PL_TEX_ADDRESS_MIRROR,
     }
-}
-
-/// Draw parameters for one scissored egui mesh rendered over the Vulkan swapchain.
-pub struct UiMeshDraw<'a> {
-    pub tex_id: u64,
-    pub linear_filter: bool,
-    pub wrap: UiTextureWrap,
-    pub vertices_bytes: &'a [u8],
-    pub indices: &'a [u32],
-    pub scissor: [i32; 4],
-    pub screen_size_pts: [f32; 2],
-    pub hdr_paper_white_nits: f32,
 }
 
 pub struct VulkanPlaceboRenderer {
@@ -500,7 +481,7 @@ impl VulkanPlaceboRenderer {
         };
         let mut binding = ffi::pl_desc_binding {
             object: tex.cast(),
-            address_mode: draw.wrap.to_pl(),
+            address_mode: map_ui_wrap_mode(draw.wrap),
             sample_mode: if draw.linear_filter {
                 ffi::pl_tex_sample_mode_PL_TEX_SAMPLE_LINEAR
             } else {
@@ -690,8 +671,8 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         let gpu = unsafe { (*self.vk).gpu };
         let mut src_frame: ffi::pl_frame = unsafe { std::mem::zeroed() };
         let (fw, fh, is_hdr, used_planes) = match frame {
-            DecodedFrame::D3D11(_) => {
-                bail!("VulkanPlaceboRenderer cannot consume zero-copy D3D11 frames directly");
+            DecodedFrame::D3D11(_) | DecodedFrame::D3D12(_) => {
+                bail!("VulkanPlaceboRenderer cannot consume zero-copy D3D11/D3D12 frames directly");
             }
             DecodedFrame::SoftwareNv12 {
                 y,
@@ -1000,6 +981,32 @@ impl VideoRenderer for VulkanPlaceboRenderer {
             ffi::pl_swapchain_swap_buffers(self.sw);
         }
         Ok(())
+    }
+}
+
+impl UiOverlayRenderer for VulkanPlaceboRenderer {
+    fn upsert_ui_texture(&mut self, id: u64, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
+        VulkanPlaceboRenderer::upsert_ui_texture(self, id, w, h, rgba)
+    }
+
+    fn update_ui_texture_region(
+        &mut self,
+        id: u64,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+    ) -> Result<()> {
+        VulkanPlaceboRenderer::update_ui_texture_region(self, id, x, y, w, h, rgba)
+    }
+
+    fn free_ui_texture(&mut self, id: u64) {
+        VulkanPlaceboRenderer::free_ui_texture(self, id);
+    }
+
+    fn draw_ui_mesh(&mut self, draw: UiMeshDraw<'_>) -> Result<()> {
+        VulkanPlaceboRenderer::draw_ui_mesh(self, draw)
     }
 }
 

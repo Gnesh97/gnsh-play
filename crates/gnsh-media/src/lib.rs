@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod d3d11_renderer;
+pub mod d3d12_renderer;
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,
@@ -20,10 +21,12 @@ pub use audio::{
     volume_pct_to_gain,
 };
 pub use d3d11_renderer::D3D11Renderer;
+pub use d3d12_renderer::D3D12Renderer;
 pub use renderer::{
-    RendererBackend, ScaleMode, VideoFilterMode, VideoRenderOptions, VideoRenderer,
+    RendererBackend, ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode,
+    VideoRenderOptions, VideoRenderer,
 };
-pub use video_decoder::{D3D11Frame, DecodedFrame, DecoderHardware, MediaCodec, VideoDecoder};
-pub use vulkan_renderer::{
-    UiMeshDraw, UiTextureWrap, VulkanPlaceboRenderer, compute_placebo_target_rect,
+pub use video_decoder::{
+    D3D11Frame, D3D12Frame, DecodedFrame, DecoderHardware, MediaCodec, VideoDecoder,
 };
+pub use vulkan_renderer::{VulkanPlaceboRenderer, compute_placebo_target_rect};

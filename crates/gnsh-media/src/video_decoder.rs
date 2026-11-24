@@ -2,10 +2,12 @@ use crate::ffi;
 use anyhow::{Context, Result, bail};
 use std::ffi::CStr;
 use std::os::raw::c_void;
+use std::sync::Arc;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, ID3D11Device, ID3D11Multithread,
     ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Fence, ID3D12Resource};
 use windows::core::Interface as _;
 
 const MAX_VIDEO_PACKET_BYTES: usize = 16 * 1024 * 1024;
@@ -18,11 +20,12 @@ pub enum MediaCodec {
     HevcHdr,
 }
 
-struct AvFrameGuard {
+pub(crate) struct AvFrameGuard {
     ptr: *mut ffi::AVFrame,
 }
 
 unsafe impl Send for AvFrameGuard {}
+unsafe impl Sync for AvFrameGuard {}
 
 impl Drop for AvFrameGuard {
     fn drop(&mut self) {
@@ -45,16 +48,37 @@ pub struct D3D11Frame {
     _av_frame: AvFrameGuard,
 }
 
+pub struct D3D12Frame {
+    pub texture: ID3D12Resource,
+    pub subresource_index: u32,
+    pub fence: Option<ID3D12Fence>,
+    pub fence_value: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pts: i64,
+    pub is_hdr: bool,
+    // Keeps FFmpeg's D3D12VA resource pool slot alive until the graphics queue finishes reading it.
+    pub(crate) _av_frame: Arc<AvFrameGuard>,
+}
+
+impl D3D12Frame {
+    pub(crate) fn pin_guard(&self) -> Arc<AvFrameGuard> {
+        Arc::clone(&self._av_frame)
+    }
+}
+
 /// Hardware acceleration mode for `VideoDecoder`.
 #[derive(Debug, Clone)]
 pub enum DecoderHardware {
     None,
     D3D11ZeroCopy(ID3D11Device),
     D3D11Transfer,
+    D3D12ZeroCopy(ID3D12Device),
 }
 
 pub enum DecodedFrame {
     D3D11(D3D11Frame),
+    D3D12(D3D12Frame),
     SoftwareYuv420 {
         y: Vec<u8>,
         u: Vec<u8>,
@@ -94,6 +118,7 @@ impl DecodedFrame {
     pub fn pts(&self) -> i64 {
         match self {
             Self::D3D11(frame) => frame.pts,
+            Self::D3D12(frame) => frame.pts,
             Self::SoftwareYuv420 { pts, .. }
             | Self::SoftwareNv12 { pts, .. }
             | Self::SoftwareP010 { pts, .. } => *pts,
@@ -104,6 +129,7 @@ impl DecodedFrame {
     pub fn is_hdr(&self) -> bool {
         match self {
             Self::D3D11(frame) => frame.is_hdr,
+            Self::D3D12(frame) => frame.is_hdr,
             Self::SoftwareYuv420 { is_hdr, .. }
             | Self::SoftwareNv12 { is_hdr, .. }
             | Self::SoftwareP010 { is_hdr, .. } => *is_hdr,
@@ -342,6 +368,9 @@ impl VideoDecoder {
                         tracing::warn!(
                             "D3D11VA device setup failed, using software decoder: {e:#}"
                         );
+                        unsafe {
+                            (*ctx).thread_count = 4;
+                        }
                     }
                 }
             }
@@ -360,6 +389,27 @@ impl VideoDecoder {
                     Err(e) => {
                         tracing::warn!(
                             "D3D11VA transfer setup failed, using software decoder: {e:#}"
+                        );
+                        unsafe {
+                            (*ctx).thread_count = 4;
+                        }
+                    }
+                }
+            }
+            DecoderHardware::D3D12ZeroCopy(dev) => {
+                match unsafe { create_d3d12va_device_ctx(&dev) } {
+                    Ok(buf_ref) => {
+                        unsafe {
+                            (*ctx).hw_device_ctx = ffi::av_buffer_ref(buf_ref);
+                            (*ctx).get_format = Some(select_d3d12_format);
+                            (*ctx).thread_count = 1;
+                        }
+                        hw_device_ctx = buf_ref;
+                        hw_active = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "D3D12VA device setup failed, using software decoder: {e:#}"
                         );
                         unsafe {
                             (*ctx).thread_count = 4;
@@ -474,14 +524,39 @@ unsafe fn create_d3d11va_device_ctx(dev: &ID3D11Device) -> Result<*mut ffi::AVBu
     Ok(hw_ref)
 }
 
-unsafe extern "C" fn select_d3d11_format(
-    _ctx: *mut ffi::AVCodecContext,
+unsafe fn create_d3d12va_device_ctx(dev: &ID3D12Device) -> Result<*mut ffi::AVBufferRef> {
+    let mut hw_ref =
+        unsafe { ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType_AV_HWDEVICE_TYPE_D3D12VA) };
+    if hw_ref.is_null() {
+        bail!("av_hwdevice_ctx_alloc(D3D12VA) returned null");
+    }
+
+    unsafe {
+        let hw_dev_ctx = (*hw_ref).data.cast::<ffi::AVHWDeviceContext>();
+        let d3d12_ctx = (*hw_dev_ctx).hwctx.cast::<ffi::AVD3D12VADeviceContext>();
+        (*d3d12_ctx).device = dev.clone().into_raw().cast();
+
+        let init_err = ffi::av_hwdevice_ctx_init(hw_ref);
+        if init_err < 0 {
+            ffi::av_buffer_unref(&mut hw_ref);
+            bail!(
+                "av_hwdevice_ctx_init(D3D12VA) failed: {}",
+                av_err_string(init_err)
+            );
+        }
+    }
+
+    Ok(hw_ref)
+}
+
+unsafe fn select_hw_pix_fmt(
     pix_fmts: *const ffi::AVPixelFormat,
+    preferred: ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
     let mut p = pix_fmts;
     while !p.is_null() && unsafe { *p } != ffi::AVPixelFormat_AV_PIX_FMT_NONE {
-        if unsafe { *p } == ffi::AVPixelFormat_AV_PIX_FMT_D3D11 {
-            return ffi::AVPixelFormat_AV_PIX_FMT_D3D11;
+        if unsafe { *p } == preferred {
+            return preferred;
         }
         p = unsafe { p.add(1) };
     }
@@ -490,6 +565,20 @@ unsafe extern "C" fn select_d3d11_format(
     } else {
         ffi::AVPixelFormat_AV_PIX_FMT_NONE
     }
+}
+
+unsafe extern "C" fn select_d3d11_format(
+    _ctx: *mut ffi::AVCodecContext,
+    pix_fmts: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    unsafe { select_hw_pix_fmt(pix_fmts, ffi::AVPixelFormat_AV_PIX_FMT_D3D11) }
+}
+
+unsafe extern "C" fn select_d3d12_format(
+    _ctx: *mut ffi::AVCodecContext,
+    pix_fmts: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    unsafe { select_hw_pix_fmt(pix_fmts, ffi::AVPixelFormat_AV_PIX_FMT_D3D12) }
 }
 
 unsafe fn extract_frame(
@@ -522,6 +611,42 @@ unsafe fn extract_frame(
         return Ok(Some(DecodedFrame::D3D11(D3D11Frame {
             texture,
             slice_index,
+            width,
+            height,
+            pts,
+            is_hdr,
+            _av_frame: guard,
+        })));
+    }
+
+    if fmt == ffi::AVPixelFormat_AV_PIX_FMT_D3D12 {
+        let cloned = unsafe { ffi::av_frame_clone(src) };
+        if cloned.is_null() {
+            bail!("av_frame_clone returned null");
+        }
+        let guard = Arc::new(AvFrameGuard { ptr: cloned });
+        let frame_ptr = unsafe { (*cloned).data[0].cast::<ffi::AVD3D12VAFrame>() };
+        if frame_ptr.is_null() {
+            bail!("AVFrame D3D12VA frame pointer was null");
+        }
+        let raw_tex = unsafe { (*frame_ptr).texture.cast::<c_void>() };
+        let texture = unsafe { ID3D12Resource::from_raw_borrowed(&raw_tex) }
+            .context("AVD3D12VAFrame texture pointer was null")?
+            .clone();
+        let raw_fence = unsafe { (*frame_ptr).sync_ctx.fence.cast::<c_void>() };
+        let fence = if raw_fence.is_null() {
+            None
+        } else {
+            unsafe { ID3D12Fence::from_raw_borrowed(&raw_fence) }.cloned()
+        };
+        let fence_value = unsafe { (*frame_ptr).sync_ctx.fence_value };
+        let subresource_index =
+            u32::try_from(unsafe { (*frame_ptr).subresource_index }.max(0)).unwrap_or(0);
+        return Ok(Some(DecodedFrame::D3D12(D3D12Frame {
+            texture,
+            subresource_index,
+            fence,
+            fence_value,
             width,
             height,
             pts,
@@ -803,6 +928,7 @@ mod tests {
                 assert_eq!((*width, *height), (64, 64));
             }
             DecodedFrame::D3D11(_)
+            | DecodedFrame::D3D12(_)
             | DecodedFrame::SoftwareNv12 { .. }
             | DecodedFrame::SoftwareP010 { .. } => panic!("expected software YUV420 frame"),
         }
@@ -972,5 +1098,23 @@ mod tests {
             !matches!(frames[0], DecodedFrame::D3D11(_)),
             "transfer mode must never emit D3D11 zero-copy textures"
         );
+    }
+
+    #[test]
+    fn initializes_d3d12va_zero_copy_and_decodes_idr_or_falls_back() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
+
+        let mut device: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device) }.is_err() {
+            eprintln!("skipping D3D12VA test: no D3D12 device available");
+            return;
+        }
+        let dev = device.expect("D3D12CreateDevice populated device");
+        let mut decoder =
+            VideoDecoder::new_with_mode(MediaCodec::H264, DecoderHardware::D3D12ZeroCopy(dev))
+                .expect("D3D12ZeroCopy or software fallback initializes");
+        let frames = decoder.decode(TEST_H264_IDR).expect("IDR decode ok");
+        assert!(!frames.is_empty(), "expected decoded IDR frame");
     }
 }
