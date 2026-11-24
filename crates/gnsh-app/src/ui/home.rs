@@ -415,6 +415,16 @@ fn render_saved_console_card(
                 {
                     *pending_action = Some(HomeAction::CreateShortcut(idx));
                 }
+                if saved.remote_host.is_some()
+                    && ui
+                        .add(theme::secondary_button("Shortcut (WAN)"))
+                        .on_hover_text(
+                            "Create Desktop shortcut for direct fullscreen WAN launch (--wan)",
+                        )
+                        .clicked()
+                {
+                    *pending_action = Some(HomeAction::CreateShortcutWan(idx));
+                }
                 if ui.add(theme::secondary_button("Edit")).clicked() {
                     *pending_action = Some(HomeAction::EditSaved(idx));
                 }

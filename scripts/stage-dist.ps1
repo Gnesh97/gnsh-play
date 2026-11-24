@@ -1,3 +1,8 @@
+param(
+    [switch]$Zip,
+    [string]$OutDir = "dist-packages"
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -58,6 +63,34 @@ try {
     $totalMiB = [math]::Round($totalBytes / 1MB, 2)
 
     Write-Host "Staged $($dllNames.Count) MinGW64 DLL(s), $totalFiles total file(s), $totalMiB MiB in $distDir"
+
+    if ($Zip) {
+        $cargoToml = Get-Content -Path (Join-Path $repoRoot "Cargo.toml") -Raw
+        if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw "Could not parse workspace version from Cargo.toml"
+        }
+        $version = $Matches[1]
+
+        $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) {
+            $OutDir
+        } else {
+            Join-Path $repoRoot $OutDir
+        }
+        $null = New-Item -ItemType Directory -Path $outRoot -Force
+
+        $zipName = "gnsh-play-v$version-win64.zip"
+        $zipPath = Join-Path $outRoot $zipName
+        if (Test-Path $zipPath) {
+            Remove-Item -Force $zipPath
+        }
+        Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -Force
+
+        $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $shaPath = "$zipPath.sha256"
+        [System.IO.File]::WriteAllText($shaPath, "$hash  $zipName`n", [System.Text.UTF8Encoding]::new($false))
+
+        Write-Host "Packaged $zipPath (sha256: $hash)"
+    }
 }
 finally {
     Pop-Location

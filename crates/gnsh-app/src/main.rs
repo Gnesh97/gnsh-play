@@ -37,11 +37,15 @@ use ui::{
     apply_theme, console_state_label, format_mac_id, host_matches_remote_probe,
     render_streaming_ui, saved_from_registered, upsert_saved_console,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::HSTRING;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON,
+    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOWNORMAL, SendMessageW, WM_SETICON,
+};
+use windows::core::{HSTRING, PCWSTR};
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
@@ -300,6 +304,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
 
     let mut window = AppWindow::new("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT)
         .context("failed creating application window")?;
+    apply_window_icon(window.hwnd());
     let (init_w, init_h) = window.size();
     let mut renderer = D3D11Renderer::new(window.hwnd(), init_w, init_h)
         .context("failed initializing D3D11 renderer")?;
@@ -627,6 +632,56 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
     Ok(())
 }
 
+fn apply_window_icon(hwnd: HWND) {
+    let Ok(hinst) = (unsafe { GetModuleHandleW(None) }) else {
+        return;
+    };
+    let icon_res = PCWSTR(std::ptr::without_provenance(1));
+    let small_w = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+    let small_h = unsafe { GetSystemMetrics(SM_CYSMICON) }.max(16);
+    let big_w = unsafe { GetSystemMetrics(SM_CXICON) }.max(32);
+    let big_h = unsafe { GetSystemMetrics(SM_CYICON) }.max(32);
+
+    if let Ok(small_icon) = unsafe {
+        LoadImageW(
+            Some(hinst.into()),
+            icon_res,
+            IMAGE_ICON,
+            small_w,
+            small_h,
+            LR_SHARED,
+        )
+    } {
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(small_icon.0 as isize)),
+            );
+        }
+    }
+    if let Ok(big_icon) = unsafe {
+        LoadImageW(
+            Some(hinst.into()),
+            icon_res,
+            IMAGE_ICON,
+            big_w,
+            big_h,
+            LR_SHARED,
+        )
+    } {
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(big_icon.0 as isize)),
+            );
+        }
+    }
+}
+
 fn handle_platform_commands(window: &AppWindow, commands: &[egui::OutputCommand]) {
     for cmd in commands {
         match cmd {
@@ -758,7 +813,11 @@ fn handle_settings_pad_event(
             *ctx.settings_focus_row = 0;
         }
         HomeNavEvent::PrevConsole | HomeNavEvent::NextConsole => {
-            let count = settings_row_count(*ctx.settings_tab, ctx.settings.kbm_enabled);
+            let count = settings_row_count(
+                *ctx.settings_tab,
+                ctx.settings.kbm_enabled,
+                ctx.settings.wan_profile_enabled,
+            );
             step_wrap(
                 ctx.settings_focus_row,
                 count,
@@ -775,7 +834,11 @@ fn handle_settings_pad_event(
                 ctx.audio_devices,
                 ctx.mic_devices,
             );
-            let count = settings_row_count(*ctx.settings_tab, ctx.settings.kbm_enabled);
+            let count = settings_row_count(
+                *ctx.settings_tab,
+                ctx.settings.kbm_enabled,
+                ctx.settings.wan_profile_enabled,
+            );
             if count > 0 && *ctx.settings_focus_row >= count {
                 *ctx.settings_focus_row = count - 1;
             }
@@ -1596,22 +1659,10 @@ impl AppState {
                     }
                 }
                 HomeAction::CreateShortcut(idx) => {
-                    self.selected_console_idx = idx;
-                    if let Some(console) = self.saved_consoles.get(idx) {
-                        match shortcut::create_desktop_shortcut(console, false) {
-                            Ok(path) => {
-                                self.status_banner = Some(StatusBanner::success(format!(
-                                    "Created Desktop shortcut: {}",
-                                    path.display()
-                                )));
-                            }
-                            Err(err) => {
-                                self.status_banner = Some(StatusBanner::error(format!(
-                                    "Failed creating Desktop shortcut: {err:#}"
-                                )));
-                            }
-                        }
-                    }
+                    self.create_shortcut_for_saved(idx, false);
+                }
+                HomeAction::CreateShortcutWan(idx) => {
+                    self.create_shortcut_for_saved(idx, true);
                 }
                 HomeAction::EditSaved(idx) => {
                     self.selected_console_idx = idx;
@@ -1656,6 +1707,25 @@ impl AppState {
                 }
                 HomeAction::CancelReconnect => {
                     self.reconnect = None;
+                }
+            }
+        }
+    }
+
+    fn create_shortcut_for_saved(&mut self, idx: usize, use_wan: bool) {
+        self.selected_console_idx = idx;
+        if let Some(console) = self.saved_consoles.get(idx) {
+            match shortcut::create_desktop_shortcut(console, use_wan) {
+                Ok(path) => {
+                    self.status_banner = Some(StatusBanner::success(format!(
+                        "Created Desktop shortcut: {}",
+                        path.display()
+                    )));
+                }
+                Err(err) => {
+                    self.status_banner = Some(StatusBanner::error(format!(
+                        "Failed creating Desktop shortcut: {err:#}"
+                    )));
                 }
             }
         }
@@ -1770,7 +1840,7 @@ impl AppState {
         } else {
             &console.host
         };
-        match ActiveStream::start_with_host(console, target_host, &self.settings, device) {
+        match ActiveStream::start_with_host(console, target_host, &self.settings, use_wan, device) {
             Ok(stream) => {
                 self.active_stream_target = Some((saved_idx, use_wan));
                 self.status_banner = None;

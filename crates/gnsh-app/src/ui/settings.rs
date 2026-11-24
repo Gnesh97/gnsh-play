@@ -150,13 +150,17 @@ pub(crate) fn render_kbm_sliders(ui: &mut egui::Ui, settings: &mut StreamSetting
         .on_hover_text("Invert vertical mouse camera axis");
 }
 
-pub(crate) fn format_profile_summary(settings: &StreamSettings) -> String {
-    let (res, fps) = match settings.preset {
+fn preset_label(preset: VideoPreset) -> (&'static str, u8) {
+    match preset {
         VideoPreset::P720Fps30 => ("720p", 30),
         VideoPreset::P720Fps60 => ("720p", 60),
         VideoPreset::P1080Fps30 => ("1080p", 30),
         VideoPreset::P1080Fps60 => ("1080p", 60),
-    };
+    }
+}
+
+pub(crate) fn format_profile_summary(settings: &StreamSettings) -> String {
+    let (res, fps) = preset_label(settings.preset);
     let codec = match settings.codec {
         VideoCodec::H264 => "H.264",
         VideoCodec::Hevc => "HEVC",
@@ -186,7 +190,16 @@ pub(crate) fn format_profile_summary(settings: &StreamSettings) -> String {
         "Low-Latency No-VSync"
     };
     let kbm = if settings.kbm_enabled { " · KB+M" } else { "" };
-    format!("{res}{fps} · {codec} · {mbps} Mbps · {filter} · {vsync}{kbm}")
+    let wan = if settings.wan_profile_enabled {
+        let (wan_res, wan_fps) = preset_label(settings.wan_preset);
+        format!(
+            " · WAN {wan_res}{wan_fps} {} Mbps",
+            settings.wan_bitrate_kbps / 1_000
+        )
+    } else {
+        String::new()
+    };
+    format!("{res}{fps} · {codec} · {mbps} Mbps · {filter} · {vsync}{kbm}{wan}")
 }
 
 fn settings_row_label(ui: &mut egui::Ui, label: &str, focus_row: Option<usize>, row_idx: usize) {
@@ -206,8 +219,11 @@ impl AppState {
         if !self.settings_open {
             return;
         }
-        let row_count =
-            crate::gamepad_nav::settings_row_count(self.settings_tab, self.settings.kbm_enabled);
+        let row_count = crate::gamepad_nav::settings_row_count(
+            self.settings_tab,
+            self.settings.kbm_enabled,
+            self.settings.wan_profile_enabled,
+        );
         if row_count > 0 && self.settings_focus_row >= row_count {
             self.settings_focus_row = row_count - 1;
         }
@@ -359,6 +375,45 @@ impl AppState {
                     "Automatically reconnect transient stream drops and switch to saved WAN host if LAN retries fail.",
                 );
                 ui.end_row();
+
+                settings_row_label(ui, "WAN Profile", focus_row, 8);
+                ui.checkbox(
+                    &mut self.settings.wan_profile_enabled,
+                    "Use separate stream profile for WAN / VPN connections",
+                )
+                .on_hover_text(
+                    "Overrides Resolution, FPS, Codec, and Bitrate when streaming via Connect WAN or WAN fallback.",
+                );
+                ui.end_row();
+
+                if self.settings.wan_profile_enabled {
+                    settings_row_label(ui, "WAN Preset", focus_row, 9);
+                    ui.add_enabled_ui(!is_streaming, |ui| {
+                        render_preset_controls(ui, &mut self.settings.wan_preset);
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, "WAN Codec", focus_row, 10);
+                    ui.add_enabled_ui(!is_streaming, |ui| {
+                        render_codec_controls(ui, &mut self.settings.wan_codec);
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, "WAN Bitrate", focus_row, 11);
+                    ui.add_enabled_ui(!is_streaming, |ui| {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.settings.wan_bitrate_kbps,
+                                MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS,
+                            )
+                            .step_by(1_000.0)
+                            .clamping(egui::SliderClamping::Always)
+                            .suffix(" kbps"),
+                        )
+                        .on_hover_text("Target bitrate used for WAN / VPN streams (2,000-100,000 kbps)");
+                    });
+                    ui.end_row();
+                }
             });
     }
 
@@ -474,6 +529,11 @@ mod tests {
         assert_eq!(
             format_profile_summary(&s),
             "1080p60 · HEVC · 30 Mbps · FSR 1.0 (RCAS 45%) · Low-Latency No-VSync · KB+M"
+        );
+        s.wan_profile_enabled = true;
+        assert_eq!(
+            format_profile_summary(&s),
+            "1080p60 · HEVC · 30 Mbps · FSR 1.0 (RCAS 45%) · Low-Latency No-VSync · KB+M · WAN 720p60 12 Mbps"
         );
     }
 }

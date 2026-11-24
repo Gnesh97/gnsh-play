@@ -79,6 +79,7 @@ pub(crate) enum HomeAction {
     ConnectSavedWan(usize),
     WakeSaved(usize),
     CreateShortcut(usize),
+    CreateShortcutWan(usize),
     EditSaved(usize),
     DeleteSaved(usize),
     OpenRegister(String),

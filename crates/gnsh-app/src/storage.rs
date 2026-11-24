@@ -358,6 +358,10 @@ mod tests {
             preset: VideoPreset::P1080Fps30,
             codec: VideoCodec::HevcHdr,
             bitrate_kbps: 500_000,
+            wan_profile_enabled: true,
+            wan_preset: VideoPreset::P720Fps30,
+            wan_codec: VideoCodec::H264,
+            wan_bitrate_kbps: 200_000,
             vsync: false,
             auto_reconnect: false,
             touchpad_touch: true,
@@ -379,6 +383,10 @@ mod tests {
         assert_eq!(loaded.preset, VideoPreset::P1080Fps30);
         assert_eq!(loaded.codec, VideoCodec::HevcHdr);
         assert_eq!(loaded.bitrate_kbps, 100_000);
+        assert!(loaded.wan_profile_enabled);
+        assert_eq!(loaded.wan_preset, VideoPreset::P720Fps30);
+        assert_eq!(loaded.wan_codec, VideoCodec::H264);
+        assert_eq!(loaded.wan_bitrate_kbps, 100_000);
         assert!(!loaded.vsync);
         assert!(!loaded.auto_reconnect);
         assert!(loaded.touchpad_touch);
@@ -424,9 +432,45 @@ mod tests {
         let defaulted = store.load().expect("load missing curve");
         assert_eq!(defaulted.filter_mode, VideoFilterMode::Bilinear);
         assert!(defaulted.auto_reconnect);
+        assert!(!defaulted.wan_profile_enabled);
+        assert_eq!(defaulted.wan_preset, VideoPreset::P720Fps60);
+        assert_eq!(defaulted.wan_codec, VideoCodec::Hevc);
+        assert_eq!(defaulted.wan_bitrate_kbps, 12_000);
         assert_eq!(defaulted.kbm_curve_pct, 100);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_stream_profile_switches_on_wan_when_enabled() {
+        let mut s = StoredSettings {
+            preset: VideoPreset::P1080Fps60,
+            codec: VideoCodec::HevcHdr,
+            bitrate_kbps: 30_000,
+            wan_profile_enabled: false,
+            wan_preset: VideoPreset::P720Fps60,
+            wan_codec: VideoCodec::Hevc,
+            wan_bitrate_kbps: 100, // clamped to 2_000
+            ..StoredSettings::default()
+        };
+        assert_eq!(
+            s.effective_stream_profile(false),
+            (VideoPreset::P1080Fps60, VideoCodec::HevcHdr, 30_000)
+        );
+        assert_eq!(
+            s.effective_stream_profile(true),
+            (VideoPreset::P1080Fps60, VideoCodec::HevcHdr, 30_000)
+        );
+
+        s.wan_profile_enabled = true;
+        assert_eq!(
+            s.effective_stream_profile(false),
+            (VideoPreset::P1080Fps60, VideoCodec::HevcHdr, 30_000)
+        );
+        assert_eq!(
+            s.effective_stream_profile(true),
+            (VideoPreset::P720Fps60, VideoCodec::Hevc, 2_000)
+        );
     }
 }
 
@@ -437,6 +481,10 @@ pub struct StoredSettings {
     pub preset: VideoPreset,
     pub codec: VideoCodec,
     pub bitrate_kbps: u32,
+    pub wan_profile_enabled: bool,
+    pub wan_preset: VideoPreset,
+    pub wan_codec: VideoCodec,
+    pub wan_bitrate_kbps: u32,
     pub vsync: bool,
     pub auto_reconnect: bool,
     pub touchpad_touch: bool,
@@ -460,6 +508,10 @@ impl Default for StoredSettings {
             preset: VideoPreset::P1080Fps60,
             codec: VideoCodec::Hevc,
             bitrate_kbps: 30_000,
+            wan_profile_enabled: false,
+            wan_preset: VideoPreset::P720Fps60,
+            wan_codec: VideoCodec::Hevc,
+            wan_bitrate_kbps: 12_000,
             vsync: true,
             auto_reconnect: true,
             touchpad_touch: false,
@@ -479,6 +531,25 @@ impl Default for StoredSettings {
     }
 }
 
+impl StoredSettings {
+    /// Returns the active `(preset, codec, bitrate_kbps)` for LAN or WAN/VPN streaming.
+    pub fn effective_stream_profile(&self, use_wan: bool) -> (VideoPreset, VideoCodec, u32) {
+        if use_wan && self.wan_profile_enabled {
+            (
+                self.wan_preset,
+                self.wan_codec,
+                clamp_bitrate_kbps(self.wan_bitrate_kbps),
+            )
+        } else {
+            (
+                self.preset,
+                self.codec,
+                clamp_bitrate_kbps(self.bitrate_kbps),
+            )
+        }
+    }
+}
+
 fn normalize_device_opt(opt: &mut Option<String>) {
     *opt = opt
         .take()
@@ -488,6 +559,7 @@ fn normalize_device_opt(opt: &mut Option<String>) {
 
 fn normalize_settings(settings: &mut StoredSettings) {
     settings.bitrate_kbps = clamp_bitrate_kbps(settings.bitrate_kbps);
+    settings.wan_bitrate_kbps = clamp_bitrate_kbps(settings.wan_bitrate_kbps);
     settings.sharpness_pct = settings.sharpness_pct.min(100);
     settings.volume_pct = settings.volume_pct.min(100);
     settings.kbm_sensitivity_pct = settings.kbm_sensitivity_pct.clamp(1, 100);

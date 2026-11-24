@@ -178,23 +178,25 @@ impl ActiveStream {
         settings: &StoredSettings,
         device: ID3D11Device,
     ) -> Result<Self> {
-        Self::start_with_host(console, &console.host, settings, device)
+        Self::start_with_host(console, &console.host, settings, false, device)
     }
 
     pub(crate) fn start_with_host(
         console: &SavedConsole,
         host_override: &str,
         settings: &StoredSettings,
+        use_wan: bool,
         device: ID3D11Device,
     ) -> Result<Self> {
         let target_host = host_override.trim();
+        let (preset, codec, bitrate_kbps) = settings.effective_stream_profile(use_wan);
         let config = Ps5SessionConfig {
             host: target_host.to_string(),
             regist_key: console.regist_key,
             rp_key: console.rp_key,
-            preset: settings.preset,
-            codec: settings.codec,
-            bitrate_kbps: settings.bitrate_kbps,
+            preset,
+            codec,
+            bitrate_kbps,
             enable_dualsense: true,
         };
         let (session, channels) = Ps5Session::start(config)
@@ -202,13 +204,14 @@ impl ActiveStream {
 
         tracing::info!(
             host = %target_host,
-            preset = ?settings.preset,
-            codec = ?settings.codec,
-            bitrate_kbps = settings.bitrate_kbps,
+            use_wan,
+            ?preset,
+            ?codec,
+            bitrate_kbps,
             "Started Remote Play stream session"
         );
 
-        let media_codec = match settings.codec {
+        let media_codec = match codec {
             VideoCodec::H264 => MediaCodec::H264,
             VideoCodec::Hevc => MediaCodec::Hevc,
             VideoCodec::HevcHdr => MediaCodec::HevcHdr,
@@ -265,7 +268,7 @@ impl ActiveStream {
         Ok(Self {
             console_name: console.name.clone(),
             console_host: target_host.to_string(),
-            codec: settings.codec,
+            codec,
             session: Some(session),
             events_rx: channels.events_rx,
             frame_sync,
