@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 use storage::{ConsoleStore, SavedConsole, SettingsStore, StoredSettings};
 use stream::{ActiveStream, IDR_COOLDOWN, LoginPinPrompt, OskPrompt};
 use ui::{
-    EditConsoleModal, HomeAction, RegisterModal, StatusBanner, StreamSettings, apply_theme,
-    console_state_label, format_mac_id, host_matches_remote_probe, render_streaming_ui,
-    saved_from_registered, upsert_saved_console,
+    EditConsoleModal, HomeAction, RegisterModal, SettingsTab, StatusBanner, StreamSettings,
+    apply_theme, console_state_label, format_mac_id, host_matches_remote_probe,
+    render_streaming_ui, saved_from_registered, upsert_saved_console,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
@@ -227,6 +227,7 @@ fn run_gui() -> Result<()> {
         }
         if summary.toggle_mouse_lock
             && !app.kbm_modal_open
+            && !app.settings_open
             && matches!(app.mode, AppMode::Streaming(_))
         {
             if !app.settings.kbm_enabled {
@@ -294,6 +295,7 @@ fn run_gui() -> Result<()> {
             || got_new_frame
             || hdr_mode_changed
             || lock_state_changed
+            || app.settings_open
             || app.kbm_modal_open
             || summary.last_kbm_input.is_some()
             || !raw_input.events.is_empty()
@@ -318,7 +320,7 @@ fn run_gui() -> Result<()> {
         let clear_rgba = if is_streaming {
             [0.0, 0.0, 0.0, 1.0]
         } else {
-            [0.06, 0.07, 0.10, 1.0]
+            [0.04, 0.05, 0.08, 1.0]
         };
         renderer.begin_frame(clear_rgba);
 
@@ -339,6 +341,7 @@ fn run_gui() -> Result<()> {
         }
 
         let draw_egui = !is_streaming
+            || app.settings_open
             || app.kbm_modal_open
             || matches!(
                 &app.mode,
@@ -408,6 +411,8 @@ fn run_gui() -> Result<()> {
         if let AppMode::Streaming(ref mut stream) = app.mode
             && std::mem::take(&mut stream.mouse_lock_toggle_requested)
             && app.settings.kbm_enabled
+            && !app.settings_open
+            && !stream.hud_drawer_open
             && stream.pin_prompt.is_none()
             && stream.osk_prompt.is_none()
         {
@@ -418,10 +423,12 @@ fn run_gui() -> Result<()> {
             }
         }
         let allow_mouse_lock = app.settings.kbm_enabled
+            && !app.settings_open
             && !app.kbm_modal_open
             && matches!(
                 &app.mode,
-                AppMode::Streaming(s) if s.pin_prompt.is_none() && s.osk_prompt.is_none()
+                AppMode::Streaming(s)
+                    if !s.hud_drawer_open && s.pin_prompt.is_none() && s.osk_prompt.is_none()
             );
         if !allow_mouse_lock && window.is_relative_mouse_mode() {
             window.set_relative_mouse_mode(false);
@@ -510,6 +517,8 @@ pub(crate) struct AppState {
     pub(crate) status_banner: Option<StatusBanner>,
     pub(crate) register_modal: Option<RegisterModal>,
     pub(crate) edit_modal: Option<EditConsoleModal>,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_tab: SettingsTab,
     pub(crate) kbm_modal_open: bool,
     pub(crate) kbm_listening_action: Option<KbmAction>,
     pub(crate) mode: AppMode,
@@ -538,6 +547,8 @@ impl AppState {
             status_banner,
             register_modal: None,
             edit_modal: None,
+            settings_open: false,
+            settings_tab: SettingsTab::Video,
             kbm_modal_open: false,
             kbm_listening_action: None,
             mode: AppMode::Home,
@@ -638,12 +649,17 @@ impl AppState {
                         self.edit_modal = None;
                     } else if self.register_modal.is_some() {
                         self.register_modal = None;
+                    } else if self.settings_open {
+                        self.settings_open = false;
                     }
                 }
             }
             AppMode::Streaming(stream) => {
                 if toggle_hud {
                     stream.show_hud = !stream.show_hud;
+                    if !stream.show_hud {
+                        stream.hud_drawer_open = false;
+                    }
                 }
                 if toggle_mic {
                     stream.mic_toggle_requested = true;
@@ -654,6 +670,10 @@ impl AppState {
                 if escape_pressed {
                     if let Some(osk) = stream.osk_prompt.as_mut() {
                         osk.cancel_requested = true;
+                    } else if self.settings_open {
+                        self.settings_open = false;
+                    } else if stream.hud_drawer_open {
+                        stream.hud_drawer_open = false;
                     } else {
                         stream.disconnect_requested = true;
                     }
@@ -1128,9 +1148,11 @@ impl AppState {
                     hdr_output_active,
                     mouse_locked,
                     &mut self.kbm_modal_open,
+                    &mut self.settings_open,
                 );
             }
         }
+        self.render_settings_modal(ui.ctx());
         self.render_kbm_bindings_modal(ui.ctx());
         if self.settings != prev_settings {
             if let AppMode::Streaming(ref mut stream) = self.mode {
@@ -1176,6 +1198,7 @@ impl AppState {
                 self.status_banner = None;
                 self.register_modal = None;
                 self.edit_modal = None;
+                self.settings_open = false;
                 self.mode = AppMode::Streaming(Box::new(stream));
             }
             Err(err) => {
