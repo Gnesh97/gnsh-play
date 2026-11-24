@@ -137,6 +137,14 @@ impl DecodedFrame {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HwKind {
+    None,
+    D3D11ZeroCopy,
+    D3D11Transfer,
+    D3D12ZeroCopy,
+}
+
 pub struct VideoDecoder {
     codec: MediaCodec,
     ctx: *mut ffi::AVCodecContext,
@@ -145,7 +153,7 @@ pub struct VideoDecoder {
     frame: *mut ffi::AVFrame,
     sw_frame: *mut ffi::AVFrame,
     hw_active: bool,
-    transfer_hw: bool,
+    hw_kind: HwKind,
     decoded_any: bool,
 }
 
@@ -153,7 +161,7 @@ unsafe impl Send for VideoDecoder {}
 
 enum DrainOutcome {
     Done,
-    FallbackToSw,
+    FallbackRetry,
 }
 
 impl VideoDecoder {
@@ -212,7 +220,7 @@ impl VideoDecoder {
         };
 
         if send_err == ffi::GNSH_AVERROR_EAGAIN {
-            if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackToSw) {
+            if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackRetry) {
                 return self.decode_with_pts(annex_b, pts);
             }
             send_err = unsafe {
@@ -225,23 +233,38 @@ impl VideoDecoder {
         }
 
         if send_err < 0 && send_err != ffi::GNSH_AVERROR_EAGAIN {
-            if self.hw_active && !self.decoded_any {
-                tracing::warn!(
-                    "D3D11VA failed on initial packet ({}); falling back to software decode",
-                    av_err_string(send_err)
-                );
-                let sw = Self::open_internal(self.codec, DecoderHardware::None)?;
-                *self = sw;
+            if !self.decoded_any && self.fallback_next(&av_err_string(send_err))? {
                 return self.decode_with_pts(annex_b, pts);
             }
             bail!("avcodec_send_packet failed: {}", av_err_string(send_err));
         }
 
-        if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackToSw) {
+        if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackRetry) {
             return self.decode_with_pts(annex_b, pts);
         }
 
         Ok(frames)
+    }
+
+    fn fallback_next(&mut self, reason: &str) -> Result<bool> {
+        let next_hw = match self.hw_kind {
+            HwKind::D3D12ZeroCopy => {
+                tracing::warn!(
+                    "D3D12VA unavailable ({reason}); switching to D3D11VA hardware transfer"
+                );
+                DecoderHardware::D3D11Transfer
+            }
+            HwKind::D3D11ZeroCopy | HwKind::D3D11Transfer => {
+                tracing::warn!(
+                    "D3D11VA unavailable ({reason}); switching to multi-threaded software decode"
+                );
+                DecoderHardware::None
+            }
+            HwKind::None => return Ok(false),
+        };
+        let next = Self::open_internal(self.codec, next_hw)?;
+        *self = next;
+        Ok(true)
     }
 
     fn drain_frames(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<DrainOutcome> {
@@ -251,21 +274,34 @@ impl VideoDecoder {
                 return Ok(DrainOutcome::Done);
             }
             if r < 0 {
-                if self.hw_active && !self.decoded_any {
-                    tracing::warn!(
-                        "D3D11VA receive_frame failed ({}); falling back to software decode",
-                        av_err_string(r)
-                    );
-                    let sw = Self::open_internal(self.codec, DecoderHardware::None)?;
-                    *self = sw;
-                    return Ok(DrainOutcome::FallbackToSw);
+                if !self.decoded_any && self.fallback_next(&av_err_string(r))? {
+                    return Ok(DrainOutcome::FallbackRetry);
                 }
                 bail!("avcodec_receive_frame failed: {}", av_err_string(r));
             }
 
             let is_hdr_codec = self.codec == MediaCodec::HevcHdr;
             let fmt = unsafe { (*self.frame).format };
-            let decoded = if self.transfer_hw && fmt == ffi::AVPixelFormat_AV_PIX_FMT_D3D11 {
+            if !self.decoded_any {
+                let unexpected_hw = match self.hw_kind {
+                    HwKind::D3D12ZeroCopy => fmt != ffi::AVPixelFormat_AV_PIX_FMT_D3D12,
+                    HwKind::D3D11ZeroCopy | HwKind::D3D11Transfer => {
+                        fmt != ffi::AVPixelFormat_AV_PIX_FMT_D3D11
+                    }
+                    HwKind::None => false,
+                };
+                if unexpected_hw {
+                    unsafe {
+                        ffi::av_frame_unref(self.frame);
+                    }
+                    if self.fallback_next(&format!("FFmpeg fell back to pix_fmt {fmt}"))? {
+                        return Ok(DrainOutcome::FallbackRetry);
+                    }
+                }
+            }
+
+            let transfer_hw = self.hw_kind == HwKind::D3D11Transfer;
+            let decoded = if transfer_hw && fmt == ffi::AVPixelFormat_AV_PIX_FMT_D3D11 {
                 let xfer_err =
                     unsafe { ffi::av_hwframe_transfer_data(self.sw_frame, self.frame, 0) };
                 if xfer_err < 0 {
@@ -273,14 +309,8 @@ impl VideoDecoder {
                         ffi::av_frame_unref(self.sw_frame);
                         ffi::av_frame_unref(self.frame);
                     }
-                    if !self.decoded_any {
-                        tracing::warn!(
-                            "D3D11VA frame transfer failed ({}); falling back to software decode",
-                            av_err_string(xfer_err)
-                        );
-                        let sw = Self::open_internal(self.codec, DecoderHardware::None)?;
-                        *self = sw;
-                        return Ok(DrainOutcome::FallbackToSw);
+                    if !self.decoded_any && self.fallback_next(&av_err_string(xfer_err))? {
+                        return Ok(DrainOutcome::FallbackRetry);
                     }
                     bail!(
                         "av_hwframe_transfer_data failed: {}",
@@ -296,7 +326,7 @@ impl VideoDecoder {
                 }
                 out
             } else {
-                unsafe { extract_frame(self.frame, is_hdr_codec, self.transfer_hw)? }
+                unsafe { extract_frame(self.frame, is_hdr_codec, transfer_hw)? }
             };
             if let Some(decoded) = decoded {
                 self.decoded_any = true;
@@ -343,7 +373,7 @@ impl VideoDecoder {
 
         let mut hw_device_ctx: *mut ffi::AVBufferRef = std::ptr::null_mut();
         let mut hw_active = false;
-        let mut transfer_hw = false;
+        let mut hw_kind = HwKind::None;
 
         unsafe {
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
@@ -363,6 +393,7 @@ impl VideoDecoder {
                         }
                         hw_device_ctx = buf_ref;
                         hw_active = true;
+                        hw_kind = HwKind::D3D11ZeroCopy;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -384,7 +415,7 @@ impl VideoDecoder {
                         }
                         hw_device_ctx = buf_ref;
                         hw_active = true;
-                        transfer_hw = true;
+                        hw_kind = HwKind::D3D11Transfer;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -406,6 +437,7 @@ impl VideoDecoder {
                         }
                         hw_device_ctx = buf_ref;
                         hw_active = true;
+                        hw_kind = HwKind::D3D12ZeroCopy;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -444,7 +476,7 @@ impl VideoDecoder {
             frame,
             sw_frame,
             hw_active,
-            transfer_hw,
+            hw_kind,
             decoded_any: false,
         })
     }
@@ -1113,8 +1145,16 @@ mod tests {
         let dev = device.expect("D3D12CreateDevice populated device");
         let mut decoder =
             VideoDecoder::new_with_mode(MediaCodec::H264, DecoderHardware::D3D12ZeroCopy(dev))
-                .expect("D3D12ZeroCopy or software fallback initializes");
+                .expect("D3D12ZeroCopy or fallback initializes");
         let frames = decoder.decode(TEST_H264_IDR).expect("IDR decode ok");
         assert!(!frames.is_empty(), "expected decoded IDR frame");
+        match &frames[0] {
+            DecodedFrame::D3D12(_) => assert!(decoder.is_hw_active()),
+            DecodedFrame::SoftwareNv12 { .. } | DecodedFrame::SoftwareP010 { .. } => {
+                assert!(decoder.is_hw_active());
+            }
+            DecodedFrame::SoftwareYuv420 { .. } => assert!(!decoder.is_hw_active()),
+            DecodedFrame::D3D11(_) => panic!("unexpected D3D11 frame from D3D12ZeroCopy mode"),
+        }
     }
 }

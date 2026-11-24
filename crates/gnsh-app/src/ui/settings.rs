@@ -68,7 +68,7 @@ pub(crate) fn render_renderer_backend_selector(ui: &mut egui::Ui, backend: &mut 
             .on_hover_text("Direct3D 11 swapchain with HLSL CAS / FSR 1.0");
         ui.selectable_value(backend, RendererBackend::Vulkan, "Vulkan")
             .on_hover_text(
-                "libplacebo Vulkan renderer (Spline36 / EWA Lanczos + deband). Restart required.",
+                "libplacebo Vulkan renderer (Bilinear / Spline36 + live CAS sharpening). Restart required.",
             );
         ui.selectable_value(backend, RendererBackend::D3D12, "D3D12")
             .on_hover_text(

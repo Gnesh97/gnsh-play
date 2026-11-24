@@ -2,7 +2,6 @@ use crate::d3d11_renderer::{
     FSR_EASU_PS_HLSL, FSR_RCAS_PS_HLSL, FsrParams, HLSL_COLOR_CAS_HELPERS, NV12_ARRAY_PS_BODY,
     P010_ARRAY_PS_BODY, VIDEO_VS_HLSL, VideoParams, YUV420_PS_BODY, aspect_scale, blob_slice,
     compile_hlsl, compute_rcas_bounds, compute_video_params, should_run_fsr_easu,
-    unpack_nv12_chroma, unpack_p010_to_yuv8,
 };
 use crate::renderer::{
     ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode, VideoRenderOptions,
@@ -66,9 +65,10 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
     DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
-    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16_UNORM,
+    DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
@@ -216,6 +216,14 @@ struct SwYuvTextures {
     v: SwPlane,
 }
 
+struct SwSemiPlanarTextures {
+    width: u32,
+    height: u32,
+    is_p010: bool,
+    y: SwPlane,
+    uv: SwPlane,
+}
+
 struct UiTextureEntry {
     resource: ID3D12Resource,
     state: D3D12_RESOURCE_STATES,
@@ -298,6 +306,7 @@ struct RendererState {
     next_fence_value: u64,
     pending_decode_waits: Vec<(ID3D12Fence, u64)>,
     sw_textures: Option<SwYuvTextures>,
+    sw_semiplanar: Option<SwSemiPlanarTextures>,
     fsr_src_rt: Option<OwnedRenderTarget>,
     fsr_easu_rt: Option<OwnedRenderTarget>,
     ui_textures: HashMap<u64, UiTextureEntry>,
@@ -541,6 +550,7 @@ impl D3D12Renderer {
                 next_fence_value: 0,
                 pending_decode_waits: Vec::new(),
                 sw_textures: None,
+                sw_semiplanar: None,
                 fsr_src_rt: None,
                 fsr_easu_rt: None,
                 ui_textures: HashMap::new(),
@@ -709,6 +719,7 @@ impl D3D12Renderer {
         close_open_cmd_list_if_needed(&self.cmd_list, state);
         let _ = flush_gpu(&self.command_queue, &self.fence, self.fence_event, state);
         state.sw_textures = None;
+        state.sw_semiplanar = None;
         state.fsr_src_rt = None;
         state.fsr_easu_rt = None;
     }
@@ -1231,26 +1242,8 @@ impl D3D12Renderer {
                 width,
                 height,
                 ..
-            } => {
-                let (u, v, uv_s) = unpack_nv12_chroma(uv, *uv_stride, *width, *height);
-                draw_sw_yuv420(
-                    &self.device,
-                    &self.cmd_list,
-                    &pso_set.ps_yuv420,
-                    &self.srv_heap,
-                    self.srv_inc,
-                    state,
-                    y,
-                    &u,
-                    &v,
-                    *y_stride,
-                    uv_s,
-                    uv_s,
-                    *width,
-                    *height,
-                )
             }
-            DecodedFrame::SoftwareP010 {
+            | DecodedFrame::SoftwareP010 {
                 y,
                 uv,
                 y_stride,
@@ -1258,26 +1251,21 @@ impl D3D12Renderer {
                 width,
                 height,
                 ..
-            } => {
-                let (y8, u8, v8, ys, uvs) =
-                    unpack_p010_to_yuv8(y, uv, *y_stride, *uv_stride, *width, *height);
-                draw_sw_yuv420(
-                    &self.device,
-                    &self.cmd_list,
-                    &pso_set.ps_yuv420,
-                    &self.srv_heap,
-                    self.srv_inc,
-                    state,
-                    &y8,
-                    &u8,
-                    &v8,
-                    ys,
-                    uvs,
-                    uvs,
-                    *width,
-                    *height,
-                )
-            }
+            } => draw_sw_semiplanar(
+                &self.device,
+                &self.cmd_list,
+                pso_set,
+                &self.srv_heap,
+                self.srv_inc,
+                state,
+                y,
+                uv,
+                *y_stride,
+                *uv_stride,
+                *width,
+                *height,
+                matches!(frame, DecodedFrame::SoftwareP010 { .. }),
+            ),
         }
     }
 
@@ -1646,6 +1634,7 @@ impl Drop for D3D12Renderer {
             let _ = flush_gpu(&self.command_queue, &self.fence, self.fence_event, state);
             state.ui_textures.clear();
             state.sw_textures = None;
+            state.sw_semiplanar = None;
             state.fsr_src_rt = None;
             state.fsr_easu_rt = None;
             for bb in &mut state.backbuffers {
@@ -1698,19 +1687,17 @@ fn inspect_frame(
                 mode,
             )
         }
+        DecodedFrame::SoftwareNv12 { width, height, .. }
+        | DecodedFrame::SoftwareP010 { width, height, .. } => {
+            let mode = if hdr_output_active { 1.0 } else { 0.0 };
+            let fmt = if matches!(frame, DecodedFrame::SoftwareP010 { .. }) {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_NV12
+            };
+            (*width, *height, *width, *height, Some(fmt), mode)
+        }
         DecodedFrame::SoftwareYuv420 {
-            width,
-            height,
-            is_hdr,
-            ..
-        }
-        | DecodedFrame::SoftwareNv12 {
-            width,
-            height,
-            is_hdr,
-            ..
-        }
-        | DecodedFrame::SoftwareP010 {
             width,
             height,
             is_hdr,
@@ -1880,13 +1867,34 @@ fn draw_sw_yuv420(
             cmd_list,
             slot,
             &mut texs.y,
+            DXGI_FORMAT_R8_UNORM,
             y,
             y_stride,
             width,
             height,
         )?;
-        upload_sw_plane(device, cmd_list, slot, &mut texs.u, u, u_stride, cw, ch)?;
-        upload_sw_plane(device, cmd_list, slot, &mut texs.v, v, v_stride, cw, ch)?;
+        upload_sw_plane(
+            device,
+            cmd_list,
+            slot,
+            &mut texs.u,
+            DXGI_FORMAT_R8_UNORM,
+            u,
+            u_stride,
+            cw,
+            ch,
+        )?;
+        upload_sw_plane(
+            device,
+            cmd_list,
+            slot,
+            &mut texs.v,
+            DXGI_FORMAT_R8_UNORM,
+            v,
+            v_stride,
+            cw,
+            ch,
+        )?;
         (
             texs.y.resource.clone(),
             texs.u.resource.clone(),
@@ -1910,6 +1918,112 @@ fn draw_sw_yuv420(
         device.CreateShaderResourceView(
             &v_res,
             Some(&r8_desc),
+            cpu_handle_at(srv_heap, srv_inc, srv_start + 2),
+        );
+        cmd_list.SetPipelineState(pso);
+        cmd_list.SetGraphicsRootDescriptorTable(2, gpu_handle_at(srv_heap, srv_inc, srv_start));
+        cmd_list.DrawInstanced(4, 1, 0, 0);
+    }
+    Ok(())
+}
+
+fn semiplanar_formats(is_p010: bool) -> (DXGI_FORMAT, DXGI_FORMAT) {
+    if is_p010 {
+        (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
+    } else {
+        (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_sw_semiplanar(
+    device: &ID3D12Device,
+    cmd_list: &ID3D12GraphicsCommandList,
+    pso_set: &PipelineFormatSet,
+    srv_heap: &ID3D12DescriptorHeap,
+    srv_inc: u32,
+    state: &mut RendererState,
+    y: &[u8],
+    uv: &[u8],
+    y_stride: usize,
+    uv_stride: usize,
+    width: u32,
+    height: u32,
+    is_p010: bool,
+) -> Result<()> {
+    let recreate = state
+        .sw_semiplanar
+        .as_ref()
+        .is_none_or(|t| t.width != width || t.height != height || t.is_p010 != is_p010);
+    if recreate {
+        if let Some(old) = state.sw_semiplanar.take() {
+            let retired = &mut state.frames[state.active_slot].retired_resources;
+            retired.push(old.y.resource);
+            retired.push(old.uv.resource);
+        }
+        state.sw_semiplanar = Some(create_sw_semiplanar_textures(
+            device, width, height, is_p010,
+        )?);
+    }
+
+    let (y_fmt, uv_fmt) = semiplanar_formats(is_p010);
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let active_slot = state.active_slot;
+    let (y_res, uv_res) = {
+        let texs = state
+            .sw_semiplanar
+            .as_mut()
+            .expect("sw_semiplanar initialized");
+        let slot = &mut state.frames[active_slot];
+        upload_sw_plane(
+            device,
+            cmd_list,
+            slot,
+            &mut texs.y,
+            y_fmt,
+            y,
+            y_stride,
+            width,
+            height,
+        )?;
+        upload_sw_plane(
+            device,
+            cmd_list,
+            slot,
+            &mut texs.uv,
+            uv_fmt,
+            uv,
+            uv_stride,
+            cw,
+            ch,
+        )?;
+        (texs.y.resource.clone(), texs.uv.resource.clone())
+    };
+
+    let srv_start = alloc_transient_srvs(&mut state.frames[active_slot], active_slot, 3)?;
+    let y_desc = array_plane_srv_desc(y_fmt, 0, 0);
+    let uv_desc = array_plane_srv_desc(uv_fmt, 0, 0);
+    let null_desc = null_tex2d_srv_desc();
+    let pso = if is_p010 {
+        &pso_set.ps_p010
+    } else {
+        &pso_set.ps_nv12
+    };
+    unsafe {
+        device.CreateShaderResourceView(
+            &y_res,
+            Some(&y_desc),
+            cpu_handle_at(srv_heap, srv_inc, srv_start),
+        );
+        device.CreateShaderResourceView(
+            &uv_res,
+            Some(&uv_desc),
+            cpu_handle_at(srv_heap, srv_inc, srv_start + 1),
+        );
+        device.CreateShaderResourceView(
+            None,
+            Some(&null_desc),
             cpu_handle_at(srv_heap, srv_inc, srv_start + 2),
         );
         cmd_list.SetPipelineState(pso);
@@ -2261,6 +2375,7 @@ fn upload_sw_plane(
     cmd_list: &ID3D12GraphicsCommandList,
     slot: &mut FrameSlot,
     plane: &mut SwPlane,
+    format: DXGI_FORMAT,
     data: &[u8],
     src_stride: usize,
     width: u32,
@@ -2275,17 +2390,7 @@ fn upload_sw_plane(
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
     upload_texture_region(
-        device,
-        cmd_list,
-        slot,
-        &res,
-        DXGI_FORMAT_R8_UNORM,
-        0,
-        0,
-        width,
-        height,
-        data,
-        src_stride,
+        device, cmd_list, slot, &res, format, 0, 0, width, height, data, src_stride,
     )?;
     transition_tracked(
         cmd_list,
@@ -2312,7 +2417,8 @@ fn upload_texture_region(
     src_stride: usize,
 ) -> Result<()> {
     let bpp = match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM => 4usize,
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R16G16_UNORM => 4usize,
+        DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R16_UNORM => 2usize,
         _ => 1usize,
     };
     let copy_row_bytes = (width as usize) * bpp;
@@ -2487,30 +2593,54 @@ fn ensure_render_target(
     Ok(meta)
 }
 
+fn create_sw_plane(
+    device: &ID3D12Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<SwPlane> {
+    let resource = create_texture_2d(
+        device,
+        width.max(1),
+        height.max(1),
+        format,
+        D3D12_RESOURCE_FLAG_NONE,
+        None,
+        D3D12_RESOURCE_STATE_COMMON,
+    )?;
+    Ok(SwPlane {
+        resource,
+        state: D3D12_RESOURCE_STATE_COMMON,
+    })
+}
+
 fn create_sw_yuv_textures(device: &ID3D12Device, width: u32, height: u32) -> Result<SwYuvTextures> {
     let cw = width.div_ceil(2);
     let ch = height.div_ceil(2);
-    let make_plane = |pw: u32, ph: u32| -> Result<SwPlane> {
-        let resource = create_texture_2d(
-            device,
-            pw.max(1),
-            ph.max(1),
-            DXGI_FORMAT_R8_UNORM,
-            D3D12_RESOURCE_FLAG_NONE,
-            None,
-            D3D12_RESOURCE_STATE_COMMON,
-        )?;
-        Ok(SwPlane {
-            resource,
-            state: D3D12_RESOURCE_STATE_COMMON,
-        })
-    };
     Ok(SwYuvTextures {
         width,
         height,
-        y: make_plane(width, height)?,
-        u: make_plane(cw, ch)?,
-        v: make_plane(cw, ch)?,
+        y: create_sw_plane(device, width, height, DXGI_FORMAT_R8_UNORM)?,
+        u: create_sw_plane(device, cw, ch, DXGI_FORMAT_R8_UNORM)?,
+        v: create_sw_plane(device, cw, ch, DXGI_FORMAT_R8_UNORM)?,
+    })
+}
+
+fn create_sw_semiplanar_textures(
+    device: &ID3D12Device,
+    width: u32,
+    height: u32,
+    is_p010: bool,
+) -> Result<SwSemiPlanarTextures> {
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let (y_fmt, uv_fmt) = semiplanar_formats(is_p010);
+    Ok(SwSemiPlanarTextures {
+        width,
+        height,
+        is_p010,
+        y: create_sw_plane(device, width, height, y_fmt)?,
+        uv: create_sw_plane(device, cw, ch, uv_fmt)?,
     })
 }
 

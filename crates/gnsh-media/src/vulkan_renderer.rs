@@ -94,6 +94,33 @@ fn map_ui_wrap_mode(wrap: UiTextureWrap) -> ffi::pl_tex_address_mode {
     }
 }
 
+const CAS_HOOK_GLSL: &str = "\
+//!PARAM sharpness
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!HOOK OUTPUT
+//!BIND HOOKED
+//!DESC gnsh-play CAS
+vec4 hook() {
+    vec4 c0 = HOOKED_tex(HOOKED_pos);
+    vec3 cas_c = c0.rgb;
+    vec3 cas_n = HOOKED_tex(HOOKED_pos + vec2(0.0, -HOOKED_pt.y)).rgb;
+    vec3 cas_s = HOOKED_tex(HOOKED_pos + vec2(0.0,  HOOKED_pt.y)).rgb;
+    vec3 cas_w = HOOKED_tex(HOOKED_pos + vec2(-HOOKED_pt.x, 0.0)).rgb;
+    vec3 cas_e = HOOKED_tex(HOOKED_pos + vec2( HOOKED_pt.x, 0.0)).rgb;
+    vec3 mn = min(cas_c, min(min(cas_n, cas_s), min(cas_w, cas_e)));
+    vec3 mx = max(cas_c, max(max(cas_n, cas_s), max(cas_w, cas_e)));
+    vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+    float peak = -1.0 / mix(8.0, 5.0, clamp(sharpness, 0.0, 1.0));
+    vec3 weight = amp * peak;
+    vec3 sharp = clamp((cas_c + (cas_n + cas_s + cas_w + cas_e) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);
+    return vec4(mix(cas_c, sharp, clamp(sharpness, 0.0, 1.0)), c0.a);
+}
+";
+
 pub struct VulkanPlaceboRenderer {
     log: ffi::pl_log,
     vk_inst: ffi::pl_vk_inst,
@@ -102,6 +129,7 @@ pub struct VulkanPlaceboRenderer {
     vk: ffi::pl_vulkan,
     sw: ffi::pl_swapchain,
     renderer: ffi::pl_renderer,
+    cas_hook: *const ffi::pl_hook,
     rgba8_fmt: ffi::pl_fmt,
     vert_pos_fmt: ffi::pl_fmt,
     vert_color_fmt: ffi::pl_fmt,
@@ -273,6 +301,15 @@ impl VulkanPlaceboRenderer {
             bail!("required libplacebo Vulkan formats are unavailable");
         }
 
+        let cas_hook = unsafe {
+            ffi::pl_mpv_user_shader_parse(gpu, CAS_HOOK_GLSL.as_ptr().cast(), CAS_HOOK_GLSL.len())
+        };
+        if cas_hook.is_null() {
+            tracing::warn!(
+                "libplacebo pl_mpv_user_shader_parse(CAS) returned null; sharpening disabled"
+            );
+        }
+
         Ok(Self {
             log,
             vk_inst,
@@ -281,6 +318,7 @@ impl VulkanPlaceboRenderer {
             vk,
             sw,
             renderer,
+            cas_hook,
             rgba8_fmt,
             vert_pos_fmt,
             vert_color_fmt,
@@ -910,7 +948,7 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         src_frame.color = if is_hdr {
             unsafe { ffi::pl_color_space_hdr10 }
         } else {
-            unsafe { ffi::pl_color_space_bt709 }
+            unsafe { ffi::pl_color_space_srgb }
         };
         src_frame.crop = ffi::pl_rect2df {
             x0: 0.0,
@@ -943,25 +981,29 @@ impl VideoRenderer for VulkanPlaceboRenderer {
             compute_placebo_target_rect(fw, fh, target_w, target_h, options.scale_mode);
         target.crop = ffi::pl_rect2df { x0, y0, x1, y1 };
 
-        let mut params = match options.filter_mode {
-            VideoFilterMode::Bilinear => {
-                let mut p = unsafe { ffi::pl_render_fast_params };
-                p.upscaler = &raw const ffi::pl_filter_bilinear;
-                p
-            }
-            VideoFilterMode::Cas => {
-                let mut p = unsafe { ffi::pl_render_default_params };
-                p.upscaler = &raw const ffi::pl_filter_spline36;
-                p.deband_params = &raw const ffi::pl_deband_default_params;
-                p
-            }
-            VideoFilterMode::Fsr1 => {
-                let mut p = unsafe { ffi::pl_render_high_quality_params };
-                p.upscaler = &raw const ffi::pl_filter_ewa_lanczossharp;
-                p.deband_params = &raw const ffi::pl_deband_default_params;
-                p
-            }
+        let mut params = unsafe { ffi::pl_render_fast_params };
+        params.upscaler = match options.filter_mode {
+            VideoFilterMode::Bilinear => &raw const ffi::pl_filter_bilinear,
+            VideoFilterMode::Cas | VideoFilterMode::Fsr1 => &raw const ffi::pl_filter_spline36,
         };
+        let hook_ptrs = [self.cas_hook];
+        let sharp = options.sharpness.clamp(0.0, 1.0);
+        if !matches!(options.filter_mode, VideoFilterMode::Bilinear)
+            && sharp > 0.001
+            && !self.cas_hook.is_null()
+        {
+            unsafe {
+                let hook_ref = &*self.cas_hook;
+                if hook_ref.num_parameters > 0
+                    && !hook_ref.parameters.is_null()
+                    && !(*hook_ref.parameters).data.is_null()
+                {
+                    (*(*hook_ref.parameters).data).f = sharp;
+                }
+            }
+            params.hooks = hook_ptrs.as_ptr();
+            params.num_hooks = 1;
+        }
         params.border = ffi::pl_clear_mode_PL_CLEAR_SKIP;
 
         if !unsafe { ffi::pl_render_image(self.renderer, &src_frame, &target, &params) } {
@@ -1029,6 +1071,9 @@ impl Drop for VulkanPlaceboRenderer {
                     ffi::pl_tex_destroy(gpu, slot);
                 }
             }
+            if !self.cas_hook.is_null() {
+                ffi::pl_mpv_user_shader_destroy(&mut self.cas_hook);
+            }
             if !self.renderer.is_null() {
                 ffi::pl_renderer_destroy(&mut self.renderer);
             }
@@ -1063,7 +1108,7 @@ fn build_swapchain_params(
     } else {
         ffi::VkPresentModeKHR_VK_PRESENT_MODE_IMMEDIATE_KHR
     };
-    params.swapchain_depth = 2;
+    params.swapchain_depth = 1;
     params.allow_suboptimal = false;
     params
 }
@@ -1210,8 +1255,10 @@ mod tests {
                 4,
                 8,
                 8,
-                (ffi::pl_fmt_caps_PL_FMT_CAP_RENDERABLE | ffi::pl_fmt_caps_PL_FMT_CAP_BLENDABLE)
-                    as ffi::pl_fmt_caps,
+                (ffi::pl_fmt_caps_PL_FMT_CAP_RENDERABLE
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_BLENDABLE
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_SAMPLEABLE
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_LINEAR) as ffi::pl_fmt_caps,
             )
         };
         let vert_pos_fmt =
@@ -1277,8 +1324,78 @@ mod tests {
             "egui overlay GLSL pl_pass_create should compile"
         );
 
+        let mut cas_hook = unsafe {
+            ffi::pl_mpv_user_shader_parse(gpu, CAS_HOOK_GLSL.as_ptr().cast(), CAS_HOOK_GLSL.len())
+        };
+        assert!(
+            !cas_hook.is_null(),
+            "CAS_HOOK_GLSL pl_mpv_user_shader_parse should succeed"
+        );
         unsafe {
+            assert!(
+                (*cas_hook).num_parameters >= 1 && !(*cas_hook).parameters.is_null(),
+                "CAS hook should expose dynamic sharpness parameter"
+            );
+            let data = (*(*cas_hook).parameters).data;
+            assert!(
+                !data.is_null(),
+                "CAS parameter data pointer should be valid"
+            );
+            (*data).f = 0.5;
+            assert!(((*data).f - 0.5).abs() < f32::EPSILON);
+
+            let mut src_tex_params: ffi::pl_tex_params = std::mem::zeroed();
+            src_tex_params.w = 4;
+            src_tex_params.h = 4;
+            src_tex_params.format = target_fmt;
+            src_tex_params.sampleable = true;
+            let mut src_tex = ffi::pl_tex_create(gpu, &src_tex_params);
+            assert!(!src_tex.is_null(), "headless CAS src_tex create");
+
+            let mut dst_tex_params: ffi::pl_tex_params = std::mem::zeroed();
+            dst_tex_params.w = 4;
+            dst_tex_params.h = 4;
+            dst_tex_params.format = target_fmt;
+            dst_tex_params.renderable = true;
+            let mut dst_tex = ffi::pl_tex_create(gpu, &dst_tex_params);
+            assert!(!dst_tex.is_null(), "headless CAS dst_tex create");
+
+            let crop = ffi::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 4.0,
+                y1: 4.0,
+            };
+            let mut src_frame: ffi::pl_frame = std::mem::zeroed();
+            src_frame.num_planes = 1;
+            src_frame.planes[0].texture = src_tex;
+            src_frame.planes[0].components = 4;
+            src_frame.planes[0].component_mapping = [0, 1, 2, 3];
+            src_frame.crop = crop;
+            src_frame.color = ffi::pl_color_space_srgb;
+            src_frame.repr = ffi::pl_color_repr_rgb;
+
+            let mut dst_frame: ffi::pl_frame = std::mem::zeroed();
+            dst_frame.num_planes = 1;
+            dst_frame.planes[0].texture = dst_tex;
+            dst_frame.planes[0].components = 4;
+            dst_frame.planes[0].component_mapping = [0, 1, 2, 3];
+            dst_frame.crop = crop;
+            dst_frame.color = ffi::pl_color_space_srgb;
+            dst_frame.repr = ffi::pl_color_repr_rgb;
+
+            let hook_ptrs = [cas_hook];
+            let mut render_params = ffi::pl_render_fast_params;
+            render_params.upscaler = &raw const ffi::pl_filter_spline36;
+            render_params.hooks = hook_ptrs.as_ptr();
+            render_params.num_hooks = 1;
+            let ok = ffi::pl_render_image(renderer, &src_frame, &dst_frame, &render_params);
+            assert!(ok, "pl_render_image with CAS_HOOK_GLSL should succeed");
+
             ffi::pl_gpu_finish(gpu);
+            ffi::pl_tex_destroy(gpu, &mut src_tex);
+            ffi::pl_tex_destroy(gpu, &mut dst_tex);
+            ffi::pl_mpv_user_shader_destroy(&mut cas_hook);
             ffi::pl_pass_destroy(gpu, &mut pass);
             ffi::pl_renderer_destroy(&mut renderer);
             ffi::pl_vulkan_destroy(&mut vk);
