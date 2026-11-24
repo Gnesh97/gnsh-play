@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod egui_d3d11;
+mod egui_placebo;
 mod gamepad_nav;
 mod logging;
 mod reconnect;
@@ -12,6 +13,7 @@ mod ui;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::Receiver;
 use egui_d3d11::EguiD3d11Painter;
+use egui_placebo::EguiPlaceboPainter;
 use gamepad_nav::{
     GamepadHomeNav, HUD_QUICK_ROWS, HomeNavEvent, HudNavAction, apply_hud_nav, apply_settings_nav,
     settings_row_count,
@@ -20,7 +22,8 @@ use gnsh_input::{
     AppWindow, GamepadManager, KbmAction, KbmConfig, KbmEmulator, merge_controller_states,
 };
 use gnsh_media::{
-    D3D11Renderer, VideoRenderOptions, VideoRenderer, list_playback_devices, list_recording_devices,
+    D3D11Renderer, DecoderHardware, RendererBackend, VideoRenderOptions, VideoRenderer,
+    VulkanPlaceboRenderer, list_playback_devices, list_recording_devices,
 };
 use gnsh_proto::{
     ControllerState, DiscoveredConsole, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES,
@@ -38,7 +41,6 @@ use ui::{
     render_streaming_ui, saved_from_registered, upsert_saved_console,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -270,6 +272,235 @@ fn print_usage() {
     ));
 }
 
+enum ActiveBackend {
+    D3D11 {
+        renderer: D3D11Renderer,
+        egui: EguiD3d11Painter,
+    },
+    Vulkan {
+        renderer: VulkanPlaceboRenderer,
+        egui: EguiPlaceboPainter,
+    },
+}
+
+impl ActiveBackend {
+    fn init(
+        requested: RendererBackend,
+        initial_banner: &mut Option<StatusBanner>,
+    ) -> Result<(AppWindow, Self)> {
+        if requested == RendererBackend::Vulkan {
+            match AppWindow::new_with_vulkan("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT, true) {
+                Ok(window) => {
+                    apply_window_icon(window.hwnd());
+                    let (w, h) = window.size();
+                    let ext_names = match window.vulkan_instance_extensions() {
+                        Ok(names) => names,
+                        Err(err) => {
+                            tracing::warn!("SDL Vulkan extensions unavailable: {err:#}");
+                            Vec::new()
+                        }
+                    };
+                    let exts: Vec<*const std::ffi::c_char> =
+                        ext_names.iter().map(|s| s.as_ptr()).collect();
+                    // SAFETY: `exts` holds valid SDL C strings and `destroy_vulkan_surface`
+                    // matches the instance/surface pair made by `create_vulkan_surface`.
+                    let vk_res = unsafe {
+                        VulkanPlaceboRenderer::new(
+                            &exts,
+                            |inst| window.create_vulkan_surface(inst),
+                            AppWindow::destroy_vulkan_surface,
+                            w,
+                            h,
+                            true,
+                        )
+                    };
+                    match vk_res {
+                        Ok(renderer) => {
+                            return Ok((
+                                window,
+                                Self::Vulkan {
+                                    renderer,
+                                    egui: EguiPlaceboPainter::new(),
+                                },
+                            ));
+                        }
+                        Err(err) => {
+                            tracing::warn!("Vulkan init failed, using Direct3D 11: {err:#}");
+                            if initial_banner.is_none() {
+                                *initial_banner = Some(StatusBanner::info(format!(
+                                    "Vulkan unavailable ({err}); fell back to Direct3D 11."
+                                )));
+                            }
+                        }
+                    }
+                    drop(window);
+                }
+                Err(err) => {
+                    tracing::warn!("Vulkan window failed, using Direct3D 11: {err:#}");
+                    if initial_banner.is_none() {
+                        *initial_banner = Some(StatusBanner::info(format!(
+                            "Vulkan window unavailable ({err}); fell back to Direct3D 11."
+                        )));
+                    }
+                }
+            }
+        } else if requested == RendererBackend::D3D12 && initial_banner.is_none() {
+            *initial_banner = Some(StatusBanner::info(
+                "Direct3D 12 arrives in Milestone 3B; currently running Direct3D 11.",
+            ));
+        }
+
+        let window = AppWindow::new("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .context("failed creating application window")?;
+        apply_window_icon(window.hwnd());
+        let (init_w, init_h) = window.size();
+        let renderer = D3D11Renderer::new(window.hwnd(), init_w, init_h)
+            .context("failed initializing D3D11 renderer")?;
+        let egui = EguiD3d11Painter::new(renderer.device())
+            .context("failed initializing egui D3D11 painter")?;
+        Ok((window, Self::D3D11 { renderer, egui }))
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::D3D11 { .. } => "Direct3D 11",
+            Self::Vulkan { .. } => "Vulkan (libplacebo)",
+        }
+    }
+
+    fn short_label(&self) -> &'static str {
+        match self {
+            Self::D3D11 { .. } => "D3D11",
+            Self::Vulkan { .. } => "Vulkan",
+        }
+    }
+
+    fn decoder_hardware(&self) -> DecoderHardware {
+        match self {
+            Self::D3D11 { renderer, .. } => {
+                DecoderHardware::D3D11ZeroCopy(renderer.device().clone())
+            }
+            Self::Vulkan { .. } => DecoderHardware::D3D11Transfer,
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        match self {
+            Self::D3D11 { renderer, .. } => VideoRenderer::resize(renderer, width, height),
+            Self::Vulkan { renderer, .. } => VideoRenderer::resize(renderer, width, height),
+        }
+    }
+
+    fn wait_for_frame_latency(&self, timeout_ms: u32) {
+        match self {
+            Self::D3D11 { renderer, .. } => renderer.wait_for_frame_latency(timeout_ms),
+            Self::Vulkan { renderer, .. } => renderer.wait_for_frame_latency(timeout_ms),
+        }
+    }
+
+    fn clear_video_cache(&mut self) {
+        match self {
+            Self::D3D11 { renderer, .. } => renderer.clear_video_cache(),
+            Self::Vulkan { renderer, .. } => renderer.clear_video_cache(),
+        }
+    }
+
+    fn is_hdr_output_active(&self) -> bool {
+        match self {
+            Self::D3D11 { renderer, .. } => VideoRenderer::is_hdr_output_active(renderer),
+            Self::Vulkan { renderer, .. } => VideoRenderer::is_hdr_output_active(renderer),
+        }
+    }
+
+    fn set_hdr_output(&mut self, enable: bool) -> Result<bool> {
+        match self {
+            Self::D3D11 { renderer, .. } => VideoRenderer::set_hdr_output(renderer, enable),
+            Self::Vulkan { renderer, .. } => VideoRenderer::set_hdr_output(renderer, enable),
+        }
+    }
+
+    fn set_vsync(&mut self, vsync: bool) -> Result<()> {
+        match self {
+            Self::D3D11 { .. } => Ok(()),
+            Self::Vulkan { renderer, .. } => renderer.set_vsync(vsync),
+        }
+    }
+
+    fn begin_frame(&self, clear_rgba: [f32; 4]) {
+        match self {
+            Self::D3D11 { renderer, .. } => VideoRenderer::begin_frame(renderer, clear_rgba),
+            Self::Vulkan { renderer, .. } => VideoRenderer::begin_frame(renderer, clear_rgba),
+        }
+    }
+
+    fn draw_video_frame(
+        &mut self,
+        frame: &gnsh_media::DecodedFrame,
+        options: VideoRenderOptions,
+    ) -> Result<()> {
+        match self {
+            Self::D3D11 { renderer, .. } => {
+                VideoRenderer::draw_video_frame(renderer, frame, options)
+            }
+            Self::Vulkan { renderer, .. } => {
+                VideoRenderer::draw_video_frame(renderer, frame, options)
+            }
+        }
+    }
+
+    fn paint_egui(
+        &mut self,
+        textures_delta: &egui::TexturesDelta,
+        pixels_per_point: f32,
+        clipped: &[egui::ClippedPrimitive],
+        hdr_output_active: bool,
+    ) {
+        match self {
+            Self::D3D11 { renderer, egui } => {
+                renderer.bind_backbuffer();
+                if let Err(err) =
+                    egui.update_textures(renderer.device(), renderer.context(), textures_delta)
+                {
+                    tracing::warn!("egui texture upload failed: {err:#}");
+                }
+                if let Err(err) = egui.paint(
+                    renderer.device(),
+                    renderer.context(),
+                    VideoRenderer::viewport_size(renderer),
+                    pixels_per_point,
+                    hdr_output_active,
+                    clipped,
+                ) {
+                    tracing::warn!("egui paint failed: {err:#}");
+                }
+                egui.free_textures(textures_delta);
+            }
+            Self::Vulkan { renderer, egui } => {
+                if let Err(err) = egui.update_textures(renderer, textures_delta) {
+                    tracing::warn!("Vulkan egui texture upload failed: {err:#}");
+                }
+                if let Err(err) = egui.paint(
+                    renderer,
+                    VideoRenderer::viewport_size(renderer),
+                    pixels_per_point,
+                    hdr_output_active,
+                    clipped,
+                ) {
+                    tracing::warn!("Vulkan egui paint failed: {err:#}");
+                }
+                egui.free_textures(renderer, textures_delta);
+            }
+        }
+    }
+
+    fn present(&self, vsync: bool) -> Result<()> {
+        match self {
+            Self::D3D11 { renderer, .. } => VideoRenderer::present(renderer, vsync),
+            Self::Vulkan { renderer, .. } => VideoRenderer::present(renderer, vsync),
+        }
+    }
+}
+
 fn run_gui(launch: LaunchOptions) -> Result<()> {
     let _log_path = logging::init_logging();
 
@@ -302,14 +533,8 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         }
     };
 
-    let mut window = AppWindow::new("gnsh-play", DEFAULT_WIDTH, DEFAULT_HEIGHT)
-        .context("failed creating application window")?;
-    apply_window_icon(window.hwnd());
-    let (init_w, init_h) = window.size();
-    let mut renderer = D3D11Renderer::new(window.hwnd(), init_w, init_h)
-        .context("failed initializing D3D11 renderer")?;
-    let mut painter = EguiD3d11Painter::new(renderer.device())
-        .context("failed initializing egui D3D11 painter")?;
+    let (mut window, mut backend) =
+        ActiveBackend::init(initial_settings.renderer_backend, &mut initial_banner)?;
     let mut gamepads = GamepadManager::new().context("failed initializing SDL3 gamepad manager")?;
     let mut kbm = KbmEmulator::default();
 
@@ -323,6 +548,12 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         initial_settings,
         initial_banner,
     );
+    app.active_renderer_label = backend.label();
+    app.active_renderer_short = backend.short_label();
+    tracing::info!(
+        renderer = app.active_renderer_label,
+        "Active graphics backend ready"
+    );
     if launch.start_fullscreen
         && let Err(err) = window.toggle_fullscreen()
     {
@@ -334,7 +565,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
     if let Some(target) = launch.connect_target.as_deref() {
         if let Some(idx) = find_saved_console_for_cli(&app.saved_consoles, target) {
             app.selected_console_idx = idx;
-            app.begin_stream(idx, launch.use_wan, renderer.device().clone());
+            app.begin_stream(idx, launch.use_wan, backend.decoder_hardware());
         } else {
             app.status_banner = Some(StatusBanner::error(format!(
                 "Saved console '{target}' not found. Run --list to view saved consoles."
@@ -359,7 +590,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             }
             false
         } else {
-            renderer.wait_for_frame_latency(100);
+            backend.wait_for_frame_latency(100);
             true
         };
 
@@ -368,9 +599,12 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             break;
         }
         if let Some((nw, nh)) = summary.resized
-            && let Err(err) = renderer.resize(nw, nh)
+            && let Err(err) = backend.resize(nw, nh)
         {
-            tracing::warn!("D3D11 resize({nw}, {nh}) failed: {err:#}");
+            tracing::warn!(
+                "{} resize({nw}, {nh}) failed: {err:#}",
+                backend.short_label()
+            );
         }
         if summary.toggle_fullscreen
             && let Err(err) = window.toggle_fullscreen()
@@ -446,7 +680,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
 
         let is_streaming = matches!(app.mode, AppMode::Streaming(_));
         if was_streaming && !is_streaming {
-            renderer.clear_video_cache();
+            backend.clear_video_cache();
         }
         was_streaming = is_streaming;
 
@@ -457,18 +691,19 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         if hdr_mode_changed
             || (want_hdr && (summary.resized.is_some() || summary.toggle_fullscreen))
         {
-            match renderer.set_hdr_output(want_hdr) {
+            match backend.set_hdr_output(want_hdr) {
                 Ok(active) => {
                     if hdr_mode_changed {
                         tracing::info!(
+                            renderer = backend.short_label(),
                             want_hdr,
                             hdr_output_active = active,
-                            "Updated D3D11 HDR output mode"
+                            "Updated HDR output mode"
                         );
                     }
                 }
                 Err(err) => {
-                    tracing::warn!("D3D11 HDR output transition failed: {err:#}");
+                    tracing::warn!("HDR output transition failed: {err:#}");
                 }
             }
             prev_want_hdr = want_hdr;
@@ -496,23 +731,31 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         }
 
         if !waited_for_latency {
-            renderer.wait_for_frame_latency(100);
+            backend.wait_for_frame_latency(100);
         }
 
         raw_input.time = Some(start_time.elapsed().as_secs_f64());
+
+        let vsync = if is_streaming {
+            app.settings.vsync
+        } else {
+            true
+        };
+        if let Err(err) = backend.set_vsync(vsync) {
+            tracing::warn!("Failed updating VSync mode ({vsync}): {err:#}");
+        }
 
         let clear_rgba = if is_streaming {
             [0.0, 0.0, 0.0, 1.0]
         } else {
             [0.04, 0.05, 0.08, 1.0]
         };
-        renderer.begin_frame(clear_rgba);
+        backend.begin_frame(clear_rgba);
 
         let sharpness = f32::from(app.settings.sharpness_pct.min(100)) / 100.0;
         if let AppMode::Streaming(ref stream) = app.mode
             && let Some(ref latest) = stream.current_frame
-            && let Err(err) = VideoRenderer::draw_video_frame(
-                &mut renderer,
+            && let Err(err) = backend.draw_video_frame(
                 &latest.frame,
                 VideoRenderOptions {
                     filter_mode: app.settings.filter_mode,
@@ -531,18 +774,16 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
                 &app.mode,
                 AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some() || s.osk_prompt.is_some()
             );
-        let hdr_output_active = renderer.is_hdr_output_active();
+        let hdr_output_active = backend.is_hdr_output_active();
         let mouse_locked = window.is_relative_mouse_mode();
         if draw_egui {
-            renderer.bind_backbuffer();
-
             let gamepad_name = gamepads.connected_name().map(str::to_owned);
-            let device_for_connect = renderer.device().clone();
+            let decoder_hw = backend.decoder_hardware();
             let full_output = egui_ctx.run_ui(raw_input.take(), |ui| {
                 app.ui(
                     ui,
                     gamepad_name.as_deref(),
-                    &device_for_connect,
+                    decoder_hw.clone(),
                     hdr_output_active,
                     mouse_locked,
                 );
@@ -551,34 +792,17 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             handle_platform_commands(&window, &full_output.platform_output.commands);
 
             let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-            if let Err(err) = painter.update_textures(
-                renderer.device(),
-                renderer.context(),
+            backend.paint_egui(
                 &full_output.textures_delta,
-            ) {
-                tracing::warn!("egui texture upload failed: {err:#}");
-            }
-            if let Err(err) = painter.paint(
-                renderer.device(),
-                renderer.context(),
-                renderer.viewport_size(),
                 full_output.pixels_per_point,
-                hdr_output_active,
                 &clipped,
-            ) {
-                tracing::warn!("egui paint failed: {err:#}");
-            }
-            painter.free_textures(&full_output.textures_delta);
+                hdr_output_active,
+            );
         } else {
             let _ = raw_input.take();
         }
 
-        let vsync = if is_streaming {
-            app.settings.vsync
-        } else {
-            true
-        };
-        match renderer.present(vsync) {
+        match backend.present(vsync) {
             Ok(()) => {
                 last_present = Instant::now();
                 if let AppMode::Streaming(ref mut stream) = app.mode {
@@ -586,7 +810,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
                 }
             }
             Err(err) => {
-                tracing::warn!("D3D11 present failed: {err:#}");
+                tracing::warn!("{} present failed: {err:#}", backend.short_label());
             }
         }
 
@@ -623,11 +847,10 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
     window.set_relative_mouse_mode(false);
     kbm.clear_state();
     app.stop_stream(&mut gamepads, None);
-    let _ = renderer.set_hdr_output(false);
-    renderer.clear_video_cache();
+    let _ = backend.set_hdr_output(false);
+    backend.clear_video_cache();
     drop(app);
-    drop(painter);
-    drop(renderer);
+    drop(backend);
     drop(window);
     Ok(())
 }
@@ -748,6 +971,8 @@ pub(crate) struct AppState {
     pub(crate) discovery_rx: Option<Receiver<std::result::Result<Vec<DiscoveredConsole>, String>>>,
     pub(crate) wake_rx: Option<Receiver<std::result::Result<String, String>>>,
     pub(crate) settings: StreamSettings,
+    pub(crate) active_renderer_label: &'static str,
+    pub(crate) active_renderer_short: &'static str,
     pub(crate) status_banner: Option<StatusBanner>,
     pub(crate) register_modal: Option<RegisterModal>,
     pub(crate) edit_modal: Option<EditConsoleModal>,
@@ -919,6 +1144,8 @@ impl AppState {
             discovery_rx: None,
             wake_rx: None,
             settings,
+            active_renderer_label: "Direct3D 11",
+            active_renderer_short: "D3D11",
             status_banner,
             register_modal: None,
             edit_modal: None,
@@ -1778,6 +2005,12 @@ impl AppState {
                 stream.set_mic_device(self.settings.mic_device.clone());
             }
         }
+        if self.settings.renderer_backend != prev.renderer_backend {
+            self.status_banner = Some(StatusBanner::info(format!(
+                "Renderer set to {}. Restart gnsh-play to apply.",
+                self.settings.renderer_backend.label()
+            )));
+        }
         self.persist_settings();
     }
 
@@ -1785,12 +2018,12 @@ impl AppState {
         &mut self,
         ui: &mut egui::Ui,
         gamepad_name: Option<&str>,
-        device: &ID3D11Device,
+        hw: DecoderHardware,
         hdr_output_active: bool,
         mouse_locked: bool,
     ) {
         if let Some((idx, use_wan)) = self.pending_stream_connect.take() {
-            self.begin_stream(idx, use_wan, device.clone());
+            self.begin_stream(idx, use_wan, hw);
         }
 
         let prev_settings = self.settings.clone();
@@ -1806,6 +2039,7 @@ impl AppState {
                     &mut self.settings,
                     &self.audio_devices,
                     &self.mic_devices,
+                    self.active_renderer_short,
                     hdr_output_active,
                     mouse_locked,
                     &mut self.kbm_modal_open,
@@ -1818,7 +2052,7 @@ impl AppState {
         self.apply_settings_side_effects(&prev_settings);
     }
 
-    fn begin_stream(&mut self, saved_idx: usize, use_wan: bool, device: ID3D11Device) {
+    fn begin_stream(&mut self, saved_idx: usize, use_wan: bool, hw: DecoderHardware) {
         let Some(console) = self.saved_consoles.get(saved_idx) else {
             self.reconnect = None;
             self.active_stream_target = None;
@@ -1840,7 +2074,7 @@ impl AppState {
         } else {
             &console.host
         };
-        match ActiveStream::start_with_host(console, target_host, &self.settings, use_wan, device) {
+        match ActiveStream::start_with_host(console, target_host, &self.settings, use_wan, hw) {
             Ok(stream) => {
                 self.active_stream_target = Some((saved_idx, use_wan));
                 self.status_banner = None;

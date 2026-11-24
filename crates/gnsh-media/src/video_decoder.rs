@@ -45,6 +45,14 @@ pub struct D3D11Frame {
     _av_frame: AvFrameGuard,
 }
 
+/// Hardware acceleration mode for `VideoDecoder`.
+#[derive(Debug, Clone)]
+pub enum DecoderHardware {
+    None,
+    D3D11ZeroCopy(ID3D11Device),
+    D3D11Transfer,
+}
+
 pub enum DecodedFrame {
     D3D11(D3D11Frame),
     SoftwareYuv420 {
@@ -59,6 +67,26 @@ pub enum DecodedFrame {
         pts: i64,
         is_hdr: bool,
     },
+    SoftwareNv12 {
+        y: Vec<u8>,
+        uv: Vec<u8>,
+        y_stride: usize,
+        uv_stride: usize,
+        width: u32,
+        height: u32,
+        pts: i64,
+        is_hdr: bool,
+    },
+    SoftwareP010 {
+        y: Vec<u8>,
+        uv: Vec<u8>,
+        y_stride: usize,
+        uv_stride: usize,
+        width: u32,
+        height: u32,
+        pts: i64,
+        is_hdr: bool,
+    },
 }
 
 impl DecodedFrame {
@@ -66,7 +94,9 @@ impl DecodedFrame {
     pub fn pts(&self) -> i64 {
         match self {
             Self::D3D11(frame) => frame.pts,
-            Self::SoftwareYuv420 { pts, .. } => *pts,
+            Self::SoftwareYuv420 { pts, .. }
+            | Self::SoftwareNv12 { pts, .. }
+            | Self::SoftwareP010 { pts, .. } => *pts,
         }
     }
 
@@ -74,7 +104,9 @@ impl DecodedFrame {
     pub fn is_hdr(&self) -> bool {
         match self {
             Self::D3D11(frame) => frame.is_hdr,
-            Self::SoftwareYuv420 { is_hdr, .. } => *is_hdr,
+            Self::SoftwareYuv420 { is_hdr, .. }
+            | Self::SoftwareNv12 { is_hdr, .. }
+            | Self::SoftwareP010 { is_hdr, .. } => *is_hdr,
         }
     }
 }
@@ -85,7 +117,9 @@ pub struct VideoDecoder {
     hw_device_ctx: *mut ffi::AVBufferRef,
     pkt: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
+    sw_frame: *mut ffi::AVFrame,
     hw_active: bool,
+    transfer_hw: bool,
     decoded_any: bool,
 }
 
@@ -98,12 +132,20 @@ enum DrainOutcome {
 
 impl VideoDecoder {
     pub fn new(codec: MediaCodec, d3d11_device: Option<ID3D11Device>) -> Result<Self> {
-        if let Some(dev) = d3d11_device
-            && let Ok(hw) = Self::open_internal(codec, Some(dev))
+        let hw = match d3d11_device {
+            Some(dev) => DecoderHardware::D3D11ZeroCopy(dev),
+            None => DecoderHardware::None,
+        };
+        Self::new_with_mode(codec, hw)
+    }
+
+    pub fn new_with_mode(codec: MediaCodec, hw: DecoderHardware) -> Result<Self> {
+        if !matches!(hw, DecoderHardware::None)
+            && let Ok(dec) = Self::open_internal(codec, hw)
         {
-            return Ok(hw);
+            return Ok(dec);
         }
-        Self::open_internal(codec, None)
+        Self::open_internal(codec, DecoderHardware::None)
     }
 
     pub fn is_hw_active(&self) -> bool {
@@ -162,7 +204,7 @@ impl VideoDecoder {
                     "D3D11VA failed on initial packet ({}); falling back to software decode",
                     av_err_string(send_err)
                 );
-                let sw = Self::open_internal(self.codec, None)?;
+                let sw = Self::open_internal(self.codec, DecoderHardware::None)?;
                 *self = sw;
                 return self.decode_with_pts(annex_b, pts);
             }
@@ -188,7 +230,7 @@ impl VideoDecoder {
                         "D3D11VA receive_frame failed ({}); falling back to software decode",
                         av_err_string(r)
                     );
-                    let sw = Self::open_internal(self.codec, None)?;
+                    let sw = Self::open_internal(self.codec, DecoderHardware::None)?;
                     *self = sw;
                     return Ok(DrainOutcome::FallbackToSw);
                 }
@@ -196,7 +238,41 @@ impl VideoDecoder {
             }
 
             let is_hdr_codec = self.codec == MediaCodec::HevcHdr;
-            if let Some(decoded) = unsafe { extract_frame(self.frame, is_hdr_codec)? } {
+            let fmt = unsafe { (*self.frame).format };
+            let decoded = if self.transfer_hw && fmt == ffi::AVPixelFormat_AV_PIX_FMT_D3D11 {
+                let xfer_err =
+                    unsafe { ffi::av_hwframe_transfer_data(self.sw_frame, self.frame, 0) };
+                if xfer_err < 0 {
+                    unsafe {
+                        ffi::av_frame_unref(self.sw_frame);
+                        ffi::av_frame_unref(self.frame);
+                    }
+                    if !self.decoded_any {
+                        tracing::warn!(
+                            "D3D11VA frame transfer failed ({}); falling back to software decode",
+                            av_err_string(xfer_err)
+                        );
+                        let sw = Self::open_internal(self.codec, DecoderHardware::None)?;
+                        *self = sw;
+                        return Ok(DrainOutcome::FallbackToSw);
+                    }
+                    bail!(
+                        "av_hwframe_transfer_data failed: {}",
+                        av_err_string(xfer_err)
+                    );
+                }
+                unsafe {
+                    (*self.sw_frame).pts = (*self.frame).pts;
+                }
+                let out = unsafe { extract_frame(self.sw_frame, is_hdr_codec, true)? };
+                unsafe {
+                    ffi::av_frame_unref(self.sw_frame);
+                }
+                out
+            } else {
+                unsafe { extract_frame(self.frame, is_hdr_codec, self.transfer_hw)? }
+            };
+            if let Some(decoded) = decoded {
                 self.decoded_any = true;
                 frames.push(decoded);
             }
@@ -206,7 +282,7 @@ impl VideoDecoder {
         }
     }
 
-    fn open_internal(codec: MediaCodec, d3d11_device: Option<ID3D11Device>) -> Result<Self> {
+    fn open_internal(codec: MediaCodec, hw: DecoderHardware) -> Result<Self> {
         let codec_id = match codec {
             MediaCodec::H264 => ffi::AVCodecID_AV_CODEC_ID_H264,
             MediaCodec::Hevc | MediaCodec::HevcHdr => ffi::AVCodecID_AV_CODEC_ID_HEVC,
@@ -222,13 +298,17 @@ impl VideoDecoder {
         }
         let pkt = unsafe { ffi::av_packet_alloc() };
         let frame = unsafe { ffi::av_frame_alloc() };
-        if pkt.is_null() || frame.is_null() {
+        let sw_frame = unsafe { ffi::av_frame_alloc() };
+        if pkt.is_null() || frame.is_null() || sw_frame.is_null() {
             unsafe {
                 if !pkt.is_null() {
                     ffi::av_packet_free(&mut { pkt });
                 }
                 if !frame.is_null() {
                     ffi::av_frame_free(&mut { frame });
+                }
+                if !sw_frame.is_null() {
+                    ffi::av_frame_free(&mut { sw_frame });
                 }
                 ffi::avcodec_free_context(&mut { ctx });
             }
@@ -237,6 +317,7 @@ impl VideoDecoder {
 
         let mut hw_device_ctx: *mut ffi::AVBufferRef = std::ptr::null_mut();
         let mut hw_active = false;
+        let mut transfer_hw = false;
 
         unsafe {
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
@@ -245,25 +326,50 @@ impl VideoDecoder {
             (*ctx).thread_type = 2;
         }
 
-        if let Some(dev) = d3d11_device {
-            match unsafe { create_d3d11va_device_ctx(&dev) } {
-                Ok(buf_ref) => {
-                    unsafe {
-                        (*ctx).hw_device_ctx = ffi::av_buffer_ref(buf_ref);
-                        (*ctx).get_format = Some(select_d3d11_format);
-                        (*ctx).thread_count = 1;
+        match hw {
+            DecoderHardware::D3D11ZeroCopy(dev) => {
+                match unsafe { create_d3d11va_device_ctx(&dev) } {
+                    Ok(buf_ref) => {
+                        unsafe {
+                            (*ctx).hw_device_ctx = ffi::av_buffer_ref(buf_ref);
+                            (*ctx).get_format = Some(select_d3d11_format);
+                            (*ctx).thread_count = 1;
+                        }
+                        hw_device_ctx = buf_ref;
+                        hw_active = true;
                     }
-                    hw_device_ctx = buf_ref;
-                    hw_active = true;
-                }
-                Err(e) => {
-                    tracing::warn!("D3D11VA device setup failed, using software decoder: {e:#}");
+                    Err(e) => {
+                        tracing::warn!(
+                            "D3D11VA device setup failed, using software decoder: {e:#}"
+                        );
+                    }
                 }
             }
-        } else {
-            unsafe {
+            DecoderHardware::D3D11Transfer => {
+                match unsafe { create_d3d11va_transfer_device_ctx() } {
+                    Ok(buf_ref) => {
+                        unsafe {
+                            (*ctx).hw_device_ctx = ffi::av_buffer_ref(buf_ref);
+                            (*ctx).get_format = Some(select_d3d11_format);
+                            (*ctx).thread_count = 1;
+                        }
+                        hw_device_ctx = buf_ref;
+                        hw_active = true;
+                        transfer_hw = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "D3D11VA transfer setup failed, using software decoder: {e:#}"
+                        );
+                        unsafe {
+                            (*ctx).thread_count = 4;
+                        }
+                    }
+                }
+            }
+            DecoderHardware::None => unsafe {
                 (*ctx).thread_count = 4;
-            }
+            },
         }
 
         let open_err = unsafe { ffi::avcodec_open2(ctx, av_codec, std::ptr::null_mut()) };
@@ -274,6 +380,7 @@ impl VideoDecoder {
                 }
                 ffi::av_packet_free(&mut { pkt });
                 ffi::av_frame_free(&mut { frame });
+                ffi::av_frame_free(&mut { sw_frame });
                 ffi::avcodec_free_context(&mut { ctx });
             }
             bail!("avcodec_open2 failed: {}", av_err_string(open_err));
@@ -285,7 +392,9 @@ impl VideoDecoder {
             hw_device_ctx,
             pkt,
             frame,
+            sw_frame,
             hw_active,
+            transfer_hw,
             decoded_any: false,
         })
     }
@@ -294,6 +403,9 @@ impl VideoDecoder {
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
         unsafe {
+            if !self.sw_frame.is_null() {
+                ffi::av_frame_free(&mut self.sw_frame);
+            }
             if !self.frame.is_null() {
                 ffi::av_frame_free(&mut self.frame);
             }
@@ -308,6 +420,26 @@ impl Drop for VideoDecoder {
             }
         }
     }
+}
+
+unsafe fn create_d3d11va_transfer_device_ctx() -> Result<*mut ffi::AVBufferRef> {
+    let mut hw_ref: *mut ffi::AVBufferRef = std::ptr::null_mut();
+    let err = unsafe {
+        ffi::av_hwdevice_ctx_create(
+            &mut hw_ref,
+            ffi::AVHWDeviceType_AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if err < 0 || hw_ref.is_null() {
+        bail!(
+            "av_hwdevice_ctx_create(D3D11VA) failed: {}",
+            av_err_string(err)
+        );
+    }
+    Ok(hw_ref)
 }
 
 unsafe fn create_d3d11va_device_ctx(dev: &ID3D11Device) -> Result<*mut ffi::AVBufferRef> {
@@ -360,7 +492,11 @@ unsafe extern "C" fn select_d3d11_format(
     }
 }
 
-unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<DecodedFrame>> {
+unsafe fn extract_frame(
+    src: *mut ffi::AVFrame,
+    is_hdr: bool,
+    preserve_semiplanar: bool,
+) -> Result<Option<DecodedFrame>> {
     if src.is_null() {
         bail!("FFmpeg AVFrame pointer is null");
     }
@@ -445,6 +581,19 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
         let ys = validate_plane_layout(y_ptr, ys_raw, w, h)?;
         let uvs = validate_plane_layout(uv_ptr, uvs_raw, cw * 2, ch)?;
         let y = copy_plane(y_ptr, ys, w, h);
+        if preserve_semiplanar {
+            let uv = copy_plane(uv_ptr, uvs, cw * 2, ch);
+            return Ok(Some(DecodedFrame::SoftwareNv12 {
+                y,
+                uv,
+                y_stride: w,
+                uv_stride: cw * 2,
+                width,
+                height,
+                pts,
+                is_hdr,
+            }));
+        }
         let mut u = Vec::with_capacity(cw * ch);
         let mut v = Vec::with_capacity(cw * ch);
         for row in 0..ch {
@@ -518,6 +667,20 @@ unsafe fn extract_frame(src: *mut ffi::AVFrame, is_hdr: bool) -> Result<Option<D
         let ch = h.div_ceil(2);
         let ys = validate_plane_layout(y_ptr, ys_raw, w * 2, h)?;
         let uvs = validate_plane_layout(uv_ptr, uvs_raw, cw * 4, ch)?;
+        if preserve_semiplanar {
+            let y = copy_plane(y_ptr, ys, w * 2, h);
+            let uv = copy_plane(uv_ptr, uvs, cw * 4, ch);
+            return Ok(Some(DecodedFrame::SoftwareP010 {
+                y,
+                uv,
+                y_stride: w * 2,
+                uv_stride: cw * 4,
+                width,
+                height,
+                pts,
+                is_hdr: true,
+            }));
+        }
         let y = copy_plane_10le_to_u8(y_ptr, ys, w, h, 8);
         let mut u = Vec::with_capacity(cw * ch);
         let mut v = Vec::with_capacity(cw * ch);
@@ -639,7 +802,9 @@ mod tests {
             DecodedFrame::SoftwareYuv420 { width, height, .. } => {
                 assert_eq!((*width, *height), (64, 64));
             }
-            DecodedFrame::D3D11(_) => panic!("expected software YUV420 frame"),
+            DecodedFrame::D3D11(_)
+            | DecodedFrame::SoftwareNv12 { .. }
+            | DecodedFrame::SoftwareP010 { .. } => panic!("expected software YUV420 frame"),
         }
     }
 
@@ -708,5 +873,104 @@ mod tests {
             VideoDecoder::new(MediaCodec::H264, None).expect("FFmpeg H264 decoder initializes");
         let oversized = vec![0u8; MAX_VIDEO_PACKET_BYTES + 1];
         assert!(decoder.decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn preserves_semiplanar_nv12_and_p010_frames() {
+        let mut nv12_y = [16u8, 32, 48, 64, 80, 96, 112, 128];
+        let mut nv12_uv = [120u8, 130, 140, 150];
+        let mut av_frame = unsafe { ffi::av_frame_alloc() };
+        assert!(!av_frame.is_null());
+        unsafe {
+            (*av_frame).format = ffi::AVPixelFormat_AV_PIX_FMT_NV12;
+            (*av_frame).width = 4;
+            (*av_frame).height = 2;
+            (*av_frame).pts = 42;
+            (*av_frame).data[0] = nv12_y.as_mut_ptr();
+            (*av_frame).data[1] = nv12_uv.as_mut_ptr();
+            (*av_frame).linesize[0] = 4;
+            (*av_frame).linesize[1] = 4;
+        }
+        let frame = unsafe { extract_frame(av_frame, false, true) }
+            .expect("NV12 extract ok")
+            .expect("NV12 frame produced");
+        match frame {
+            DecodedFrame::SoftwareNv12 {
+                y,
+                uv,
+                y_stride,
+                uv_stride,
+                width,
+                height,
+                pts,
+                is_hdr,
+            } => {
+                assert_eq!(
+                    (width, height, y_stride, uv_stride, pts, is_hdr),
+                    (4, 2, 4, 4, 42, false)
+                );
+                assert_eq!(y, nv12_y);
+                assert_eq!(uv, nv12_uv);
+            }
+            _ => panic!("expected SoftwareNv12"),
+        }
+
+        let mut p010_y: Vec<u8> = [64_u16 << 6, 256_u16 << 6, 512_u16 << 6, 1020_u16 << 6]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut p010_uv: Vec<u8> = [512_u16 << 6, 600_u16 << 6]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        unsafe {
+            (*av_frame).format = ffi::AVPixelFormat_AV_PIX_FMT_P010LE;
+            (*av_frame).width = 2;
+            (*av_frame).height = 2;
+            (*av_frame).pts = 99;
+            (*av_frame).data[0] = p010_y.as_mut_ptr();
+            (*av_frame).data[1] = p010_uv.as_mut_ptr();
+            (*av_frame).linesize[0] = 4;
+            (*av_frame).linesize[1] = 4;
+        }
+        let p010_frame = unsafe { extract_frame(av_frame, true, true) }
+            .expect("P010 extract ok")
+            .expect("P010 frame produced");
+        match p010_frame {
+            DecodedFrame::SoftwareP010 {
+                y,
+                uv,
+                y_stride,
+                uv_stride,
+                width,
+                height,
+                pts,
+                is_hdr,
+            } => {
+                assert_eq!(
+                    (width, height, y_stride, uv_stride, pts, is_hdr),
+                    (2, 2, 4, 4, 99, true)
+                );
+                assert_eq!(y, p010_y);
+                assert_eq!(uv, p010_uv);
+            }
+            _ => panic!("expected SoftwareP010"),
+        }
+        unsafe {
+            ffi::av_frame_free(&mut av_frame);
+        }
+    }
+
+    #[test]
+    fn initializes_d3d11_transfer_mode_and_decodes_idr_without_d3d11_frames() {
+        let mut decoder =
+            VideoDecoder::new_with_mode(MediaCodec::H264, DecoderHardware::D3D11Transfer)
+                .expect("D3D11Transfer or software fallback initializes");
+        let frames = decoder.decode(TEST_H264_IDR).expect("IDR decode ok");
+        assert!(!frames.is_empty(), "expected decoded IDR frame");
+        assert!(
+            !matches!(frames[0], DecodedFrame::D3D11(_)),
+            "transfer mode must never emit D3D11 zero-copy textures"
+        );
     }
 }

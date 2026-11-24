@@ -5,6 +5,7 @@ pub mod d3d11_renderer;
     non_camel_case_types,
     non_snake_case,
     dead_code,
+    unused_imports,
     clippy::all
 )]
 pub(crate) mod ffi {
@@ -12,11 +13,17 @@ pub(crate) mod ffi {
 }
 pub mod renderer;
 pub mod video_decoder;
+pub mod vulkan_renderer;
 
 pub use audio::{
     AudioOutput, HapticsAudioOutput, MicCapture, list_playback_devices, list_recording_devices,
     volume_pct_to_gain,
 };
 pub use d3d11_renderer::D3D11Renderer;
-pub use renderer::{ScaleMode, VideoFilterMode, VideoRenderOptions, VideoRenderer};
-pub use video_decoder::{D3D11Frame, DecodedFrame, MediaCodec, VideoDecoder};
+pub use renderer::{
+    RendererBackend, ScaleMode, VideoFilterMode, VideoRenderOptions, VideoRenderer,
+};
+pub use video_decoder::{D3D11Frame, DecodedFrame, DecoderHardware, MediaCodec, VideoDecoder};
+pub use vulkan_renderer::{
+    UiMeshDraw, UiTextureWrap, VulkanPlaceboRenderer, compute_placebo_target_rect,
+};

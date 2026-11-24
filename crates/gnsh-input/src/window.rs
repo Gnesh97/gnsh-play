@@ -32,15 +32,29 @@ pub struct AppWindow {
 impl AppWindow {
     /// Creates a resizable SDL3 window, starts text input, and resolves its Win32 `HWND`.
     pub fn new(title: &str, width: u32, height: u32) -> anyhow::Result<Self> {
+        Self::new_with_vulkan(title, width, height, false)
+    }
+
+    /// Creates a resizable SDL3 window optionally configured for Vulkan surface creation.
+    pub fn new_with_vulkan(
+        title: &str,
+        width: u32,
+        height: u32,
+        enable_vulkan: bool,
+    ) -> anyhow::Result<Self> {
         crate::init_sdl()?;
 
         let c_title = CString::new(title).context("window title contains interior NUL")?;
         let w = width.clamp(1, i32::MAX as u32) as c_int;
         let h = height.clamp(1, i32::MAX as u32) as c_int;
+        let flags = ffi::GNSH_SDL_WINDOW_RESIZABLE
+            | if enable_vulkan {
+                ffi::GNSH_SDL_WINDOW_VULKAN
+            } else {
+                0
+            };
 
-        let window = unsafe {
-            ffi::SDL_CreateWindow(c_title.as_ptr(), w, h, ffi::GNSH_SDL_WINDOW_RESIZABLE)
-        };
+        let window = unsafe { ffi::SDL_CreateWindow(c_title.as_ptr(), w, h, flags) };
         if window.is_null() {
             anyhow::bail!("SDL_CreateWindow failed: {}", crate::sdl_error());
         }
@@ -80,6 +94,68 @@ impl AppWindow {
     /// Returns the native Win32 `HWND` associated with this window.
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// Queries the Vulkan instance extensions required by SDL for surface creation.
+    pub fn vulkan_instance_extensions(&self) -> anyhow::Result<Vec<CString>> {
+        let mut count: u32 = 0;
+        // SAFETY: SDL returns an SDL-owned static array of C strings for `count` extensions.
+        let ptr = unsafe { ffi::SDL_Vulkan_GetInstanceExtensions(&mut count) };
+        if ptr.is_null() {
+            anyhow::bail!(
+                "SDL_Vulkan_GetInstanceExtensions failed: {}",
+                crate::sdl_error()
+            );
+        }
+        let slice = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
+        let mut out = Vec::with_capacity(slice.len());
+        for &ext in slice {
+            if !ext.is_null() {
+                out.push(unsafe { CStr::from_ptr(ext) }.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Creates a `VkSurfaceKHR` bound to this window and the supplied `VkInstance`.
+    pub fn create_vulkan_surface(
+        &self,
+        vk_instance: *mut std::ffi::c_void,
+    ) -> anyhow::Result<*mut std::ffi::c_void> {
+        if vk_instance.is_null() {
+            anyhow::bail!("vk_instance cannot be null");
+        }
+        let mut surface: ffi::VkSurfaceKHR = std::ptr::null_mut();
+        // SAFETY: `self.window` was created with `SDL_WINDOW_VULKAN` and `vk_instance` is valid.
+        let ok = unsafe {
+            ffi::SDL_Vulkan_CreateSurface(
+                self.window,
+                vk_instance.cast(),
+                std::ptr::null(),
+                &mut surface,
+            )
+        };
+        if !ok || surface.is_null() {
+            anyhow::bail!("SDL_Vulkan_CreateSurface failed: {}", crate::sdl_error());
+        }
+        Ok(surface.cast())
+    }
+
+    /// Destroys a `VkSurfaceKHR` previously returned by `create_vulkan_surface`.
+    pub fn destroy_vulkan_surface(
+        vk_instance: *mut std::ffi::c_void,
+        vk_surface: *mut std::ffi::c_void,
+    ) {
+        if !vk_instance.is_null() && !vk_surface.is_null() {
+            // SAFETY: Matches SDL_Vulkan_CreateSurface with null custom allocator callbacks.
+            unsafe {
+                ffi::SDL_Vulkan_DestroySurface(
+                    vk_instance.cast(),
+                    vk_surface.cast(),
+                    std::ptr::null(),
+                );
+            }
+        }
     }
 
     /// Returns the current window client area `(width, height)` clamped to at least `(1, 1)`.

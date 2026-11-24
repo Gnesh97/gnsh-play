@@ -1105,6 +1105,18 @@ impl D3D11Renderer {
                 height,
                 is_hdr,
                 ..
+            }
+            | DecodedFrame::SoftwareNv12 {
+                width,
+                height,
+                is_hdr,
+                ..
+            }
+            | DecodedFrame::SoftwareP010 {
+                width,
+                height,
+                is_hdr,
+                ..
             } => {
                 let mode = match (*is_hdr, self.hdr_output_active) {
                     (false, false) => 0.0,
@@ -1199,6 +1211,31 @@ impl D3D11Renderer {
                 height,
                 ..
             } => self.draw_sw_yuv420(y, u, v, *y_stride, *u_stride, *v_stride, *width, *height)?,
+            DecodedFrame::SoftwareNv12 {
+                y,
+                uv,
+                y_stride,
+                uv_stride,
+                width,
+                height,
+                ..
+            } => {
+                let (u, v, uv_s) = unpack_nv12_chroma(uv, *uv_stride, *width, *height);
+                self.draw_sw_yuv420(y, &u, &v, *y_stride, uv_s, uv_s, *width, *height)?;
+            }
+            DecodedFrame::SoftwareP010 {
+                y,
+                uv,
+                y_stride,
+                uv_stride,
+                width,
+                height,
+                ..
+            } => {
+                let (y8, u8, v8, ys, uvs) =
+                    unpack_p010_to_yuv8(y, uv, *y_stride, *uv_stride, *width, *height);
+                self.draw_sw_yuv420(&y8, &u8, &v8, ys, uvs, uvs, *width, *height)?;
+            }
         }
 
         unsafe {
@@ -1874,6 +1911,74 @@ fn upload_plane(
         context.Unmap(tex, 0);
     }
     Ok(())
+}
+
+fn unpack_nv12_chroma(
+    uv: &[u8],
+    uv_stride: usize,
+    width: u32,
+    height: u32,
+) -> (Vec<u8>, Vec<u8>, usize) {
+    let cw = (width as usize).div_ceil(2);
+    let ch = (height as usize).div_ceil(2);
+    let mut u = Vec::with_capacity(cw * ch);
+    let mut v = Vec::with_capacity(cw * ch);
+    for row in 0..ch {
+        let start = row * uv_stride;
+        let end = start + cw * 2;
+        if let Some(src_row) = uv.get(start..end) {
+            for pair in src_row.as_chunks::<2>().0 {
+                u.push(pair[0]);
+                v.push(pair[1]);
+            }
+        } else {
+            u.resize(u.len() + cw, 128);
+            v.resize(v.len() + cw, 128);
+        }
+    }
+    (u, v, cw)
+}
+
+fn unpack_p010_to_yuv8(
+    y: &[u8],
+    uv: &[u8],
+    y_stride: usize,
+    uv_stride: usize,
+    width: u32,
+    height: u32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize) {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let mut y8 = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let start = row * y_stride;
+        let end = start + w * 2;
+        if let Some(src_row) = y.get(start..end) {
+            for pair in src_row.as_chunks::<2>().0 {
+                y8.push((u16::from_le_bytes(*pair) >> 8) as u8);
+            }
+        } else {
+            y8.resize(y8.len() + w, 0);
+        }
+    }
+    let mut u8_buf = Vec::with_capacity(cw * ch);
+    let mut v8_buf = Vec::with_capacity(cw * ch);
+    for row in 0..ch {
+        let start = row * uv_stride;
+        let end = start + cw * 4;
+        if let Some(src_row) = uv.get(start..end) {
+            for quad in src_row.as_chunks::<4>().0 {
+                u8_buf.push((u16::from_le_bytes([quad[0], quad[1]]) >> 8) as u8);
+                v8_buf.push((u16::from_le_bytes([quad[2], quad[3]]) >> 8) as u8);
+            }
+        } else {
+            u8_buf.resize(u8_buf.len() + cw, 128);
+            v8_buf.resize(v8_buf.len() + cw, 128);
+        }
+    }
+    (y8, u8_buf, v8_buf, w, cw)
 }
 
 fn aspect_scale(

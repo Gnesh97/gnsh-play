@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use gnsh_input::KbmBindings;
-use gnsh_media::{ScaleMode, VideoFilterMode};
+use gnsh_media::{RendererBackend, ScaleMode, VideoFilterMode};
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -368,6 +368,7 @@ mod tests {
             filter_mode: VideoFilterMode::Fsr1,
             sharpness_pct: 250,
             scale_mode: ScaleMode::Zoom,
+            renderer_backend: RendererBackend::Vulkan,
             volume_pct: 220,
             audio_device: Some("  Speakers (Realtek Audio) ".into()),
             mic_device: Some("  USB Microphone ".into()),
@@ -393,6 +394,7 @@ mod tests {
         assert_eq!(loaded.filter_mode, VideoFilterMode::Fsr1);
         assert_eq!(loaded.sharpness_pct, 100);
         assert_eq!(loaded.scale_mode, ScaleMode::Zoom);
+        assert_eq!(loaded.renderer_backend, RendererBackend::Vulkan);
         assert_eq!(loaded.volume_pct, 100);
         assert_eq!(
             loaded.audio_device.as_deref(),
@@ -433,6 +435,7 @@ mod tests {
         assert_eq!(defaulted.filter_mode, VideoFilterMode::Bilinear);
         assert!(defaulted.auto_reconnect);
         assert!(!defaulted.wan_profile_enabled);
+        assert_eq!(defaulted.renderer_backend, RendererBackend::Auto);
         assert_eq!(defaulted.wan_preset, VideoPreset::P720Fps60);
         assert_eq!(defaulted.wan_codec, VideoCodec::Hevc);
         assert_eq!(defaulted.wan_bitrate_kbps, 12_000);
@@ -491,6 +494,7 @@ pub struct StoredSettings {
     pub filter_mode: VideoFilterMode,
     pub sharpness_pct: u8,
     pub scale_mode: ScaleMode,
+    pub renderer_backend: RendererBackend,
     pub volume_pct: u8,
     pub audio_device: Option<String>,
     pub mic_device: Option<String>,
@@ -518,6 +522,7 @@ impl Default for StoredSettings {
             filter_mode: VideoFilterMode::Bilinear,
             sharpness_pct: 0,
             scale_mode: ScaleMode::Fit,
+            renderer_backend: RendererBackend::Auto,
             volume_pct: 100,
             audio_device: None,
             mic_device: None,

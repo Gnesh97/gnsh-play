@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, select};
 use gnsh_input::GamepadManager;
 use gnsh_media::{
-    AudioOutput, DecodedFrame, HapticsAudioOutput, MediaCodec, MicCapture, VideoDecoder,
-    volume_pct_to_gain,
+    AudioOutput, DecodedFrame, DecoderHardware, HapticsAudioOutput, MediaCodec, MicCapture,
+    VideoDecoder, volume_pct_to_gain,
 };
 use gnsh_proto::{Ps5Session, Ps5SessionConfig, SessionEvent, VideoCodec};
 use std::collections::VecDeque;
@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
@@ -176,9 +175,9 @@ impl ActiveStream {
     pub(crate) fn start(
         console: &SavedConsole,
         settings: &StoredSettings,
-        device: ID3D11Device,
+        hw: DecoderHardware,
     ) -> Result<Self> {
-        Self::start_with_host(console, &console.host, settings, false, device)
+        Self::start_with_host(console, &console.host, settings, false, hw)
     }
 
     pub(crate) fn start_with_host(
@@ -186,7 +185,7 @@ impl ActiveStream {
         host_override: &str,
         settings: &StoredSettings,
         use_wan: bool,
-        device: ID3D11Device,
+        hw: DecoderHardware,
     ) -> Result<Self> {
         let target_host = host_override.trim();
         let (preset, codec, bitrate_kbps) = settings.effective_stream_profile(use_wan);
@@ -231,7 +230,7 @@ impl ActiveStream {
 
         let video_args = VideoWorkerArgs {
             codec: media_codec,
-            device,
+            hw,
             video_rx: channels.video_rx,
             frame_sync: Arc::clone(&frame_sync),
             frames_decoded: Arc::clone(&frames_decoded),
@@ -475,7 +474,7 @@ impl Drop for ActiveStream {
 
 struct VideoWorkerArgs {
     codec: MediaCodec,
-    device: ID3D11Device,
+    hw: DecoderHardware,
     video_rx: Receiver<gnsh_proto::VideoPacket>,
     frame_sync: Arc<(Mutex<Option<LatestFrame>>, Condvar)>,
     frames_decoded: Arc<AtomicU64>,
@@ -488,7 +487,7 @@ struct VideoWorkerArgs {
 
 fn run_video_decode_loop(args: VideoWorkerArgs) {
     boost_current_thread_priority("video");
-    let mut decoder = match VideoDecoder::new(args.codec, Some(args.device)) {
+    let mut decoder = match VideoDecoder::new_with_mode(args.codec, args.hw) {
         Ok(dec) => dec,
         Err(err) => {
             tracing::error!("VideoDecoder initialization failed: {err:#}");

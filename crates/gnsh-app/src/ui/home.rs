@@ -42,6 +42,13 @@ impl AppState {
                             "No Controller",
                         ),
                     }
+                    ui.add_space(6.0);
+                    theme::status_pill(
+                        ui,
+                        theme::SURFACE_RAISED,
+                        theme::TEXT_SECONDARY,
+                        &format!("Renderer: {}", self.active_renderer_label),
+                    );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(theme::primary_button("+ Register PS5")).clicked() {

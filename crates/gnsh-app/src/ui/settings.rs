@@ -1,6 +1,6 @@
 use super::{SettingsTab, StreamSettings, theme};
 use crate::{AppMode, AppState};
-use gnsh_media::{ScaleMode, VideoFilterMode};
+use gnsh_media::{RendererBackend, ScaleMode, VideoFilterMode};
 use gnsh_proto::{MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, VideoCodec, VideoPreset};
 
 pub(crate) fn render_preset_controls(ui: &mut egui::Ui, preset: &mut VideoPreset) {
@@ -56,6 +56,23 @@ pub(crate) fn render_filter_mode_selector(ui: &mut egui::Ui, filter_mode: &mut V
         ui.selectable_value(filter_mode, VideoFilterMode::Fsr1, "FSR 1.0")
             .on_hover_text(
                 "AMD FidelityFX Super Resolution 1.0: 12-tap EASU edge-adaptive upscaling + RCAS sharpening",
+            );
+    });
+}
+
+pub(crate) fn render_renderer_backend_selector(ui: &mut egui::Ui, backend: &mut RendererBackend) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(backend, RendererBackend::Auto, "Auto")
+            .on_hover_text("Default Direct3D 11 renderer with zero-copy D3D11VA decode");
+        ui.selectable_value(backend, RendererBackend::D3D11, "Direct3D 11")
+            .on_hover_text("Direct3D 11 swapchain with HLSL CAS / FSR 1.0");
+        ui.selectable_value(backend, RendererBackend::Vulkan, "Vulkan")
+            .on_hover_text(
+                "libplacebo Vulkan renderer (Spline36 / EWA Lanczos + deband). Restart required.",
+            );
+        ui.selectable_value(backend, RendererBackend::D3D12, "D3D12")
+            .on_hover_text(
+                "Direct3D 12 + D3D12VA coming in Milestone 3B (falls back to Direct3D 11 for now).",
             );
     });
 }
@@ -376,7 +393,18 @@ impl AppState {
                 );
                 ui.end_row();
 
-                settings_row_label(ui, "WAN Profile", focus_row, 8);
+                settings_row_label(ui, "Renderer", focus_row, 8);
+                ui.horizontal(|ui| {
+                    render_renderer_backend_selector(ui, &mut self.settings.renderer_backend);
+                    ui.label(
+                        egui::RichText::new("Restart required")
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, "WAN Profile", focus_row, 9);
                 ui.checkbox(
                     &mut self.settings.wan_profile_enabled,
                     "Use separate stream profile for WAN / VPN connections",
@@ -387,19 +415,19 @@ impl AppState {
                 ui.end_row();
 
                 if self.settings.wan_profile_enabled {
-                    settings_row_label(ui, "WAN Preset", focus_row, 9);
+                    settings_row_label(ui, "WAN Preset", focus_row, 10);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         render_preset_controls(ui, &mut self.settings.wan_preset);
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, "WAN Codec", focus_row, 10);
+                    settings_row_label(ui, "WAN Codec", focus_row, 11);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         render_codec_controls(ui, &mut self.settings.wan_codec);
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, "WAN Bitrate", focus_row, 11);
+                    settings_row_label(ui, "WAN Bitrate", focus_row, 12);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         ui.add(
                             egui::Slider::new(

@@ -655,7 +655,7 @@ impl EguiD3d11Painter {
     }
 }
 
-fn color_image_to_rgba8(image: &egui::ColorImage) -> Vec<u8> {
+pub(crate) fn color_image_to_rgba8(image: &egui::ColorImage) -> Vec<u8> {
     image.pixels.iter().flat_map(|c| c.to_array()).collect()
 }
 
@@ -766,7 +766,7 @@ fn create_sampler(device: &ID3D11Device, key: SamplerKey) -> Result<ID3D11Sample
     }
 }
 
-fn clip_rect_to_scissor(
+pub(crate) fn clip_rect_to_scissor(
     clip_rect: egui::Rect,
     pixels_per_point: f32,
     screen_w: u32,

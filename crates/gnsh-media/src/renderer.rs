@@ -2,6 +2,27 @@ use crate::video_decoder::DecodedFrame;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Graphics backend preference for rendering and decode interop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RendererBackend {
+    #[default]
+    Auto,
+    D3D11,
+    Vulkan,
+    D3D12,
+}
+
+impl RendererBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::D3D11 => "Direct3D 11",
+            Self::Vulkan => "Vulkan",
+            Self::D3D12 => "Direct3D 12",
+        }
+    }
+}
+
 /// Aspect-ratio presentation mode for decoded video frames inside the render viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ScaleMode {

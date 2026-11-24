@@ -1,5 +1,5 @@
 use crate::ui::{SettingsTab, StreamSettings};
-use gnsh_media::{ScaleMode, VideoFilterMode};
+use gnsh_media::{RendererBackend, ScaleMode, VideoFilterMode};
 use gnsh_proto::controller::{ControllerState, buttons};
 use gnsh_proto::{MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, VideoCodec, VideoPreset};
 use std::time::{Duration, Instant};
@@ -191,9 +191,9 @@ pub(crate) fn settings_row_count(
     match tab {
         SettingsTab::Video => {
             if wan_profile_enabled {
-                12
+                13
             } else {
-                9
+                10
             }
         }
         SettingsTab::Audio => 3,
@@ -317,6 +317,19 @@ fn adjust_filter_mode(filter_mode: &mut VideoFilterMode, dir: isize) -> bool {
     )
 }
 
+fn adjust_renderer_backend(backend: &mut RendererBackend, dir: isize) -> bool {
+    cycle_slice(
+        backend,
+        &[
+            RendererBackend::Auto,
+            RendererBackend::D3D11,
+            RendererBackend::Vulkan,
+            RendererBackend::D3D12,
+        ],
+        dir,
+    )
+}
+
 fn adjust_sharpness(filter_mode: VideoFilterMode, sharpness_pct: &mut u8, dir: isize) -> bool {
     if filter_mode == VideoFilterMode::Bilinear {
         return false;
@@ -370,17 +383,19 @@ pub(crate) fn apply_settings_nav(
                 settings.auto_reconnect = !settings.auto_reconnect;
                 true
             }
-            8 if nav_dir(event).is_some() => {
+            8 => nav_dir(event)
+                .is_some_and(|dir| adjust_renderer_backend(&mut settings.renderer_backend, dir)),
+            9 if nav_dir(event).is_some() => {
                 settings.wan_profile_enabled = !settings.wan_profile_enabled;
                 true
             }
-            9 if !is_streaming && settings.wan_profile_enabled => {
+            10 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_preset(&mut settings.wan_preset, event)
             }
-            10 if !is_streaming && settings.wan_profile_enabled => {
+            11 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_codec(&mut settings.wan_codec, event)
             }
-            11 if !is_streaming && settings.wan_profile_enabled => {
+            12 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_bitrate(&mut settings.wan_bitrate_kbps, event, 2_000)
             }
             _ => false,
@@ -617,8 +632,8 @@ mod tests {
         let audio = vec!["Speakers".to_string(), "Headset".to_string()];
         let mic = vec!["USB Mic".to_string()];
 
-        assert_eq!(settings_row_count(SettingsTab::Video, false, false), 9);
-        assert_eq!(settings_row_count(SettingsTab::Video, false, true), 12);
+        assert_eq!(settings_row_count(SettingsTab::Video, false, false), 10);
+        assert_eq!(settings_row_count(SettingsTab::Video, false, true), 13);
         assert_eq!(settings_row_count(SettingsTab::Audio, false, false), 3);
         assert_eq!(settings_row_count(SettingsTab::Input, false, false), 2);
         assert_eq!(settings_row_count(SettingsTab::Input, true, false), 6);
@@ -704,11 +719,31 @@ mod tests {
         ));
         assert!(!s.auto_reconnect);
 
-        // WAN profile rows 8..=11 gate adjustments and lock during streaming.
+        // Renderer selector at row 8 and WAN profile rows 9..=12 gate adjustments cleanly.
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            8,
+            HomeNavEvent::Right,
+            false,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.renderer_backend, RendererBackend::D3D11);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            8,
+            HomeNavEvent::Right,
+            false,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.renderer_backend, RendererBackend::Vulkan);
         assert!(!apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            9,
+            10,
             HomeNavEvent::Right,
             false,
             &audio,
@@ -717,7 +752,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            8,
+            9,
             HomeNavEvent::Connect,
             true,
             &audio,
@@ -727,22 +762,12 @@ mod tests {
         assert!(!apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            9,
+            10,
             HomeNavEvent::Right,
             true,
             &audio,
             &mic
         ));
-        assert!(apply_settings_nav(
-            &mut s,
-            SettingsTab::Video,
-            9,
-            HomeNavEvent::Left,
-            false,
-            &audio,
-            &mic
-        ));
-        assert_eq!(s.wan_preset, VideoPreset::P720Fps30);
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
@@ -752,11 +777,21 @@ mod tests {
             &audio,
             &mic
         ));
-        assert_eq!(s.wan_codec, VideoCodec::H264);
+        assert_eq!(s.wan_preset, VideoPreset::P720Fps30);
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
             11,
+            HomeNavEvent::Left,
+            false,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.wan_codec, VideoCodec::H264);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            12,
             HomeNavEvent::Right,
             false,
             &audio,

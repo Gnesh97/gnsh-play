@@ -17,6 +17,7 @@ pub(crate) fn render_streaming_ui(
     settings: &mut StreamSettings,
     audio_devices: &[String],
     mic_devices: &[String],
+    active_renderer_short: &str,
     hdr_output_active: bool,
     mouse_locked: bool,
     open_keybinds: &mut bool,
@@ -34,6 +35,7 @@ pub(crate) fn render_streaming_ui(
                         stream,
                         gamepad_name,
                         settings,
+                        active_renderer_short,
                         hdr_output_active,
                         mouse_locked,
                         focus_row,
@@ -88,11 +90,13 @@ fn hud_focus_border(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_hud_top_pill(
     ui: &mut egui::Ui,
     stream: &mut ActiveStream,
     gamepad_name: Option<&str>,
     settings: &StreamSettings,
+    active_renderer_short: &str,
     hdr_output_active: bool,
     mouse_locked: bool,
     focus_row: Option<usize>,
@@ -175,18 +179,19 @@ fn render_hud_top_pill(
         }
 
         let summary = format!(
-            "{:.1} FPS · {:.1} Mbps · RTT {:.1} ms · Loss {:.1}% · Pipe {} [{}{}{}]",
+            "{:.1} FPS · {:.1} Mbps · RTT {:.1} ms · Loss {:.1}% · Pipe {} [{} · {}{}{}]",
             stream.fps,
             stream.measured_mbps,
             stream.rtt_ms,
             stream.packet_loss_pct,
             pipe_short,
+            active_renderer_short,
             decoder_badge,
             hdr_badge,
             filter_badge
         );
         let mut hover = format!(
-            "Pipe: {pipe_full}\nDecode: {decode_ms_text} ({decoder_badge})\nUDP Buf: {udp_buf_text}\nGamepad: {pad_label}\nHaptics: {haptics_label}"
+            "Renderer: {active_renderer_short}\nPipe: {pipe_full}\nDecode: {decode_ms_text} ({decoder_badge})\nUDP Buf: {udp_buf_text}\nGamepad: {pad_label}\nHaptics: {haptics_label}"
         );
         if let Ok(guard) = stream.haptics_device_label.lock()
             && let Some(ref dev_name) = *guard
