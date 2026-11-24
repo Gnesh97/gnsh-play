@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod egui_d3d11;
+mod gamepad_nav;
 mod logging;
+mod shortcut;
 mod storage;
 mod stream;
 mod ui;
@@ -9,6 +11,7 @@ mod ui;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::Receiver;
 use egui_d3d11::EguiD3d11Painter;
+use gamepad_nav::{GamepadHomeNav, HomeNavEvent};
 use gnsh_input::{
     AppWindow, GamepadManager, KbmAction, KbmConfig, KbmEmulator, merge_controller_states,
 };
@@ -41,73 +44,224 @@ pub(crate) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const LOW_LATENCY_INPUT_WAIT: Duration = Duration::from_millis(1);
 const IDLE_UI_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LaunchOptions {
+    connect_target: Option<String>,
+    use_wan: bool,
+    start_fullscreen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
-    RunGui,
-    ExitSuccess,
+    RunGui(LaunchOptions),
+    ShowHelp,
+    DiscoverLan,
+    ListConsoles,
 }
 
 fn main() -> Result<()> {
     match handle_cli()? {
-        CliAction::ExitSuccess => return Ok(()),
-        CliAction::RunGui => {}
+        CliAction::RunGui(launch) => run_gui(launch),
+        CliAction::ShowHelp | CliAction::DiscoverLan | CliAction::ListConsoles => Ok(()),
     }
-    run_gui()
+}
+
+fn parse_cli_args(args: &[String]) -> std::result::Result<CliAction, String> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok(CliAction::ShowHelp);
+    }
+
+    let mut has_discover = false;
+    let mut has_list = false;
+    let mut launch = LaunchOptions::default();
+    let mut i = 0;
+
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--discover" => {
+                has_discover = true;
+                i += 1;
+            }
+            "--list" => {
+                has_list = true;
+                i += 1;
+            }
+            "--wan" => {
+                launch.use_wan = true;
+                i += 1;
+            }
+            "--fullscreen" => {
+                launch.start_fullscreen = true;
+                i += 1;
+            }
+            "--connect" => {
+                if launch.connect_target.is_some() {
+                    return Err("--connect cannot be specified more than once".into());
+                }
+                let Some(val) = args.get(i + 1) else {
+                    return Err("--connect requires a console name, ID, or host".into());
+                };
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    return Err("--connect requires a non-empty console name, ID, or host".into());
+                }
+                launch.connect_target = Some(trimmed.to_string());
+                i += 2;
+            }
+            s if s.starts_with("--connect=") => {
+                if launch.connect_target.is_some() {
+                    return Err("--connect cannot be specified more than once".into());
+                }
+                let trimmed = s["--connect=".len()..].trim();
+                if trimmed.is_empty() {
+                    return Err("--connect requires a non-empty console name, ID, or host".into());
+                }
+                launch.connect_target = Some(trimmed.to_string());
+                i += 1;
+            }
+            other => {
+                return Err(format!("Unknown argument: {other}"));
+            }
+        }
+    }
+
+    if has_discover && has_list {
+        return Err("--discover and --list cannot be combined".into());
+    }
+    if (has_discover || has_list)
+        && (launch.connect_target.is_some() || launch.use_wan || launch.start_fullscreen)
+    {
+        return Err(
+            "--discover and --list cannot be combined with --connect, --wan, or --fullscreen"
+                .into(),
+        );
+    }
+    if has_discover {
+        return Ok(CliAction::DiscoverLan);
+    }
+    if has_list {
+        return Ok(CliAction::ListConsoles);
+    }
+    if launch.use_wan && launch.connect_target.is_none() {
+        return Err("--wan requires --connect <NAME|ID|HOST>".into());
+    }
+
+    Ok(CliAction::RunGui(launch))
+}
+
+fn find_saved_console_for_cli(saved: &[SavedConsole], query: &str) -> Option<usize> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    saved
+        .iter()
+        .position(|c| {
+            c.id.trim().eq_ignore_ascii_case(q) || format_mac_id(c.mac).eq_ignore_ascii_case(q)
+        })
+        .or_else(|| {
+            saved
+                .iter()
+                .position(|c| c.name.trim().eq_ignore_ascii_case(q))
+        })
+        .or_else(|| {
+            saved.iter().position(|c| {
+                c.host.trim().eq_ignore_ascii_case(q)
+                    || c.remote_host
+                        .as_deref()
+                        .is_some_and(|r| r.trim().eq_ignore_ascii_case(q))
+            })
+        })
 }
 
 fn handle_cli() -> Result<CliAction> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
-        logging::attach_parent_console();
-    }
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_usage();
-        return Ok(CliAction::ExitSuccess);
-    }
-    if args.as_slice() == ["--discover"] {
-        init_lib().context("failed to initialize Remote Play library")?;
-        let consoles = discover_ps5_lan(DISCOVERY_TIMEOUT).context("PS5 LAN discovery failed")?;
-        if consoles.is_empty() {
-            println!("No PS5 consoles found on LAN.");
-        } else {
-            for console in &consoles {
-                let state = console_state_label(console.state);
-                let app = if console.running_app_name.is_empty() {
-                    String::new()
-                } else {
-                    format!(" | running: {}", console.running_app_name)
-                };
-                println!(
-                    "{} ({}) [{}] | id={} | fw={}{}",
-                    console.host_name,
-                    console.addr,
-                    state,
-                    console.host_id,
-                    console.system_version,
-                    app
-                );
+    let action = match parse_cli_args(&args) {
+        Ok(action) => action,
+        Err(err) => {
+            logging::attach_parent_console();
+            eprintln!("{err}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+
+    match &action {
+        CliAction::RunGui(_) => {}
+        CliAction::ShowHelp => {
+            logging::attach_parent_console();
+            print_usage();
+        }
+        CliAction::DiscoverLan => {
+            logging::attach_parent_console();
+            init_lib().context("failed to initialize Remote Play library")?;
+            let consoles =
+                discover_ps5_lan(DISCOVERY_TIMEOUT).context("PS5 LAN discovery failed")?;
+            if consoles.is_empty() {
+                println!("No PS5 consoles found on LAN.");
+            } else {
+                for console in &consoles {
+                    let state = console_state_label(console.state);
+                    let app = if console.running_app_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" | running: {}", console.running_app_name)
+                    };
+                    println!(
+                        "{} ({}) [{}] | id={} | fw={}{}",
+                        console.host_name,
+                        console.addr,
+                        state,
+                        console.host_id,
+                        console.system_version,
+                        app
+                    );
+                }
             }
         }
-        return Ok(CliAction::ExitSuccess);
+        CliAction::ListConsoles => {
+            logging::attach_parent_console();
+            let store =
+                ConsoleStore::default_store().context("failed to resolve console store path")?;
+            let saved = store.load().context("failed to load saved consoles")?;
+            if saved.is_empty() {
+                println!("No saved PS5 consoles.");
+            } else {
+                for console in &saved {
+                    match console.remote_host.as_deref() {
+                        Some(remote) => println!(
+                            "{} | id={} | lan={} | wan={}",
+                            console.name, console.id, console.host, remote
+                        ),
+                        None => println!(
+                            "{} | id={} | lan={}",
+                            console.name, console.id, console.host
+                        ),
+                    }
+                }
+            }
+        }
     }
-    if !args.is_empty() {
-        eprintln!("Unknown arguments: {}", args.join(" "));
-        print_usage();
-        std::process::exit(2);
-    }
-    Ok(CliAction::RunGui)
+
+    Ok(action)
 }
 
 fn print_usage() {
-    println!(
-        "gnsh-play - Native Windows PS5 Remote Play client\n\n\
-         USAGE:\n    gnsh-play [OPTIONS]\n\n\
-         OPTIONS:\n    -h, --help       Print this help message and exit\n        \
-         --discover   Discover PS5 consoles on LAN and exit"
-    );
+    println!(concat!(
+        "gnsh-play - Native Windows PS5 Remote Play client\n\n",
+        "USAGE:\n",
+        "    gnsh-play [OPTIONS]\n\n",
+        "OPTIONS:\n",
+        "    -h, --help              Print this help message and exit\n",
+        "        --discover          Discover PS5 consoles on LAN and exit\n",
+        "        --list              List saved PS5 consoles and exit\n",
+        "        --connect <TARGET>  Directly stream saved console by name, ID, or host\n",
+        "        --wan               Use the saved console's Remote / WAN host with --connect\n",
+        "        --fullscreen        Launch the GUI window in fullscreen mode",
+    ));
 }
 
-fn run_gui() -> Result<()> {
+fn run_gui(launch: LaunchOptions) -> Result<()> {
     let _log_path = logging::init_logging();
 
     init_lib().context("failed to initialize Remote Play library")?;
@@ -159,7 +313,27 @@ fn run_gui() -> Result<()> {
         initial_settings,
         initial_banner,
     );
-    app.start_discovery();
+    if launch.start_fullscreen
+        && let Err(err) = window.toggle_fullscreen()
+    {
+        tracing::warn!("Failed entering fullscreen on startup: {err:#}");
+        app.status_banner = Some(StatusBanner::error(format!(
+            "Failed toggling fullscreen: {err:#}"
+        )));
+    }
+    if let Some(target) = launch.connect_target.as_deref() {
+        if let Some(idx) = find_saved_console_for_cli(&app.saved_consoles, target) {
+            app.selected_console_idx = idx;
+            app.begin_stream(idx, launch.use_wan, renderer.device().clone());
+        } else {
+            app.status_banner = Some(StatusBanner::error(format!(
+                "Saved console '{target}' not found. Run --list to view saved consoles."
+            )));
+        }
+    }
+    if matches!(app.mode, AppMode::Home) {
+        app.start_discovery();
+    }
 
     let mut raw_input = egui::RawInput::default();
     let start_time = Instant::now();
@@ -522,6 +696,8 @@ pub(crate) struct AppState {
     pub(crate) kbm_modal_open: bool,
     pub(crate) kbm_listening_action: Option<KbmAction>,
     pub(crate) mode: AppMode,
+    pub(crate) selected_console_idx: usize,
+    gamepad_nav: GamepadHomeNav,
     pub(crate) pending_home_action: Option<HomeAction>,
     pub(crate) pending_stream_connect: Option<(usize, bool)>,
 }
@@ -552,9 +728,100 @@ impl AppState {
             kbm_modal_open: false,
             kbm_listening_action: None,
             mode: AppMode::Home,
+            selected_console_idx: 0,
+            gamepad_nav: GamepadHomeNav::default(),
             pending_home_action: None,
             pending_stream_connect: None,
         }
+    }
+
+    fn clamp_selected_console(&mut self) {
+        if self.saved_consoles.is_empty() {
+            self.selected_console_idx = 0;
+        } else if self.selected_console_idx >= self.saved_consoles.len() {
+            self.selected_console_idx = self.saved_consoles.len() - 1;
+        }
+    }
+
+    fn handle_home_gamepad_events(&mut self, gamepads: &mut GamepadManager) -> bool {
+        let _ = gamepads.take_mic_toggle();
+        let Some(state) = gamepads.poll_state(false) else {
+            self.gamepad_nav.reset();
+            return false;
+        };
+        let events = self.gamepad_nav.update(&state);
+        if events.is_empty() {
+            return false;
+        }
+        self.clamp_selected_console();
+        let no_modal_open = !self.settings_open
+            && !self.kbm_modal_open
+            && self.register_modal.is_none()
+            && self.edit_modal.is_none();
+
+        for event in events {
+            match event {
+                HomeNavEvent::Back => {
+                    if self.kbm_modal_open {
+                        self.kbm_modal_open = false;
+                        self.kbm_listening_action = None;
+                    } else if self.edit_modal.is_some() {
+                        self.edit_modal = None;
+                    } else if self.register_modal.is_some() {
+                        self.register_modal = None;
+                    } else if self.settings_open {
+                        self.settings_open = false;
+                    }
+                }
+                HomeNavEvent::PrevSettingsTab if self.settings_open && !self.kbm_modal_open => {
+                    self.settings_tab = self.settings_tab.prev();
+                }
+                HomeNavEvent::NextSettingsTab if self.settings_open && !self.kbm_modal_open => {
+                    self.settings_tab = self.settings_tab.next();
+                }
+                HomeNavEvent::ToggleSettings
+                    if !self.kbm_modal_open
+                        && self.register_modal.is_none()
+                        && self.edit_modal.is_none() =>
+                {
+                    self.settings_open = !self.settings_open;
+                }
+                HomeNavEvent::PrevConsole if no_modal_open => {
+                    let count = self.saved_consoles.len();
+                    if count > 0 {
+                        self.selected_console_idx = if self.selected_console_idx == 0 {
+                            count - 1
+                        } else {
+                            self.selected_console_idx - 1
+                        };
+                    }
+                }
+                HomeNavEvent::NextConsole if no_modal_open => {
+                    let count = self.saved_consoles.len();
+                    if count > 0 {
+                        self.selected_console_idx = (self.selected_console_idx + 1) % count;
+                    }
+                }
+                HomeNavEvent::Connect if no_modal_open && !self.saved_consoles.is_empty() => {
+                    self.pending_stream_connect = Some((self.selected_console_idx, false));
+                }
+                HomeNavEvent::Wake if no_modal_open => {
+                    if let Some(console) =
+                        self.saved_consoles.get(self.selected_console_idx).cloned()
+                    {
+                        self.start_wake(&console);
+                    }
+                }
+                HomeNavEvent::Discover if no_modal_open && self.discovery_rx.is_none() => {
+                    self.status_banner = Some(StatusBanner::info(
+                        "Scanning LAN & saved remote hosts for PS5 consoles...",
+                    ));
+                    self.start_discovery();
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     pub(crate) fn persist_settings(&self) {
@@ -788,6 +1055,7 @@ impl AppState {
             let saved = saved_from_registered(reg, &self.discovered_consoles);
             let label = format!("{} ({})", saved.name, saved.host);
             upsert_saved_console(&mut self.saved_consoles, saved);
+            self.clamp_selected_console();
             match self.store.save(&self.saved_consoles) {
                 Ok(()) => {
                     self.register_modal = None;
@@ -1039,6 +1307,8 @@ impl AppState {
                     tracing::debug!("send_controller_state failed: {err:#}");
                 }
             }
+        } else {
+            ui_dirty |= self.handle_home_gamepad_events(gamepads);
         }
         if let Some(banner) = stream_quit_banner {
             self.stop_stream(gamepads, Some(banner));
@@ -1060,17 +1330,39 @@ impl AppState {
         if let Some(action) = self.pending_home_action.take() {
             match action {
                 HomeAction::ConnectSaved(idx) => {
+                    self.selected_console_idx = idx;
                     self.pending_stream_connect = Some((idx, false));
                 }
                 HomeAction::ConnectSavedWan(idx) => {
+                    self.selected_console_idx = idx;
                     self.pending_stream_connect = Some((idx, true));
                 }
                 HomeAction::WakeSaved(idx) => {
+                    self.selected_console_idx = idx;
                     if let Some(console) = self.saved_consoles.get(idx).cloned() {
                         self.start_wake(&console);
                     }
                 }
+                HomeAction::CreateShortcut(idx) => {
+                    self.selected_console_idx = idx;
+                    if let Some(console) = self.saved_consoles.get(idx) {
+                        match shortcut::create_desktop_shortcut(console, false) {
+                            Ok(path) => {
+                                self.status_banner = Some(StatusBanner::success(format!(
+                                    "Created Desktop shortcut: {}",
+                                    path.display()
+                                )));
+                            }
+                            Err(err) => {
+                                self.status_banner = Some(StatusBanner::error(format!(
+                                    "Failed creating Desktop shortcut: {err:#}"
+                                )));
+                            }
+                        }
+                    }
+                }
                 HomeAction::EditSaved(idx) => {
+                    self.selected_console_idx = idx;
                     if let Some(console) = self.saved_consoles.get(idx) {
                         self.edit_modal = Some(EditConsoleModal {
                             index: idx,
@@ -1086,6 +1378,7 @@ impl AppState {
                         let removed = self.saved_consoles.remove(idx);
                         match self.store.save(&self.saved_consoles) {
                             Ok(()) => {
+                                self.clamp_selected_console();
                                 self.status_banner = Some(StatusBanner::info(format!(
                                     "Deleted saved console {}.",
                                     removed.name
@@ -1110,6 +1403,7 @@ impl AppState {
     fn stop_stream(&mut self, gamepads: &mut GamepadManager, banner: Option<StatusBanner>) {
         if let AppMode::Streaming(mut stream) = std::mem::replace(&mut self.mode, AppMode::Home) {
             stream.shutdown();
+            self.gamepad_nav.arm_release_guard();
             gamepads.set_rumble(0, 0);
             gamepads.set_led(0, 0, 0);
             gamepads.set_mic_led(false);
@@ -1281,5 +1575,105 @@ mod tests {
         assert!(!is_safe_https_url("javascript:alert(1)"));
         assert!(!is_safe_https_url("https://example.com/\nfoo"));
         assert!(!is_safe_https_url("https://"));
+    }
+
+    fn cli_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_parser_supports_help_list_discover_and_connect_flags() {
+        assert_eq!(
+            parse_cli_args(&cli_args(&[])),
+            Ok(CliAction::RunGui(LaunchOptions::default()))
+        );
+        assert_eq!(parse_cli_args(&cli_args(&["-h"])), Ok(CliAction::ShowHelp));
+        assert_eq!(
+            parse_cli_args(&cli_args(&["--help", "--connect", "PS5"])),
+            Ok(CliAction::ShowHelp)
+        );
+        assert_eq!(
+            parse_cli_args(&cli_args(&["--discover"])),
+            Ok(CliAction::DiscoverLan)
+        );
+        assert_eq!(
+            parse_cli_args(&cli_args(&["--list"])),
+            Ok(CliAction::ListConsoles)
+        );
+        assert_eq!(
+            parse_cli_args(&cli_args(&["--connect", "LivingRoom"])),
+            Ok(CliAction::RunGui(LaunchOptions {
+                connect_target: Some("LivingRoom".into()),
+                use_wan: false,
+                start_fullscreen: false,
+            }))
+        );
+        assert_eq!(
+            parse_cli_args(&cli_args(&[
+                "--connect=001122334455",
+                "--wan",
+                "--fullscreen"
+            ])),
+            Ok(CliAction::RunGui(LaunchOptions {
+                connect_target: Some("001122334455".into()),
+                use_wan: true,
+                start_fullscreen: true,
+            }))
+        );
+        assert_eq!(
+            parse_cli_args(&cli_args(&["--fullscreen"])),
+            Ok(CliAction::RunGui(LaunchOptions {
+                connect_target: None,
+                use_wan: false,
+                start_fullscreen: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn cli_parser_rejects_invalid_combinations_and_missing_values() {
+        assert!(parse_cli_args(&cli_args(&["--unknown"])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--wan"])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--connect"])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--connect", "   "])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--connect="])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--connect", "a", "--connect=b"])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--discover", "--list"])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--list", "--fullscreen"])).is_err());
+        assert!(parse_cli_args(&cli_args(&["--discover", "--connect", "PS5"])).is_err());
+    }
+
+    #[test]
+    fn cli_console_lookup_prioritizes_id_then_name_then_host() {
+        let first = SavedConsole {
+            id: "001122334455".into(),
+            name: "LivingRoom".into(),
+            host: "192.168.1.50".into(),
+            remote_host: Some("85.100.12.34".into()),
+            mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            psn_account_id: "AQIDBAUGBwg=".into(),
+            regist_key: *b"1a2b3c4d\0\0\0\0\0\0\0\0",
+            rp_key: [0xAA; 16],
+        };
+        let second = SavedConsole {
+            id: "998877665544".into(),
+            name: "001122334455".into(),
+            host: "192.168.1.60".into(),
+            remote_host: None,
+            mac: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            psn_account_id: "AQIDBAUGBwg=".into(),
+            regist_key: *b"1a2b3c4d\0\0\0\0\0\0\0\0",
+            rp_key: [0xBB; 16],
+        };
+        let list = [first, second];
+
+        assert_eq!(find_saved_console_for_cli(&list, "001122334455"), Some(0));
+        assert_eq!(find_saved_console_for_cli(&list, "aabbccddeeff"), Some(0));
+        assert_eq!(find_saved_console_for_cli(&list, "112233445566"), Some(1));
+        assert_eq!(find_saved_console_for_cli(&list, "livingroom"), Some(0));
+        assert_eq!(find_saved_console_for_cli(&list, "192.168.1.60"), Some(1));
+        assert_eq!(find_saved_console_for_cli(&list, "85.100.12.34"), Some(0));
+        assert_eq!(find_saved_console_for_cli(&list, "missing"), None);
+        assert_eq!(find_saved_console_for_cli(&list, "   "), None);
     }
 }

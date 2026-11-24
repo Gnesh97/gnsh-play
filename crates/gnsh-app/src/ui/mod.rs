@@ -20,6 +20,24 @@ pub(crate) enum SettingsTab {
     Input,
 }
 
+impl SettingsTab {
+    pub(crate) const fn prev(self) -> Self {
+        match self {
+            Self::Video => Self::Input,
+            Self::Audio => Self::Video,
+            Self::Input => Self::Audio,
+        }
+    }
+
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Video => Self::Audio,
+            Self::Audio => Self::Input,
+            Self::Input => Self::Video,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BannerKind {
     Info,
@@ -60,6 +78,7 @@ pub(crate) enum HomeAction {
     ConnectSaved(usize),
     ConnectSavedWan(usize),
     WakeSaved(usize),
+    CreateShortcut(usize),
     EditSaved(usize),
     DeleteSaved(usize),
     OpenRegister(String),
@@ -257,5 +276,16 @@ mod tests {
         );
         assert!(host_matches_remote_probe(&saved[0], "100.64.0.10"));
         assert!(!host_matches_remote_probe(&saved[0], "192.168.1.51"));
+    }
+
+    #[test]
+    fn settings_tab_prev_and_next_wrap_around() {
+        assert_eq!(SettingsTab::Video.next(), SettingsTab::Audio);
+        assert_eq!(SettingsTab::Audio.next(), SettingsTab::Input);
+        assert_eq!(SettingsTab::Input.next(), SettingsTab::Video);
+
+        assert_eq!(SettingsTab::Video.prev(), SettingsTab::Input);
+        assert_eq!(SettingsTab::Input.prev(), SettingsTab::Audio);
+        assert_eq!(SettingsTab::Audio.prev(), SettingsTab::Video);
     }
 }

@@ -74,6 +74,27 @@ impl AppState {
                 });
             });
 
+        if gamepad_name.is_some() {
+            egui::Panel::bottom("gamepad_hints")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::CHROME)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                        .inner_margin(egui::Margin::symmetric(18, 8)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "D-Pad / Stick: Select  ·  Cross: Connect  ·  Triangle: Wake  ·  Square: Discover  ·  Options: Settings (L1/R1 Tabs)  ·  Circle: Back",
+                            )
+                            .small()
+                            .color(theme::TEXT_SECONDARY),
+                        );
+                    });
+                });
+        }
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -161,6 +182,7 @@ impl AppState {
                                     }
                                 } else {
                                     let waking = self.wake_rx.is_some();
+                                    let gamepad_connected = gamepad_name.is_some();
                                     for (idx, saved) in self.saved_consoles.iter().enumerate() {
                                         let live_match = find_discovered_for_saved(
                                             &self.discovered_consoles,
@@ -172,6 +194,7 @@ impl AppState {
                                             saved,
                                             live_match,
                                             waking,
+                                            gamepad_connected && idx == self.selected_console_idx,
                                             &mut self.pending_home_action,
                                         );
                                         ui.add_space(10.0);
@@ -271,9 +294,14 @@ fn render_saved_console_card(
     saved: &SavedConsole,
     live: Option<&DiscoveredConsole>,
     waking: bool,
+    is_selected: bool,
     pending_action: &mut Option<HomeAction>,
 ) {
-    theme::card_frame().show(ui, |ui| {
+    let mut frame = theme::card_frame();
+    if is_selected {
+        frame = frame.stroke(egui::Stroke::new(1.5, theme::FOCUS_RING));
+    }
+    frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
@@ -325,6 +353,13 @@ fn render_saved_console_card(
                 }
                 if ui.add(theme::secondary_button("Edit")).clicked() {
                     *pending_action = Some(HomeAction::EditSaved(idx));
+                }
+                if ui
+                    .add(theme::secondary_button("Shortcut"))
+                    .on_hover_text("Create Desktop shortcut for direct fullscreen launch")
+                    .clicked()
+                {
+                    *pending_action = Some(HomeAction::CreateShortcut(idx));
                 }
                 if ui
                     .add_enabled(!waking, theme::secondary_button("Wake"))
