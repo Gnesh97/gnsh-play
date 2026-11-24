@@ -47,12 +47,8 @@ pub(crate) fn render_scale_selector(ui: &mut egui::Ui, scale_mode: &mut ScaleMod
     });
 }
 
-pub(crate) fn render_filter_controls(
-    ui: &mut egui::Ui,
-    filter_mode: &mut VideoFilterMode,
-    sharpness_pct: &mut u8,
-) {
-    ui.horizontal_wrapped(|ui| {
+pub(crate) fn render_filter_mode_selector(ui: &mut egui::Ui, filter_mode: &mut VideoFilterMode) {
+    ui.horizontal(|ui| {
         ui.selectable_value(filter_mode, VideoFilterMode::Bilinear, "Bilinear")
             .on_hover_text("Fast bilinear scaling with no sharpening filter");
         ui.selectable_value(filter_mode, VideoFilterMode::Cas, "CAS")
@@ -61,36 +57,42 @@ pub(crate) fn render_filter_controls(
             .on_hover_text(
                 "AMD FidelityFX Super Resolution 1.0: 12-tap EASU edge-adaptive upscaling + RCAS sharpening",
             );
+    });
+}
 
-        let (slider_label, enabled, tooltip) = match *filter_mode {
-            VideoFilterMode::Bilinear => (
-                "Sharp",
-                false,
-                "Switch Filter to CAS or FSR 1.0 to adjust sharpening",
-            ),
-            VideoFilterMode::Cas => (
-                "CAS",
-                true,
-                "Contrast Adaptive Sharpening intensity (0-100%)",
-            ),
-            VideoFilterMode::Fsr1 => (
-                "RCAS",
-                true,
-                "FSR 1.0 RCAS sharpening intensity after EASU upscaling (0% = EASU only)",
-            ),
-        };
-        ui.scope(|ui| {
-            ui.spacing_mut().slider_width = 90.0;
-            ui.add_enabled(
-                enabled,
-                egui::Slider::new(sharpness_pct, 0..=100)
-                    .clamping(egui::SliderClamping::Always)
-                    .suffix("%")
-                    .text(slider_label),
-            )
-            .on_hover_text(tooltip)
-            .on_disabled_hover_text(tooltip);
-        });
+pub(crate) fn render_sharpness_slider(
+    ui: &mut egui::Ui,
+    filter_mode: VideoFilterMode,
+    sharpness_pct: &mut u8,
+) {
+    let (slider_label, enabled, tooltip) = match filter_mode {
+        VideoFilterMode::Bilinear => (
+            "Sharp",
+            false,
+            "Switch Filter to CAS or FSR 1.0 to adjust sharpening",
+        ),
+        VideoFilterMode::Cas => (
+            "CAS",
+            true,
+            "Contrast Adaptive Sharpening intensity (0-100%)",
+        ),
+        VideoFilterMode::Fsr1 => (
+            "RCAS",
+            true,
+            "FSR 1.0 RCAS sharpening intensity after EASU upscaling (0% = EASU only)",
+        ),
+    };
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = 90.0;
+        ui.add_enabled(
+            enabled,
+            egui::Slider::new(sharpness_pct, 0..=100)
+                .clamping(egui::SliderClamping::Always)
+                .suffix("%")
+                .text(slider_label),
+        )
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip);
     });
 }
 
@@ -187,11 +189,29 @@ pub(crate) fn format_profile_summary(settings: &StreamSettings) -> String {
     format!("{res}{fps} · {codec} · {mbps} Mbps · {filter} · {vsync}{kbm}")
 }
 
+fn settings_row_label(ui: &mut egui::Ui, label: &str, focus_row: Option<usize>, row_idx: usize) {
+    if focus_row == Some(row_idx) {
+        ui.label(
+            egui::RichText::new(format!("> {label}"))
+                .strong()
+                .color(theme::FOCUS_RING),
+        );
+    } else {
+        ui.label(egui::RichText::new(label).color(theme::TEXT_SECONDARY));
+    }
+}
+
 impl AppState {
-    pub(crate) fn render_settings_modal(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_settings_modal(&mut self, ctx: &egui::Context, gamepad_connected: bool) {
         if !self.settings_open {
             return;
         }
+        let row_count =
+            crate::gamepad_nav::settings_row_count(self.settings_tab, self.settings.kbm_enabled);
+        if row_count > 0 && self.settings_focus_row >= row_count {
+            self.settings_focus_row = row_count - 1;
+        }
+        let focus_row = gamepad_connected.then_some(self.settings_focus_row);
         let mut open = self.settings_open;
         let mut close_clicked = false;
         let is_streaming = matches!(self.mode, AppMode::Streaming(_));
@@ -217,6 +237,7 @@ impl AppState {
                         };
                         if ui.add_sized([92.0, 30.0], btn).clicked() {
                             self.settings_tab = tab;
+                            self.settings_focus_row = 0;
                         }
                     }
                 });
@@ -237,18 +258,31 @@ impl AppState {
                 ui.add_space(10.0);
 
                 match self.settings_tab {
-                    SettingsTab::Video => self.render_settings_video_tab(ui, is_streaming),
-                    SettingsTab::Audio => self.render_settings_audio_tab(ui),
-                    SettingsTab::Input => self.render_settings_input_tab(ui),
+                    SettingsTab::Video => {
+                        self.render_settings_video_tab(ui, is_streaming, focus_row)
+                    }
+                    SettingsTab::Audio => self.render_settings_audio_tab(ui, focus_row),
+                    SettingsTab::Input => self.render_settings_input_tab(ui, focus_row),
                 }
 
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::primary_button("Close")).clicked() {
-                        close_clicked = true;
+                ui.horizontal(|ui| {
+                    if gamepad_connected {
+                        ui.label(
+                            egui::RichText::new(
+                                "D-Pad: Row  ·  Left/Right: Adjust  ·  L1/R1: Tab  ·  Cross: Toggle  ·  Circle: Close",
+                            )
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                        );
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(theme::primary_button("Close")).clicked() {
+                            close_clicked = true;
+                        }
+                    });
                 });
             });
 
@@ -257,24 +291,29 @@ impl AppState {
         }
     }
 
-    fn render_settings_video_tab(&mut self, ui: &mut egui::Ui, is_streaming: bool) {
+    fn render_settings_video_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_streaming: bool,
+        focus_row: Option<usize>,
+    ) {
         egui::Grid::new("settings_video_grid")
             .num_columns(2)
             .spacing([20.0, 12.0])
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("Stream Preset").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Stream Preset", focus_row, 0);
                 ui.add_enabled_ui(!is_streaming, |ui| {
                     render_preset_controls(ui, &mut self.settings.preset);
                 });
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Video Codec").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Video Codec", focus_row, 1);
                 ui.add_enabled_ui(!is_streaming, |ui| {
                     render_codec_controls(ui, &mut self.settings.codec);
                 });
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Target Bitrate").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Target Bitrate", focus_row, 2);
                 ui.add_enabled_ui(!is_streaming, |ui| {
                     ui.add(
                         egui::Slider::new(
@@ -289,19 +328,19 @@ impl AppState {
                 });
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Aspect Scale").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Aspect Scale", focus_row, 3);
                 render_scale_selector(ui, &mut self.settings.scale_mode);
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Upscale Filter").color(theme::TEXT_SECONDARY));
-                render_filter_controls(
-                    ui,
-                    &mut self.settings.filter_mode,
-                    &mut self.settings.sharpness_pct,
-                );
+                settings_row_label(ui, "Upscale Filter", focus_row, 4);
+                render_filter_mode_selector(ui, &mut self.settings.filter_mode);
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Presentation").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Sharpness", focus_row, 5);
+                render_sharpness_slider(ui, self.settings.filter_mode, &mut self.settings.sharpness_pct);
+                ui.end_row();
+
+                settings_row_label(ui, "Presentation", focus_row, 6);
                 ui.checkbox(
                     &mut self.settings.vsync,
                     "VSync (tear-free, 1-frame DXGI wait)",
@@ -310,15 +349,25 @@ impl AppState {
                     "Off enables decode-paced tearing + 1000 Hz input polling for lowest latency.",
                 );
                 ui.end_row();
+
+                settings_row_label(ui, "Auto-Reconnect", focus_row, 7);
+                ui.checkbox(
+                    &mut self.settings.auto_reconnect,
+                    "Retry drops (2s/4s/8s) with LAN -> WAN fallback",
+                )
+                .on_hover_text(
+                    "Automatically reconnect transient stream drops and switch to saved WAN host if LAN retries fail.",
+                );
+                ui.end_row();
             });
     }
 
-    fn render_settings_audio_tab(&mut self, ui: &mut egui::Ui) {
+    fn render_settings_audio_tab(&mut self, ui: &mut egui::Ui, focus_row: Option<usize>) {
         egui::Grid::new("settings_audio_grid")
             .num_columns(2)
             .spacing([20.0, 12.0])
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("Master Volume").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Master Volume", focus_row, 0);
                 ui.add(
                     egui::Slider::new(&mut self.settings.volume_pct, 0..=100)
                         .clamping(egui::SliderClamping::Always)
@@ -327,7 +376,7 @@ impl AppState {
                 .on_hover_text("Stream playback gain (0-100%)");
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Playback Device").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Playback Device", focus_row, 1);
                 render_audio_device_combo(
                     ui,
                     "settings_audio_device",
@@ -337,7 +386,7 @@ impl AppState {
                 );
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Microphone Input").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Microphone Input", focus_row, 2);
                 render_audio_device_combo(
                     ui,
                     "settings_mic_device",
@@ -349,12 +398,12 @@ impl AppState {
             });
     }
 
-    fn render_settings_input_tab(&mut self, ui: &mut egui::Ui) {
+    fn render_settings_input_tab(&mut self, ui: &mut egui::Ui, focus_row: Option<usize>) {
         egui::Grid::new("settings_input_grid")
             .num_columns(2)
             .spacing([20.0, 12.0])
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("DualSense Touchpad").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "DualSense Touchpad", focus_row, 0);
                 ui.checkbox(
                     &mut self.settings.touchpad_touch,
                     "Forward capacitive finger touch",
@@ -364,7 +413,7 @@ impl AppState {
                 );
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Virtual KB+M").color(theme::TEXT_SECONDARY));
+                settings_row_label(ui, "Virtual KB+M", focus_row, 1);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.settings.kbm_enabled, "Enable Mouse & Keyboard (F8 lock)")
                         .on_hover_text(self.settings.kbm_bindings.summary_tooltip());
@@ -375,7 +424,7 @@ impl AppState {
                 ui.end_row();
 
                 if self.settings.kbm_enabled {
-                    ui.label(egui::RichText::new("Sensitivity").color(theme::TEXT_SECONDARY));
+                    settings_row_label(ui, "Sensitivity", focus_row, 2);
                     ui.add(
                         egui::Slider::new(&mut self.settings.kbm_sensitivity_pct, 1..=100)
                             .clamping(egui::SliderClamping::Always)
@@ -383,7 +432,7 @@ impl AppState {
                     );
                     ui.end_row();
 
-                    ui.label(egui::RichText::new("Inner Deadzone").color(theme::TEXT_SECONDARY));
+                    settings_row_label(ui, "Inner Deadzone", focus_row, 3);
                     ui.add(
                         egui::Slider::new(&mut self.settings.kbm_deadzone_pct, 0..=40)
                             .clamping(egui::SliderClamping::Always)
@@ -391,7 +440,7 @@ impl AppState {
                     );
                     ui.end_row();
 
-                    ui.label(egui::RichText::new("Aim Curve").color(theme::TEXT_SECONDARY));
+                    settings_row_label(ui, "Aim Curve", focus_row, 4);
                     ui.add(
                         egui::Slider::new(&mut self.settings.kbm_curve_pct, 50..=150)
                             .clamping(egui::SliderClamping::Always)
@@ -399,7 +448,7 @@ impl AppState {
                     );
                     ui.end_row();
 
-                    ui.label(egui::RichText::new("Vertical Axis").color(theme::TEXT_SECONDARY));
+                    settings_row_label(ui, "Vertical Axis", focus_row, 5);
                     ui.checkbox(&mut self.settings.kbm_invert_y, "Invert Mouse Y");
                     ui.end_row();
                 }

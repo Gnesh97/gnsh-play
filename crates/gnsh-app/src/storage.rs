@@ -359,6 +359,7 @@ mod tests {
             codec: VideoCodec::HevcHdr,
             bitrate_kbps: 500_000,
             vsync: false,
+            auto_reconnect: false,
             touchpad_touch: true,
             filter_mode: VideoFilterMode::Fsr1,
             sharpness_pct: 250,
@@ -379,6 +380,7 @@ mod tests {
         assert_eq!(loaded.codec, VideoCodec::HevcHdr);
         assert_eq!(loaded.bitrate_kbps, 100_000);
         assert!(!loaded.vsync);
+        assert!(!loaded.auto_reconnect);
         assert!(loaded.touchpad_touch);
         assert_eq!(loaded.filter_mode, VideoFilterMode::Fsr1);
         assert_eq!(loaded.sharpness_pct, 100);
@@ -410,6 +412,7 @@ mod tests {
         assert_eq!(clamped.mic_device, None);
         assert_eq!(clamped.preset, VideoPreset::P1080Fps60);
         assert_eq!(clamped.codec, VideoCodec::Hevc);
+        assert!(clamped.auto_reconnect);
         assert_eq!(clamped.scale_mode, ScaleMode::Fit);
         assert!(!clamped.kbm_enabled);
         assert_eq!(clamped.kbm_sensitivity_pct, 1);
@@ -420,6 +423,7 @@ mod tests {
         std::fs::write(&path, r#"{"kbm_enabled": true}"#).expect("write missing curve json");
         let defaulted = store.load().expect("load missing curve");
         assert_eq!(defaulted.filter_mode, VideoFilterMode::Bilinear);
+        assert!(defaulted.auto_reconnect);
         assert_eq!(defaulted.kbm_curve_pct, 100);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -434,6 +438,7 @@ pub struct StoredSettings {
     pub codec: VideoCodec,
     pub bitrate_kbps: u32,
     pub vsync: bool,
+    pub auto_reconnect: bool,
     pub touchpad_touch: bool,
     pub filter_mode: VideoFilterMode,
     pub sharpness_pct: u8,
@@ -456,6 +461,7 @@ impl Default for StoredSettings {
             codec: VideoCodec::Hevc,
             bitrate_kbps: 30_000,
             vsync: true,
+            auto_reconnect: true,
             touchpad_touch: false,
             filter_mode: VideoFilterMode::Bilinear,
             sharpness_pct: 0,

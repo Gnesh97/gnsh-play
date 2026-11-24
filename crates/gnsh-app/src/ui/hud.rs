@@ -1,5 +1,6 @@
 use super::settings::{
-    render_audio_device_combo, render_filter_controls, render_kbm_sliders, render_scale_selector,
+    render_audio_device_combo, render_filter_mode_selector, render_kbm_sliders,
+    render_scale_selector, render_sharpness_slider,
 };
 use super::{StreamSettings, theme};
 use crate::stream::ActiveStream;
@@ -22,6 +23,8 @@ pub(crate) fn render_streaming_ui(
     open_settings: &mut bool,
 ) {
     if stream.show_hud {
+        let focus_row = (stream.hud_drawer_open && gamepad_name.is_some() && !*open_settings)
+            .then_some(stream.hud_focus_row);
         egui::Area::new(egui::Id::unique("stream_hud"))
             .anchor(egui::Align2::LEFT_TOP, [14.0, 14.0])
             .show(ui.ctx(), |ui| {
@@ -33,6 +36,7 @@ pub(crate) fn render_streaming_ui(
                         settings,
                         hdr_output_active,
                         mouse_locked,
+                        focus_row,
                     );
 
                     if stream.hud_drawer_open {
@@ -45,6 +49,8 @@ pub(crate) fn render_streaming_ui(
                             settings,
                             audio_devices,
                             mic_devices,
+                            gamepad_name.is_some(),
+                            focus_row,
                             open_keybinds,
                             open_settings,
                         );
@@ -57,6 +63,31 @@ pub(crate) fn render_streaming_ui(
     render_osk_modal(ui, stream);
 }
 
+fn hud_label(ui: &mut egui::Ui, label: &str, focus_row: Option<usize>, row_idx: usize) {
+    if focus_row == Some(row_idx) {
+        ui.label(
+            egui::RichText::new(format!("> {label}"))
+                .small()
+                .strong()
+                .color(theme::FOCUS_RING),
+        );
+    } else {
+        ui.label(egui::RichText::new(label).small().color(theme::TEXT_MUTED));
+    }
+}
+
+fn hud_focus_border(
+    default_border: Option<egui::Color32>,
+    focus_row: Option<usize>,
+    row_idx: usize,
+) -> Option<egui::Color32> {
+    if focus_row == Some(row_idx) {
+        Some(theme::FOCUS_RING)
+    } else {
+        default_border
+    }
+}
+
 fn render_hud_top_pill(
     ui: &mut egui::Ui,
     stream: &mut ActiveStream,
@@ -64,6 +95,7 @@ fn render_hud_top_pill(
     settings: &StreamSettings,
     hdr_output_active: bool,
     mouse_locked: bool,
+    focus_row: Option<usize>,
 ) {
     let (decode_ms_text, decoder_badge) = match &stream.current_frame {
         Some(info) => (
@@ -201,7 +233,12 @@ fn render_hud_top_pill(
         if ui
             .add_enabled(
                 stream.connected,
-                theme::small_pill_button(mic_label, mic_bg, mic_fg, mic_border),
+                theme::small_pill_button(
+                    mic_label,
+                    mic_bg,
+                    mic_fg,
+                    hud_focus_border(mic_border, focus_row, 5),
+                ),
             )
             .on_hover_text(
                 stream
@@ -221,7 +258,7 @@ fn render_hud_top_pill(
                     "PS Home",
                     theme::SURFACE_RAISED,
                     theme::TEXT_PRIMARY,
-                    Some(theme::BORDER_SUBTLE),
+                    hud_focus_border(Some(theme::BORDER_SUBTLE), focus_row, 6),
                 ),
             )
             .on_hover_text("Open PS5 Home screen (Home key)")
@@ -272,7 +309,7 @@ fn render_hud_top_pill(
                 "Disconnect",
                 theme::DANGER_SOLID_BG,
                 egui::Color32::WHITE,
-                None,
+                hud_focus_border(None, focus_row, 8),
             ))
             .clicked()
         {
@@ -281,41 +318,40 @@ fn render_hud_top_pill(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_hud_quick_drawer(
     ui: &mut egui::Ui,
     stream: &mut ActiveStream,
     settings: &mut StreamSettings,
     audio_devices: &[String],
     mic_devices: &[String],
+    gamepad_connected: bool,
+    focus_row: Option<usize>,
     open_keybinds: &mut bool,
     open_settings: &mut bool,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(
-            egui::RichText::new("Scale:")
-                .small()
-                .color(theme::TEXT_MUTED),
-        );
+        hud_label(ui, "Scale:", focus_row, 0);
         render_scale_selector(ui, &mut settings.scale_mode);
 
         ui.separator();
-        ui.label(
-            egui::RichText::new("Filter:")
-                .small()
-                .color(theme::TEXT_MUTED),
-        );
-        render_filter_controls(ui, &mut settings.filter_mode, &mut settings.sharpness_pct);
+        hud_label(ui, "Filter:", focus_row, 1);
+        render_filter_mode_selector(ui, &mut settings.filter_mode);
+
+        ui.separator();
+        hud_label(ui, "Sharp:", focus_row, 2);
+        render_sharpness_slider(ui, settings.filter_mode, &mut settings.sharpness_pct);
     });
 
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
+        hud_label(ui, "Vol:", focus_row, 3);
         ui.scope(|ui| {
             ui.spacing_mut().slider_width = 76.0;
             ui.add(
                 egui::Slider::new(&mut settings.volume_pct, 0..=100)
                     .clamping(egui::SliderClamping::Always)
-                    .suffix("%")
-                    .text("Vol"),
+                    .suffix("%"),
             )
             .on_hover_text("Stream playback volume (0-100%)");
         });
@@ -345,7 +381,14 @@ fn render_hud_quick_drawer(
         );
 
         ui.separator();
-        ui.checkbox(&mut settings.vsync, "VSync").on_hover_text(
+        let vsync_label = if focus_row == Some(4) {
+            egui::RichText::new("> VSync")
+                .strong()
+                .color(theme::FOCUS_RING)
+        } else {
+            egui::RichText::new("VSync").color(theme::TEXT_PRIMARY)
+        };
+        ui.checkbox(&mut settings.vsync, vsync_label).on_hover_text(
             "Off: lowest latency (decode-paced + tearing, 1000 Hz input). On: tear-free VSync.",
         );
         ui.checkbox(&mut settings.touchpad_touch, "Touchpad Touch")
@@ -362,7 +405,13 @@ fn render_hud_quick_drawer(
         if ui.add(theme::secondary_button("Keybinds...")).clicked() {
             *open_keybinds = true;
         }
-        if ui.add(theme::secondary_button("All Settings...")).clicked() {
+        let all_settings_btn = if focus_row == Some(7) {
+            theme::secondary_button("> All Settings...")
+                .stroke(egui::Stroke::new(1.5, theme::FOCUS_RING))
+        } else {
+            theme::secondary_button("All Settings...")
+        };
+        if ui.add(all_settings_btn).clicked() {
             stream.hud_drawer_open = false;
             *open_settings = true;
         }
@@ -376,6 +425,15 @@ fn render_hud_quick_drawer(
         .small()
         .color(theme::TEXT_MUTED),
     );
+    if gamepad_connected {
+        ui.label(
+            egui::RichText::new(
+                "Gamepad: L1+R1+Options: Toggle HUD  ·  D-Pad: Nav  ·  Left/Right: Adjust  ·  Cross: Select  ·  Circle: Back",
+            )
+            .small()
+            .color(theme::TEXT_SECONDARY),
+        );
+    }
 }
 
 fn render_pin_modal(ui: &egui::Ui, stream: &mut ActiveStream) {

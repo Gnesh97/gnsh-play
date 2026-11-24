@@ -82,6 +82,8 @@ pub(crate) enum HomeAction {
     EditSaved(usize),
     DeleteSaved(usize),
     OpenRegister(String),
+    RetryReconnectNow,
+    CancelReconnect,
 }
 
 pub(crate) struct RegisterModal {

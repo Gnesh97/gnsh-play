@@ -86,7 +86,7 @@ impl AppState {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new(
-                                "D-Pad / Stick: Select  ·  Cross: Connect  ·  Triangle: Wake  ·  Square: Discover  ·  Options: Settings (L1/R1 Tabs)  ·  Circle: Back",
+                                "D-Pad / Stick: Select  ·  Cross: Connect  ·  Triangle: Wake  ·  Square: Discover  ·  Options: Settings (D-Pad + L1/R1)  ·  Circle: Back",
                             )
                             .small()
                             .color(theme::TEXT_SECONDARY),
@@ -120,6 +120,51 @@ impl AppState {
                                     if theme::render_status_banner(ui, &banner) {
                                         self.status_banner = None;
                                     }
+                                    ui.add_space(10.0);
+                                }
+
+                                if let Some(ref rc) = self.reconnect {
+                                    let now = std::time::Instant::now();
+                                    theme::card_frame()
+                                        .stroke(egui::Stroke::new(1.5, theme::FOCUS_RING))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spinner();
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(rc.status_line(now))
+                                                            .strong()
+                                                            .color(theme::TEXT_PRIMARY),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "Last reason: {}",
+                                                            rc.last_reason
+                                                        ))
+                                                        .small()
+                                                        .color(theme::TEXT_MUTED),
+                                                    );
+                                                });
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .add(theme::primary_button("Retry Now"))
+                                                    .clicked()
+                                                {
+                                                    self.pending_home_action =
+                                                        Some(HomeAction::RetryReconnectNow);
+                                                }
+                                                if ui
+                                                    .add(theme::secondary_button("Cancel"))
+                                                    .clicked()
+                                                {
+                                                    self.pending_home_action =
+                                                        Some(HomeAction::CancelReconnect);
+                                                }
+                                            });
+                                        });
                                     ui.add_space(10.0);
                                 }
 
@@ -303,69 +348,51 @@ fn render_saved_console_card(
     }
     frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&saved.name)
-                            .size(16.0)
-                            .strong()
-                            .color(theme::TEXT_PRIMARY),
-                    );
-                    if let Some(disc) = live {
-                        theme::state_badge(ui, disc.state);
-                        if !disc.running_app_name.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!("Playing: {}", disc.running_app_name))
-                                    .small()
-                                    .color(theme::INFO_FG),
-                            );
-                        }
-                    }
-                });
-                ui.add_space(3.0);
-                let subtitle = match saved.remote_host.as_deref() {
-                    Some(remote) => format!(
-                        "LAN {}  ·  WAN {}  ·  ID {}  ·  MAC {}",
-                        saved.host,
-                        remote,
-                        saved.id,
-                        format_mac_colon(saved.mac)
-                    ),
-                    None => format!(
-                        "Host {}  ·  ID {}  ·  MAC {}",
-                        saved.host,
-                        saved.id,
-                        format_mac_colon(saved.mac)
-                    ),
-                };
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new(subtitle)
-                        .small()
-                        .family(egui::FontFamily::Monospace)
-                        .color(theme::TEXT_MUTED),
+                    egui::RichText::new(&saved.name)
+                        .size(16.0)
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
                 );
+                if let Some(disc) = live {
+                    theme::state_badge(ui, disc.state);
+                    if !disc.running_app_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("Playing: {}", disc.running_app_name))
+                                .small()
+                                .color(theme::INFO_FG),
+                        );
+                    }
+                }
             });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(theme::subtle_danger_button("Delete")).clicked() {
-                    *pending_action = Some(HomeAction::DeleteSaved(idx));
-                }
-                if ui.add(theme::secondary_button("Edit")).clicked() {
-                    *pending_action = Some(HomeAction::EditSaved(idx));
-                }
-                if ui
-                    .add(theme::secondary_button("Shortcut"))
-                    .on_hover_text("Create Desktop shortcut for direct fullscreen launch")
-                    .clicked()
-                {
-                    *pending_action = Some(HomeAction::CreateShortcut(idx));
-                }
-                if ui
-                    .add_enabled(!waking, theme::secondary_button("Wake"))
-                    .clicked()
-                {
-                    *pending_action = Some(HomeAction::WakeSaved(idx));
+            ui.add_space(3.0);
+            let subtitle = match saved.remote_host.as_deref() {
+                Some(remote) => format!(
+                    "LAN {}  ·  WAN {}  ·  ID {}  ·  MAC {}",
+                    saved.host,
+                    remote,
+                    saved.id,
+                    format_mac_colon(saved.mac)
+                ),
+                None => format!(
+                    "Host {}  ·  ID {}  ·  MAC {}",
+                    saved.host,
+                    saved.id,
+                    format_mac_colon(saved.mac)
+                ),
+            };
+            ui.label(
+                egui::RichText::new(subtitle)
+                    .small()
+                    .family(egui::FontFamily::Monospace)
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(theme::primary_button("Connect")).clicked() {
+                    *pending_action = Some(HomeAction::ConnectSaved(idx));
                 }
                 if let Some(ref remote) = saved.remote_host
                     && ui
@@ -375,8 +402,24 @@ fn render_saved_console_card(
                 {
                     *pending_action = Some(HomeAction::ConnectSavedWan(idx));
                 }
-                if ui.add(theme::primary_button("Connect")).clicked() {
-                    *pending_action = Some(HomeAction::ConnectSaved(idx));
+                if ui
+                    .add_enabled(!waking, theme::secondary_button("Wake"))
+                    .clicked()
+                {
+                    *pending_action = Some(HomeAction::WakeSaved(idx));
+                }
+                if ui
+                    .add(theme::secondary_button("Shortcut"))
+                    .on_hover_text("Create Desktop shortcut for direct fullscreen launch")
+                    .clicked()
+                {
+                    *pending_action = Some(HomeAction::CreateShortcut(idx));
+                }
+                if ui.add(theme::secondary_button("Edit")).clicked() {
+                    *pending_action = Some(HomeAction::EditSaved(idx));
+                }
+                if ui.add(theme::subtle_danger_button("Delete")).clicked() {
+                    *pending_action = Some(HomeAction::DeleteSaved(idx));
                 }
             });
         });

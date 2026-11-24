@@ -3,6 +3,7 @@
 mod egui_d3d11;
 mod gamepad_nav;
 mod logging;
+mod reconnect;
 mod shortcut;
 mod storage;
 mod stream;
@@ -11,7 +12,10 @@ mod ui;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::Receiver;
 use egui_d3d11::EguiD3d11Painter;
-use gamepad_nav::{GamepadHomeNav, HomeNavEvent};
+use gamepad_nav::{
+    GamepadHomeNav, HUD_QUICK_ROWS, HomeNavEvent, HudNavAction, apply_hud_nav, apply_settings_nav,
+    settings_row_count,
+};
 use gnsh_input::{
     AppWindow, GamepadManager, KbmAction, KbmConfig, KbmEmulator, merge_controller_states,
 };
@@ -22,6 +26,7 @@ use gnsh_proto::{
     ControllerState, DiscoveredConsole, RegisteredConsole, SessionEvent, UDP_RECV_BUF_BYTES,
     VideoCodec, discover_ps5_hosts, discover_ps5_lan, init_lib, wake_ps5,
 };
+use reconnect::ReconnectState;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -693,13 +698,144 @@ pub(crate) struct AppState {
     pub(crate) edit_modal: Option<EditConsoleModal>,
     pub(crate) settings_open: bool,
     pub(crate) settings_tab: SettingsTab,
+    pub(crate) settings_focus_row: usize,
     pub(crate) kbm_modal_open: bool,
     pub(crate) kbm_listening_action: Option<KbmAction>,
     pub(crate) mode: AppMode,
     pub(crate) selected_console_idx: usize,
     gamepad_nav: GamepadHomeNav,
+    pub(crate) active_stream_target: Option<(usize, bool)>,
+    pub(crate) reconnect: Option<ReconnectState>,
     pub(crate) pending_home_action: Option<HomeAction>,
     pub(crate) pending_stream_connect: Option<(usize, bool)>,
+}
+
+fn step_wrap(idx: &mut usize, count: usize, forward: bool) {
+    if count == 0 {
+        *idx = 0;
+        return;
+    }
+    if *idx >= count {
+        *idx = count - 1;
+    }
+    *idx = if forward {
+        (*idx + 1) % count
+    } else if *idx == 0 {
+        count - 1
+    } else {
+        *idx - 1
+    };
+}
+
+struct SettingsPadCtx<'a> {
+    settings: &'a mut StreamSettings,
+    settings_open: &'a mut bool,
+    settings_tab: &'a mut SettingsTab,
+    settings_focus_row: &'a mut usize,
+    gamepad_nav: &'a mut GamepadHomeNav,
+    audio_devices: &'a [String],
+    mic_devices: &'a [String],
+}
+
+fn handle_settings_pad_event(
+    ctx: &mut SettingsPadCtx<'_>,
+    is_streaming: bool,
+    event: HomeNavEvent,
+) {
+    match event {
+        HomeNavEvent::Back | HomeNavEvent::ToggleSettings => {
+            *ctx.settings_open = false;
+            if is_streaming {
+                ctx.gamepad_nav.arm_release_guard();
+            }
+        }
+        HomeNavEvent::PrevSettingsTab => {
+            *ctx.settings_tab = ctx.settings_tab.prev();
+            *ctx.settings_focus_row = 0;
+        }
+        HomeNavEvent::NextSettingsTab => {
+            *ctx.settings_tab = ctx.settings_tab.next();
+            *ctx.settings_focus_row = 0;
+        }
+        HomeNavEvent::PrevConsole | HomeNavEvent::NextConsole => {
+            let count = settings_row_count(*ctx.settings_tab, ctx.settings.kbm_enabled);
+            step_wrap(
+                ctx.settings_focus_row,
+                count,
+                event == HomeNavEvent::NextConsole,
+            );
+        }
+        HomeNavEvent::Left | HomeNavEvent::Right | HomeNavEvent::Connect => {
+            let _ = apply_settings_nav(
+                ctx.settings,
+                *ctx.settings_tab,
+                *ctx.settings_focus_row,
+                event,
+                is_streaming,
+                ctx.audio_devices,
+                ctx.mic_devices,
+            );
+            let count = settings_row_count(*ctx.settings_tab, ctx.settings.kbm_enabled);
+            if count > 0 && *ctx.settings_focus_row >= count {
+                *ctx.settings_focus_row = count - 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_streaming_pad_overlay(
+    ctx: &mut SettingsPadCtx<'_>,
+    kbm_modal_open: bool,
+    stream: &mut ActiveStream,
+    pad: &ControllerState,
+) -> bool {
+    let events = ctx.gamepad_nav.update(pad);
+    if events.is_empty() {
+        return false;
+    }
+    for event in events {
+        if *ctx.settings_open && !kbm_modal_open {
+            handle_settings_pad_event(ctx, true, event);
+        } else if stream.hud_drawer_open {
+            match event {
+                HomeNavEvent::Back | HomeNavEvent::ToggleSettings => {
+                    stream.hud_drawer_open = false;
+                    ctx.gamepad_nav.arm_release_guard();
+                }
+                HomeNavEvent::PrevConsole | HomeNavEvent::NextConsole => {
+                    step_wrap(
+                        &mut stream.hud_focus_row,
+                        HUD_QUICK_ROWS,
+                        event == HomeNavEvent::NextConsole,
+                    );
+                }
+                HomeNavEvent::Left | HomeNavEvent::Right | HomeNavEvent::Connect => {
+                    let (_, action) = apply_hud_nav(ctx.settings, stream.hud_focus_row, event);
+                    match action {
+                        HudNavAction::None => {}
+                        HudNavAction::ToggleMic => {
+                            stream.mic_toggle_requested = true;
+                        }
+                        HudNavAction::GoHome => {
+                            stream.go_home_requested = true;
+                        }
+                        HudNavAction::OpenSettings => {
+                            stream.hud_drawer_open = false;
+                            *ctx.settings_open = true;
+                            *ctx.settings_focus_row = 0;
+                            ctx.gamepad_nav.arm_release_guard();
+                        }
+                        HudNavAction::Disconnect => {
+                            stream.disconnect_requested = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 impl AppState {
@@ -725,11 +861,14 @@ impl AppState {
             edit_modal: None,
             settings_open: false,
             settings_tab: SettingsTab::Video,
+            settings_focus_row: 0,
             kbm_modal_open: false,
             kbm_listening_action: None,
             mode: AppMode::Home,
             selected_console_idx: 0,
             gamepad_nav: GamepadHomeNav::default(),
+            active_stream_target: None,
+            reconnect: None,
             pending_home_action: None,
             pending_stream_connect: None,
         }
@@ -754,12 +893,32 @@ impl AppState {
             return false;
         }
         self.clamp_selected_console();
-        let no_modal_open = !self.settings_open
-            && !self.kbm_modal_open
-            && self.register_modal.is_none()
-            && self.edit_modal.is_none();
+        let prev_settings = self.settings.clone();
 
         for event in events {
+            let no_modal_open = !self.settings_open
+                && !self.kbm_modal_open
+                && self.register_modal.is_none()
+                && self.edit_modal.is_none();
+
+            if self.settings_open
+                && !self.kbm_modal_open
+                && self.register_modal.is_none()
+                && self.edit_modal.is_none()
+            {
+                let mut ctx = SettingsPadCtx {
+                    settings: &mut self.settings,
+                    settings_open: &mut self.settings_open,
+                    settings_tab: &mut self.settings_tab,
+                    settings_focus_row: &mut self.settings_focus_row,
+                    gamepad_nav: &mut self.gamepad_nav,
+                    audio_devices: &self.audio_devices,
+                    mic_devices: &self.mic_devices,
+                };
+                handle_settings_pad_event(&mut ctx, false, event);
+                continue;
+            }
+
             match event {
                 HomeNavEvent::Back => {
                     if self.kbm_modal_open {
@@ -769,41 +928,27 @@ impl AppState {
                         self.edit_modal = None;
                     } else if self.register_modal.is_some() {
                         self.register_modal = None;
-                    } else if self.settings_open {
-                        self.settings_open = false;
+                    } else if self.reconnect.is_some() {
+                        self.reconnect = None;
                     }
                 }
-                HomeNavEvent::PrevSettingsTab if self.settings_open && !self.kbm_modal_open => {
-                    self.settings_tab = self.settings_tab.prev();
+                HomeNavEvent::ToggleSettings if no_modal_open => {
+                    self.settings_open = true;
+                    self.settings_focus_row = 0;
                 }
-                HomeNavEvent::NextSettingsTab if self.settings_open && !self.kbm_modal_open => {
-                    self.settings_tab = self.settings_tab.next();
+                HomeNavEvent::PrevConsole | HomeNavEvent::NextConsole if no_modal_open => {
+                    step_wrap(
+                        &mut self.selected_console_idx,
+                        self.saved_consoles.len(),
+                        event == HomeNavEvent::NextConsole,
+                    );
                 }
-                HomeNavEvent::ToggleSettings
-                    if !self.kbm_modal_open
-                        && self.register_modal.is_none()
-                        && self.edit_modal.is_none() =>
-                {
-                    self.settings_open = !self.settings_open;
-                }
-                HomeNavEvent::PrevConsole if no_modal_open => {
-                    let count = self.saved_consoles.len();
-                    if count > 0 {
-                        self.selected_console_idx = if self.selected_console_idx == 0 {
-                            count - 1
-                        } else {
-                            self.selected_console_idx - 1
-                        };
+                HomeNavEvent::Connect if no_modal_open => {
+                    if let Some(ref rc) = self.reconnect {
+                        self.pending_stream_connect = Some((rc.saved_idx, rc.use_wan));
+                    } else if !self.saved_consoles.is_empty() {
+                        self.pending_stream_connect = Some((self.selected_console_idx, false));
                     }
-                }
-                HomeNavEvent::NextConsole if no_modal_open => {
-                    let count = self.saved_consoles.len();
-                    if count > 0 {
-                        self.selected_console_idx = (self.selected_console_idx + 1) % count;
-                    }
-                }
-                HomeNavEvent::Connect if no_modal_open && !self.saved_consoles.is_empty() => {
-                    self.pending_stream_connect = Some((self.selected_console_idx, false));
                 }
                 HomeNavEvent::Wake if no_modal_open => {
                     if let Some(console) =
@@ -821,6 +966,7 @@ impl AppState {
                 _ => {}
             }
         }
+        self.apply_settings_side_effects(&prev_settings);
         true
     }
 
@@ -918,6 +1064,8 @@ impl AppState {
                         self.register_modal = None;
                     } else if self.settings_open {
                         self.settings_open = false;
+                    } else if self.reconnect.is_some() {
+                        self.reconnect = None;
                     }
                 }
             }
@@ -1072,6 +1220,10 @@ impl AppState {
         }
 
         let mut stream_quit_banner: Option<StatusBanner> = None;
+        let mut stream_quit_error_reason: Option<String> = None;
+        let mut cleared_reconnect = false;
+        let prev_pad_settings = self.settings.clone();
+
         if let AppMode::Streaming(ref mut stream) = self.mode {
             if let Ok(mut err_guard) = stream.video_init_error.lock()
                 && let Some(err_msg) = err_guard.take()
@@ -1083,6 +1235,7 @@ impl AppState {
                 match ev {
                     SessionEvent::Connected => {
                         stream.connected = true;
+                        cleared_reconnect = true;
                         tracing::info!(host = %stream.console_host, "Stream session connected");
                         gamepads.set_mic_led(stream.mic_muted);
                         if let Some(session) = stream.session.as_mut() {
@@ -1157,19 +1310,17 @@ impl AppState {
                     SessionEvent::Quit { reason, is_error } => {
                         if is_error {
                             tracing::warn!(host = %stream.console_host, "Stream session ended with error: {reason}");
+                            stream_quit_error_reason = Some(reason);
                         } else {
                             tracing::info!(host = %stream.console_host, "Stream session disconnected: {reason}");
+                            stream_quit_banner =
+                                Some(StatusBanner::info(format!("Disconnected: {reason}")));
                         }
-                        stream_quit_banner = Some(if is_error {
-                            StatusBanner::error(format!("Session ended: {reason}"))
-                        } else {
-                            StatusBanner::info(format!("Disconnected: {reason}"))
-                        });
                     }
                 }
             }
 
-            if stream_quit_banner.is_none() {
+            if stream_quit_banner.is_none() && stream_quit_error_reason.is_none() {
                 if std::mem::take(&mut stream.go_home_requested)
                     && stream.connected
                     && let Some(session) = stream.session.as_mut()
@@ -1268,11 +1419,54 @@ impl AppState {
                 }
 
                 let pad_state = gamepads.poll_state(self.settings.touchpad_touch);
+                let modal_prompt_active =
+                    stream.pin_prompt.is_some() || stream.osk_prompt.is_some();
+                if !modal_prompt_active
+                    && !self.settings_open
+                    && !stream.hud_drawer_open
+                    && let Some(ref pad) = pad_state
+                    && self.gamepad_nav.poll_hud_chord(pad.buttons)
+                {
+                    stream.show_hud = true;
+                    stream.hud_drawer_open = true;
+                    stream.hud_focus_row = 0;
+                    self.gamepad_nav.arm_release_guard();
+                    ui_dirty = true;
+                }
+
+                let overlay_open =
+                    !modal_prompt_active && (self.settings_open || stream.hud_drawer_open);
+                let pad_for_ps5 = if overlay_open {
+                    if let Some(ref pad) = pad_state {
+                        let mut ctx = SettingsPadCtx {
+                            settings: &mut self.settings,
+                            settings_open: &mut self.settings_open,
+                            settings_tab: &mut self.settings_tab,
+                            settings_focus_row: &mut self.settings_focus_row,
+                            gamepad_nav: &mut self.gamepad_nav,
+                            audio_devices: &self.audio_devices,
+                            mic_devices: &self.mic_devices,
+                        };
+                        ui_dirty |= handle_streaming_pad_overlay(
+                            &mut ctx,
+                            self.kbm_modal_open,
+                            stream,
+                            pad,
+                        );
+                    } else {
+                        self.gamepad_nav.reset();
+                    }
+                    None
+                } else {
+                    pad_state
+                };
+                let overlay_just_opened = overlay_open && !stream.pad_overlay_was_active;
+                stream.pad_overlay_was_active = overlay_open;
+
                 let kbm_active = self.settings.kbm_enabled
                     && mouse_locked
                     && !self.kbm_modal_open
-                    && stream.pin_prompt.is_none()
-                    && stream.osk_prompt.is_none();
+                    && !modal_prompt_active;
                 let kbm_state = if kbm_active {
                     Some(kbm.sample_state(
                         KbmConfig {
@@ -1286,12 +1480,12 @@ impl AppState {
                 } else {
                     None
                 };
-                let combined = match (pad_state, kbm_state.as_ref()) {
+                let combined = match (pad_for_ps5, kbm_state.as_ref()) {
                     (Some(pad), Some(kb)) => Some(merge_controller_states(&pad, kb)),
                     (Some(pad), None) => Some(pad),
                     (None, Some(_)) => kbm_state,
                     (None, None) => {
-                        if stream.kbm_was_active {
+                        if stream.kbm_was_active || overlay_just_opened {
                             Some(ControllerState::default())
                         } else {
                             None
@@ -1309,11 +1503,67 @@ impl AppState {
             }
         } else {
             ui_dirty |= self.handle_home_gamepad_events(gamepads);
+            if let Some(ref rc) = self.reconnect
+                && rc.is_due(Instant::now())
+                && self.pending_stream_connect.is_none()
+            {
+                self.pending_stream_connect = Some((rc.saved_idx, rc.use_wan));
+                ui_dirty = true;
+            }
         }
+
+        if cleared_reconnect {
+            self.reconnect = None;
+        }
+        self.apply_settings_side_effects(&prev_pad_settings);
+
         if let Some(banner) = stream_quit_banner {
             self.stop_stream(gamepads, Some(banner));
+        } else if let Some(reason) = stream_quit_error_reason {
+            self.handle_stream_error_quit(gamepads, reason);
         }
         got_new_frame || ui_dirty
+    }
+
+    fn handle_stream_error_quit(&mut self, gamepads: &mut GamepadManager, reason: String) {
+        let now = Instant::now();
+        let can_retry = self.settings.auto_reconnect && reconnect::is_retryable_reason(&reason);
+        if can_retry
+            && let Some((saved_idx, use_wan)) = self.active_stream_target
+            && let Some(console) = self.saved_consoles.get(saved_idx)
+        {
+            if let Some(ref mut rc) = self.reconnect {
+                if rc.advance_after_failure(reason.clone(), now) {
+                    self.stop_stream_inner(gamepads, None, true);
+                    return;
+                }
+                let name = rc.console_name.clone();
+                self.stop_stream_inner(
+                    gamepads,
+                    Some(StatusBanner::error(format!(
+                        "Auto-reconnect failed for {name}: {reason}"
+                    ))),
+                    false,
+                );
+                return;
+            }
+            self.reconnect = Some(ReconnectState::start(
+                saved_idx,
+                console.name.clone(),
+                use_wan,
+                console.remote_host.is_some(),
+                reason,
+                now,
+            ));
+            self.stop_stream_inner(gamepads, None, true);
+            return;
+        }
+
+        self.stop_stream_inner(
+            gamepads,
+            Some(StatusBanner::error(format!("Session ended: {reason}"))),
+            false,
+        );
     }
 
     fn process_post_ui(&mut self, gamepads: &mut GamepadManager) {
@@ -1330,10 +1580,12 @@ impl AppState {
         if let Some(action) = self.pending_home_action.take() {
             match action {
                 HomeAction::ConnectSaved(idx) => {
+                    self.reconnect = None;
                     self.selected_console_idx = idx;
                     self.pending_stream_connect = Some((idx, false));
                 }
                 HomeAction::ConnectSavedWan(idx) => {
+                    self.reconnect = None;
                     self.selected_console_idx = idx;
                     self.pending_stream_connect = Some((idx, true));
                 }
@@ -1375,6 +1627,7 @@ impl AppState {
                 }
                 HomeAction::DeleteSaved(idx) => {
                     if idx < self.saved_consoles.len() {
+                        self.reconnect = None;
                         let removed = self.saved_consoles.remove(idx);
                         match self.store.save(&self.saved_consoles) {
                             Ok(()) => {
@@ -1396,11 +1649,32 @@ impl AppState {
                 HomeAction::OpenRegister(host) => {
                     self.register_modal = Some(RegisterModal::new(host));
                 }
+                HomeAction::RetryReconnectNow => {
+                    if let Some(ref rc) = self.reconnect {
+                        self.pending_stream_connect = Some((rc.saved_idx, rc.use_wan));
+                    }
+                }
+                HomeAction::CancelReconnect => {
+                    self.reconnect = None;
+                }
             }
         }
     }
 
     fn stop_stream(&mut self, gamepads: &mut GamepadManager, banner: Option<StatusBanner>) {
+        self.stop_stream_inner(gamepads, banner, false);
+    }
+
+    fn stop_stream_inner(
+        &mut self,
+        gamepads: &mut GamepadManager,
+        banner: Option<StatusBanner>,
+        keep_reconnect: bool,
+    ) {
+        if !keep_reconnect {
+            self.reconnect = None;
+            self.active_stream_target = None;
+        }
         if let AppMode::Streaming(mut stream) = std::mem::replace(&mut self.mode, AppMode::Home) {
             stream.shutdown();
             self.gamepad_nav.arm_release_guard();
@@ -1412,6 +1686,29 @@ impl AppState {
                 self.status_banner = Some(b);
             }
         }
+    }
+
+    fn apply_settings_side_effects(&mut self, prev: &StreamSettings) {
+        if self.settings == *prev {
+            return;
+        }
+        if let AppMode::Streaming(ref mut stream) = self.mode {
+            if self.settings.volume_pct != prev.volume_pct {
+                stream
+                    .volume_pct
+                    .store(self.settings.volume_pct.min(100), Ordering::Relaxed);
+            }
+            if self.settings.audio_device != prev.audio_device {
+                if let Ok(mut guard) = stream.audio_device.lock() {
+                    *guard = self.settings.audio_device.clone();
+                }
+                stream.audio_device_recheck.store(true, Ordering::Release);
+            }
+            if self.settings.mic_device != prev.mic_device {
+                stream.set_mic_device(self.settings.mic_device.clone());
+            }
+        }
+        self.persist_settings();
     }
 
     fn ui(
@@ -1446,31 +1743,15 @@ impl AppState {
                 );
             }
         }
-        self.render_settings_modal(ui.ctx());
+        self.render_settings_modal(ui.ctx(), gamepad_name.is_some());
         self.render_kbm_bindings_modal(ui.ctx());
-        if self.settings != prev_settings {
-            if let AppMode::Streaming(ref mut stream) = self.mode {
-                if self.settings.volume_pct != prev_settings.volume_pct {
-                    stream
-                        .volume_pct
-                        .store(self.settings.volume_pct.min(100), Ordering::Relaxed);
-                }
-                if self.settings.audio_device != prev_settings.audio_device {
-                    if let Ok(mut guard) = stream.audio_device.lock() {
-                        *guard = self.settings.audio_device.clone();
-                    }
-                    stream.audio_device_recheck.store(true, Ordering::Release);
-                }
-                if self.settings.mic_device != prev_settings.mic_device {
-                    stream.set_mic_device(self.settings.mic_device.clone());
-                }
-            }
-            self.persist_settings();
-        }
+        self.apply_settings_side_effects(&prev_settings);
     }
 
     fn begin_stream(&mut self, saved_idx: usize, use_wan: bool, device: ID3D11Device) {
         let Some(console) = self.saved_consoles.get(saved_idx) else {
+            self.reconnect = None;
+            self.active_stream_target = None;
             self.status_banner = Some(StatusBanner::error("Selected console no longer exists."));
             return;
         };
@@ -1478,6 +1759,8 @@ impl AppState {
             match console.remote_host.as_deref() {
                 Some(remote) => remote,
                 None => {
+                    self.reconnect = None;
+                    self.active_stream_target = None;
                     self.status_banner = Some(StatusBanner::error(
                         "No Remote / WAN host configured for this console.",
                     ));
@@ -1489,6 +1772,7 @@ impl AppState {
         };
         match ActiveStream::start_with_host(console, target_host, &self.settings, device) {
             Ok(stream) => {
+                self.active_stream_target = Some((saved_idx, use_wan));
                 self.status_banner = None;
                 self.register_modal = None;
                 self.edit_modal = None;
@@ -1496,15 +1780,28 @@ impl AppState {
                 self.mode = AppMode::Streaming(Box::new(stream));
             }
             Err(err) => {
+                let msg = format!("{err:#}");
                 tracing::warn!(
-                    "Unable to connect to {} ({}): {err:#}",
+                    "Unable to connect to {} ({}): {msg}",
                     console.name,
                     target_host
                 );
-                self.status_banner = Some(StatusBanner::error(format!(
-                    "Unable to connect to {} ({}): {err:#}",
-                    console.name, target_host
-                )));
+                if let Some(ref mut rc) = self.reconnect {
+                    if !rc.advance_after_failure(msg.clone(), Instant::now()) {
+                        let name = rc.console_name.clone();
+                        self.reconnect = None;
+                        self.active_stream_target = None;
+                        self.status_banner = Some(StatusBanner::error(format!(
+                            "Auto-reconnect failed for {name}: {msg}"
+                        )));
+                    }
+                } else {
+                    self.active_stream_target = None;
+                    self.status_banner = Some(StatusBanner::error(format!(
+                        "Unable to connect to {} ({}): {msg}",
+                        console.name, target_host
+                    )));
+                }
             }
         }
     }
