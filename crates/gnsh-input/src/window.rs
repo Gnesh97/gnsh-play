@@ -17,6 +17,9 @@ pub struct WindowEventSummary {
     pub escape_pressed: bool,
     pub toggle_mic: bool,
     pub go_home: bool,
+    pub take_screenshot: bool,
+    pub toggle_recording: bool,
+    pub save_replay_clip: bool,
     pub audio_devices_changed: bool,
     pub last_kbm_input: Option<KbmInput>,
 }
@@ -387,6 +390,9 @@ impl AppWindow {
         if pressed && !key_ev.repeat {
             match key_ev.key {
                 ffi::SDLK_F11 => summary.toggle_fullscreen = true,
+                ffi::SDLK_F12 => summary.take_screenshot = true,
+                ffi::SDLK_F9 => summary.toggle_recording = true,
+                ffi::SDLK_F10 => summary.save_replay_clip = true,
                 ffi::SDLK_F3 => summary.toggle_hud = true,
                 ffi::SDLK_F8 => summary.toggle_mouse_lock = true,
                 ffi::SDLK_ESCAPE => summary.escape_pressed = true,

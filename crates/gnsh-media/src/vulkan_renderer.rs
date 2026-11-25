@@ -3,11 +3,12 @@ use crate::renderer::{
     ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode, VideoRenderOptions,
     VideoRenderer,
 };
-use crate::video_decoder::DecodedFrame;
+use crate::video_decoder::{DecodedFrame, VulkanFrame};
 use anyhow::{Context, Result, bail};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::sync::{Arc, Condvar, Mutex};
 
 const EGUI_VS_GLSL: &std::ffi::CStr = c"#version 450
 layout(location = 0) in vec2 in_pos;
@@ -101,7 +102,7 @@ const CAS_HOOK_GLSL: &str = "\
 //!MAXIMUM 1.0
 0.0
 
-//!HOOK OUTPUT
+//!HOOK PRE_OUTPUT
 //!BIND HOOKED
 //!DESC gnsh-play CAS
 vec4 hook() {
@@ -121,12 +122,303 @@ vec4 hook() {
 }
 ";
 
+struct QueueLock(Mutex<bool>, Condvar);
+
+impl QueueLock {
+    fn new() -> Self {
+        Self(Mutex::new(false), Condvar::new())
+    }
+
+    fn lock(&self) {
+        let mut busy = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy {
+            busy = self.1.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy = true;
+    }
+
+    fn unlock(&self) {
+        let mut busy = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *busy = false;
+        self.1.notify_one();
+    }
+}
+
+/// Shared Vulkan device and video decode queue handles exposed to FFmpeg `AV_HWDEVICE_TYPE_VULKAN`.
+pub struct VulkanVideoDevice {
+    pub(crate) vk_inst: ffi::pl_vk_inst,
+    pub(crate) vk: ffi::pl_vulkan,
+    pub(crate) has_h264_decode: bool,
+    pub(crate) has_h265_decode: bool,
+    pub(crate) queue_families: Vec<ffi::AVVulkanDeviceQueueFamily>,
+    placebo_managed_qfs: Vec<u32>,
+    extra_queue_locks: HashMap<(u32, u32), QueueLock>,
+}
+
+// SAFETY: VulkanVideoDevice exposes immutable instance/device handles and mutex-synchronized queue locking callbacks.
+unsafe impl Send for VulkanVideoDevice {}
+// SAFETY: Queue locks serialize concurrent command-buffer submissions across FFmpeg threads and libplacebo.
+unsafe impl Sync for VulkanVideoDevice {}
+
+impl std::fmt::Debug for VulkanVideoDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VulkanVideoDevice")
+            .field("has_h264_decode", &self.has_h264_decode)
+            .field("has_h265_decode", &self.has_h265_decode)
+            .field("queue_family_count", &self.queue_families.len())
+            .finish()
+    }
+}
+
+impl VulkanVideoDevice {
+    pub(crate) fn supports_h264(&self) -> bool {
+        self.has_h264_decode
+    }
+
+    pub(crate) fn supports_h265(&self) -> bool {
+        self.has_h265_decode
+    }
+
+    pub(crate) fn lock_queue(&self, queue_family: u32, index: u32) {
+        if self.placebo_managed_qfs.contains(&queue_family) {
+            if let Some(lock_fn) = unsafe { (*self.vk).lock_queue } {
+                unsafe {
+                    lock_fn(self.vk, queue_family, index);
+                }
+            }
+        } else if let Some(ql) = self.extra_queue_locks.get(&(queue_family, index)) {
+            ql.lock();
+        }
+    }
+
+    pub(crate) fn unlock_queue(&self, queue_family: u32, index: u32) {
+        if self.placebo_managed_qfs.contains(&queue_family) {
+            if let Some(unlock_fn) = unsafe { (*self.vk).unlock_queue } {
+                unsafe {
+                    unlock_fn(self.vk, queue_family, index);
+                }
+            }
+        } else if let Some(ql) = self.extra_queue_locks.get(&(queue_family, index)) {
+            ql.unlock();
+        }
+    }
+}
+
+unsafe fn create_pl_vk_inst_with_ffmpeg_exts(
+    log: ffi::pl_log,
+    required_extensions: &[*const c_char],
+) -> ffi::pl_vk_inst {
+    let mut opt_count: c_int = 0;
+    let opt_exts = unsafe { ffi::av_vk_get_optional_instance_extensions(&mut opt_count) };
+    let mut vk_inst_params = unsafe { ffi::pl_vk_inst_default_params };
+    vk_inst_params.extensions = required_extensions.as_ptr();
+    vk_inst_params.num_extensions = i32::try_from(required_extensions.len()).unwrap_or(0);
+    if !opt_exts.is_null() && opt_count > 0 {
+        vk_inst_params.opt_extensions = opt_exts.cast_const();
+        vk_inst_params.num_opt_extensions = opt_count;
+    }
+    let vk_inst = unsafe { ffi::pl_vk_inst_create(log, &vk_inst_params) };
+    if !opt_exts.is_null() {
+        unsafe {
+            ffi::av_free(opt_exts.cast());
+        }
+    }
+    vk_inst
+}
+
+unsafe fn create_pl_vulkan_with_video(
+    log: ffi::pl_log,
+    vk_inst: ffi::pl_vk_inst,
+    surface: ffi::VkSurfaceKHR,
+    allow_software: bool,
+) -> ffi::pl_vulkan {
+    let mut opt_count: c_int = 0;
+    let opt_exts = unsafe { ffi::av_vk_get_optional_device_extensions(&mut opt_count) };
+    let mut vk_params = unsafe { ffi::pl_vulkan_default_params };
+    unsafe {
+        vk_params.instance = (*vk_inst).instance;
+        vk_params.get_proc_addr = (*vk_inst).get_proc_addr;
+        vk_params.surface = surface;
+        vk_params.allow_software = allow_software;
+        // Single graphics queue + video decode queue without async compute/transfer avoids cross-queue stalls on AMD.
+        vk_params.async_transfer = false;
+        vk_params.async_compute = false;
+        vk_params.extra_queues =
+            ffi::VkQueueFlagBits_VK_QUEUE_VIDEO_DECODE_BIT_KHR as ffi::VkQueueFlags;
+    }
+    if !opt_exts.is_null() && opt_count > 0 {
+        vk_params.opt_extensions = opt_exts.cast_const();
+        vk_params.num_opt_extensions = opt_count;
+    }
+    let vk = unsafe { ffi::pl_vulkan_create(log, &vk_params) };
+    if !opt_exts.is_null() {
+        unsafe {
+            ffi::av_free(opt_exts.cast());
+        }
+    }
+    vk
+}
+
+unsafe fn probe_vulkan_video_device(
+    vk_inst: ffi::pl_vk_inst,
+    vk: ffi::pl_vulkan,
+) -> Option<Arc<VulkanVideoDevice>> {
+    if vk_inst.is_null() || vk.is_null() {
+        return None;
+    }
+    let ext_slice = unsafe {
+        let ptr = (*vk).extensions;
+        let count = (*vk).num_extensions.max(0) as usize;
+        if ptr.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts(ptr, count)
+        }
+    };
+    let mut has_decode_queue_ext = false;
+    let mut has_h264_decode = false;
+    let mut has_h265_decode = false;
+    for &ext_ptr in ext_slice {
+        if ext_ptr.is_null() {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(ext_ptr) }.to_bytes();
+        if name == b"VK_KHR_video_decode_queue" {
+            has_decode_queue_ext = true;
+        } else if name == b"VK_KHR_video_decode_h264" {
+            has_h264_decode = true;
+        } else if name == b"VK_KHR_video_decode_h265" {
+            has_h265_decode = true;
+        }
+    }
+    if !has_decode_queue_ext || (!has_h264_decode && !has_h265_decode) {
+        return None;
+    }
+
+    type GetQfProps2Fn = unsafe extern "system" fn(
+        ffi::VkPhysicalDevice,
+        *mut u32,
+        *mut ffi::VkQueueFamilyProperties2,
+    );
+    let get_proc = unsafe { (*vk).get_proc_addr }?;
+    let raw_fn = unsafe {
+        get_proc(
+            (*vk).instance,
+            c"vkGetPhysicalDeviceQueueFamilyProperties2".as_ptr(),
+        )
+        .or_else(|| {
+            get_proc(
+                (*vk).instance,
+                c"vkGetPhysicalDeviceQueueFamilyProperties2KHR".as_ptr(),
+            )
+        })
+    }?;
+    let get_qf_props2: GetQfProps2Fn = unsafe { std::mem::transmute(raw_fn) };
+
+    let phys = unsafe { (*vk).phys_device };
+    let mut qf_count: u32 = 0;
+    unsafe {
+        get_qf_props2(phys, &mut qf_count, std::ptr::null_mut());
+    }
+    if qf_count == 0 {
+        return None;
+    }
+
+    let mut video_props = vec![ffi::VkQueueFamilyVideoPropertiesKHR::default(); qf_count as usize];
+    let mut props2 = vec![ffi::VkQueueFamilyProperties2::default(); qf_count as usize];
+    for (p2, vp) in props2.iter_mut().zip(video_props.iter_mut()) {
+        vp.sType = ffi::VkStructureType_VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR;
+        p2.sType = ffi::VkStructureType_VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+        p2.pNext = (vp as *mut ffi::VkQueueFamilyVideoPropertiesKHR).cast();
+    }
+    unsafe {
+        get_qf_props2(phys, &mut qf_count, props2.as_mut_ptr());
+    }
+
+    let mut queue_families = Vec::new();
+    let mut placebo_managed_qfs = Vec::new();
+    let mut extra_queue_locks = HashMap::new();
+    let mut seen_idx = Vec::new();
+
+    let placebo_queues = unsafe {
+        [
+            (*vk).queue_graphics,
+            (*vk).queue_compute,
+            (*vk).queue_transfer,
+        ]
+    };
+    for pq in placebo_queues {
+        if pq.count == 0 || seen_idx.contains(&pq.index) {
+            continue;
+        }
+        let Some(p2) = props2.get(pq.index as usize) else {
+            continue;
+        };
+        let vp = &video_props[pq.index as usize];
+        seen_idx.push(pq.index);
+        placebo_managed_qfs.push(pq.index);
+        queue_families.push(ffi::AVVulkanDeviceQueueFamily {
+            idx: pq.index as c_int,
+            num: pq.count as c_int,
+            flags: p2.queueFamilyProperties.queueFlags as ffi::VkQueueFlagBits,
+            video_caps: vp.videoCodecOperations as ffi::VkVideoCodecOperationFlagBitsKHR,
+        });
+    }
+
+    let mut has_video_decode_qf = queue_families
+        .iter()
+        .any(|q| (q.flags & ffi::VkQueueFlagBits_VK_QUEUE_VIDEO_DECODE_BIT_KHR) != 0);
+    for (idx, (p2, vp)) in props2.iter().zip(video_props.iter()).enumerate() {
+        let q_idx = idx as u32;
+        let flags = p2.queueFamilyProperties.queueFlags;
+        let q_count = p2.queueFamilyProperties.queueCount;
+        if (flags & ffi::VkQueueFlagBits_VK_QUEUE_VIDEO_DECODE_BIT_KHR) == 0 || q_count == 0 {
+            continue;
+        }
+        has_video_decode_qf = true;
+        if seen_idx.contains(&q_idx) {
+            continue;
+        }
+        seen_idx.push(q_idx);
+        for qi in 0..q_count {
+            extra_queue_locks.insert((q_idx, qi), QueueLock::new());
+        }
+        queue_families.push(ffi::AVVulkanDeviceQueueFamily {
+            idx: q_idx as c_int,
+            num: q_count as c_int,
+            flags: flags as ffi::VkQueueFlagBits,
+            video_caps: vp.videoCodecOperations as ffi::VkVideoCodecOperationFlagBitsKHR,
+        });
+    }
+
+    if !has_video_decode_qf || queue_families.len() > 64 {
+        return None;
+    }
+
+    tracing::info!(
+        has_h264_decode,
+        has_h265_decode,
+        queue_families = queue_families.len(),
+        "Vulkan Video zero-copy hardware decode available on shared VkDevice"
+    );
+    Some(Arc::new(VulkanVideoDevice {
+        vk_inst,
+        vk,
+        has_h264_decode,
+        has_h265_decode,
+        queue_families,
+        placebo_managed_qfs,
+        extra_queue_locks,
+    }))
+}
+
 pub struct VulkanPlaceboRenderer {
     log: ffi::pl_log,
     vk_inst: ffi::pl_vk_inst,
     surface: *mut c_void,
     destroy_surface: unsafe fn(*mut c_void, *mut c_void),
     vk: ffi::pl_vulkan,
+    video_dev: Option<Arc<VulkanVideoDevice>>,
     sw: ffi::pl_swapchain,
     renderer: ffi::pl_renderer,
     cas_hook: *const ffi::pl_hook,
@@ -171,11 +463,7 @@ impl VulkanPlaceboRenderer {
             bail!("pl_log_create returned null");
         }
 
-        let mut vk_inst_params = unsafe { ffi::pl_vk_inst_default_params };
-        vk_inst_params.extensions = required_extensions.as_ptr();
-        vk_inst_params.num_extensions = i32::try_from(required_extensions.len())
-            .context("Vulkan instance extension count exceeds i32")?;
-        let mut vk_inst = unsafe { ffi::pl_vk_inst_create(log, &vk_inst_params) };
+        let mut vk_inst = unsafe { create_pl_vk_inst_with_ffmpeg_exts(log, required_extensions) };
         if vk_inst.is_null() {
             let mut log_mut = log;
             unsafe { ffi::pl_log_destroy(&mut log_mut) };
@@ -203,15 +491,7 @@ impl VulkanPlaceboRenderer {
             }
         };
 
-        let mut vk_params = unsafe { ffi::pl_vulkan_default_params };
-        unsafe {
-            vk_params.instance = (*vk_inst).instance;
-            vk_params.get_proc_addr = (*vk_inst).get_proc_addr;
-            vk_params.surface = surface.cast();
-            // Execute uploads and rendering on a single queue to avoid cross-queue semaphore stalls on AMD.
-            vk_params.async_transfer = false;
-        }
-        let mut vk = unsafe { ffi::pl_vulkan_create(log, &vk_params) };
+        let mut vk = unsafe { create_pl_vulkan_with_video(log, vk_inst, surface.cast(), false) };
         if vk.is_null() {
             let mut log_mut = log;
             unsafe {
@@ -221,6 +501,7 @@ impl VulkanPlaceboRenderer {
             }
             bail!("pl_vulkan_create failed to find a Vulkan device supporting presentation");
         }
+        let video_dev = unsafe { probe_vulkan_video_device(vk_inst, vk) };
 
         let gpu = unsafe { (*vk).gpu };
         let sw_params = build_swapchain_params(surface.cast(), vsync);
@@ -324,6 +605,7 @@ impl VulkanPlaceboRenderer {
             surface,
             destroy_surface,
             vk,
+            video_dev,
             sw,
             renderer,
             cas_hook,
@@ -341,6 +623,11 @@ impl VulkanPlaceboRenderer {
             width: u32::try_from(w.max(1)).unwrap_or(1),
             height: u32::try_from(h.max(1)).unwrap_or(1),
         })
+    }
+
+    /// Returns shared Vulkan device & video decode queue handles when the GPU supports `VK_KHR_video_decode_queue`.
+    pub fn video_device(&self) -> Option<Arc<VulkanVideoDevice>> {
+        self.video_dev.as_ref().map(Arc::clone)
     }
 
     fn flush_swap_buffers(&self) {
@@ -735,9 +1022,47 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         };
 
         let gpu = unsafe { (*self.vk).gpu };
+        let mut target: ffi::pl_frame = unsafe { std::mem::zeroed() };
+        unsafe {
+            ffi::pl_frame_from_swapchain(&mut target, &sw_frame);
+        }
+        let target_w = if sw_frame.fbo.is_null() {
+            self.width
+        } else {
+            unsafe { u32::try_from((*sw_frame.fbo).params.w.max(1)).unwrap_or(self.width) }
+        };
+        let target_h = if sw_frame.fbo.is_null() {
+            self.height
+        } else {
+            unsafe { u32::try_from((*sw_frame.fbo).params.h.max(1)).unwrap_or(self.height) }
+        };
+
+        if let DecodedFrame::Vulkan(vk_frame) = frame {
+            for slot in &mut self.video_planes {
+                if !slot.is_null() {
+                    unsafe {
+                        ffi::pl_tex_destroy(gpu, slot);
+                    }
+                    *slot = std::ptr::null();
+                }
+            }
+            return unsafe {
+                render_vulkan_zero_copy_frame(
+                    gpu,
+                    self.renderer,
+                    self.cas_hook,
+                    vk_frame,
+                    &mut target,
+                    target_w,
+                    target_h,
+                    options,
+                )
+            };
+        }
+
         let mut src_frame: ffi::pl_frame = unsafe { std::mem::zeroed() };
         let (fw, fh, is_hdr, used_planes) = match frame {
-            DecodedFrame::D3D11(_) | DecodedFrame::D3D12(_) => {
+            DecodedFrame::D3D11(_) | DecodedFrame::D3D12(_) | DecodedFrame::Vulkan(_) => {
                 bail!("VulkanPlaceboRenderer cannot consume zero-copy D3D11/D3D12 frames directly");
             }
             DecodedFrame::SoftwareNv12 {
@@ -991,55 +1316,11 @@ impl VideoRenderer for VulkanPlaceboRenderer {
             );
         }
 
-        let mut target: ffi::pl_frame = unsafe { std::mem::zeroed() };
-        unsafe {
-            ffi::pl_frame_from_swapchain(&mut target, &sw_frame);
-        }
-        let target_w = if sw_frame.fbo.is_null() {
-            self.width
-        } else {
-            unsafe { u32::try_from((*sw_frame.fbo).params.w.max(1)).unwrap_or(self.width) }
-        };
-        let target_h = if sw_frame.fbo.is_null() {
-            self.height
-        } else {
-            unsafe { u32::try_from((*sw_frame.fbo).params.h.max(1)).unwrap_or(self.height) }
-        };
         let [x0, y0, x1, y1] =
             compute_placebo_target_rect(fw, fh, target_w, target_h, options.scale_mode);
         target.crop = ffi::pl_rect2df { x0, y0, x1, y1 };
 
-        let mut params = unsafe { ffi::pl_render_fast_params };
-        params.skip_caching_single_frame = true;
-        params.disable_linear_scaling = true;
-        params.upscaler = match options.filter_mode {
-            VideoFilterMode::Bilinear => &raw const ffi::pl_filter_bilinear,
-            VideoFilterMode::Cas | VideoFilterMode::Fsr1 => &raw const ffi::pl_filter_spline36,
-        };
-        let hook_ptrs = [self.cas_hook];
-        let sharp = options.sharpness.clamp(0.0, 1.0);
-        if !matches!(options.filter_mode, VideoFilterMode::Bilinear)
-            && sharp > 0.001
-            && !self.cas_hook.is_null()
-        {
-            unsafe {
-                let hook_ref = &*self.cas_hook;
-                if hook_ref.num_parameters > 0
-                    && !hook_ref.parameters.is_null()
-                    && !(*hook_ref.parameters).data.is_null()
-                {
-                    (*(*hook_ref.parameters).data).f = sharp;
-                }
-            }
-            params.hooks = hook_ptrs.as_ptr();
-            params.num_hooks = 1;
-        }
-        params.border = ffi::pl_clear_mode_PL_CLEAR_SKIP;
-
-        if !unsafe { ffi::pl_render_image(self.renderer, &src_frame, &target, &params) } {
-            bail!("pl_render_image failed");
-        }
-        Ok(())
+        render_pl_frame(self.renderer, self.cas_hook, &src_frame, &target, options)
     }
 
     fn present(&self, _vsync: bool) -> Result<()> {
@@ -1124,6 +1405,348 @@ impl Drop for VulkanPlaceboRenderer {
             }
         }
     }
+}
+
+fn render_pl_frame(
+    renderer: ffi::pl_renderer,
+    cas_hook: *const ffi::pl_hook,
+    src_frame: &ffi::pl_frame,
+    target: &ffi::pl_frame,
+    options: VideoRenderOptions,
+) -> Result<()> {
+    let mut params = unsafe { ffi::pl_render_fast_params };
+    params.skip_caching_single_frame = true;
+    params.disable_linear_scaling = true;
+    params.upscaler = match options.filter_mode {
+        VideoFilterMode::Bilinear => &raw const ffi::pl_filter_bilinear,
+        VideoFilterMode::Cas | VideoFilterMode::Fsr1 => &raw const ffi::pl_filter_spline36,
+    };
+    let hook_ptrs = [cas_hook];
+    let sharp = options.sharpness.clamp(0.0, 1.0);
+    if !matches!(options.filter_mode, VideoFilterMode::Bilinear)
+        && sharp > 0.001
+        && !cas_hook.is_null()
+    {
+        unsafe {
+            let hook_ref = &*cas_hook;
+            if hook_ref.num_parameters > 0
+                && !hook_ref.parameters.is_null()
+                && !(*hook_ref.parameters).data.is_null()
+            {
+                (*(*hook_ref.parameters).data).f = sharp;
+            }
+        }
+        params.hooks = hook_ptrs.as_ptr();
+        params.num_hooks = 1;
+    }
+    params.border = ffi::pl_clear_mode_PL_CLEAR_SKIP;
+
+    if !unsafe { ffi::pl_render_image(renderer, src_frame, target, &params) } {
+        bail!("pl_render_image failed");
+    }
+    Ok(())
+}
+
+fn map_vk_fmt(
+    vkfc: &ffi::AVVulkanFramesContext,
+    fmt: ffi::VkFormat,
+    bit_shift: &mut c_int,
+) -> ffi::VkFormat {
+    let mutable =
+        (vkfc.img_flags & ffi::VkImageCreateFlagBits_VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0;
+    if !mutable {
+        return fmt;
+    }
+    match fmt {
+        ffi::VkFormat_VK_FORMAT_R10X6_UNORM_PACK16 => {
+            *bit_shift = 6;
+            ffi::VkFormat_VK_FORMAT_R16_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_R10X6G10X6_UNORM_2PACK16 => {
+            *bit_shift = 6;
+            ffi::VkFormat_VK_FORMAT_R16G16_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => {
+            *bit_shift = 6;
+            ffi::VkFormat_VK_FORMAT_G16_B16R16_2PLANE_420_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 => {
+            *bit_shift = 6;
+            ffi::VkFormat_VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_R12X4_UNORM_PACK16 => {
+            *bit_shift = 4;
+            ffi::VkFormat_VK_FORMAT_R16_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_R12X4G12X4_UNORM_2PACK16 => {
+            *bit_shift = 4;
+            ffi::VkFormat_VK_FORMAT_R16G16_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16 => {
+            *bit_shift = 4;
+            ffi::VkFormat_VK_FORMAT_G16_B16R16_2PLANE_420_UNORM
+        }
+        ffi::VkFormat_VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16 => {
+            *bit_shift = 4;
+            ffi::VkFormat_VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM
+        }
+        _ => fmt,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn render_vulkan_zero_copy_frame(
+    gpu: ffi::pl_gpu,
+    renderer: ffi::pl_renderer,
+    cas_hook: *const ffi::pl_hook,
+    vk_frame: &VulkanFrame,
+    target: &mut ffi::pl_frame,
+    target_w: u32,
+    target_h: u32,
+    options: VideoRenderOptions,
+) -> Result<()> {
+    let av_frame = vk_frame.av_frame.as_ptr();
+    if av_frame.is_null() {
+        bail!("VulkanFrame AVFrame pointer was null");
+    }
+    let hw_frames_ref = unsafe { (*av_frame).hw_frames_ctx };
+    if hw_frames_ref.is_null() || unsafe { (*hw_frames_ref).data.is_null() } {
+        bail!("VulkanFrame missing AVHWFramesContext");
+    }
+    let hwfc = unsafe { (*hw_frames_ref).data.cast::<ffi::AVHWFramesContext>() };
+    let vkfc = unsafe { (*hwfc).hwctx.cast::<ffi::AVVulkanFramesContext>() };
+    let vkf = unsafe { (*av_frame).data[0].cast::<ffi::AVVkFrame>() };
+    if vkfc.is_null() || vkf.is_null() {
+        bail!("VulkanFrame missing AVVulkanFramesContext or AVVkFrame");
+    }
+
+    let sw_fmt = unsafe { (*hwfc).sw_format };
+    let desc = unsafe { ffi::av_pix_fmt_desc_get(sw_fmt) };
+    if desc.is_null() {
+        bail!("av_pix_fmt_desc_get returned null for sw_format {sw_fmt}");
+    }
+    let num_planes = unsafe { ffi::av_pix_fmt_count_planes(sw_fmt) };
+    if !(2..=3).contains(&num_planes) {
+        bail!("unsupported Vulkan sw_format plane count {num_planes} (sw_format={sw_fmt})");
+    }
+
+    let mut src_frame: ffi::pl_frame = unsafe { std::mem::zeroed() };
+    src_frame.num_planes = num_planes;
+    if num_planes == 2 {
+        src_frame.planes[0].components = 1;
+        src_frame.planes[0].component_mapping = [0, -1, -1, -1];
+        src_frame.planes[1].components = 2;
+        src_frame.planes[1].component_mapping = [1, 2, -1, -1];
+    } else {
+        for (p, plane) in src_frame.planes.iter_mut().enumerate().take(3) {
+            plane.components = 1;
+            plane.component_mapping = [p as c_int, -1, -1, -1];
+        }
+    }
+
+    let mut repr = if vk_frame.is_hdr {
+        unsafe { ffi::pl_color_repr_uhdtv }
+    } else {
+        unsafe { ffi::pl_color_repr_hdtv }
+    };
+    if sw_fmt == ffi::AVPixelFormat_AV_PIX_FMT_P010LE {
+        repr.bits = ffi::pl_bit_encoding {
+            sample_depth: 16,
+            color_depth: 10,
+            bit_shift: 6,
+        };
+    } else if sw_fmt == ffi::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+        repr.bits = ffi::pl_bit_encoding {
+            sample_depth: 16,
+            color_depth: 10,
+            bit_shift: 2,
+        };
+    }
+
+    let mut planar_tex: ffi::pl_tex = std::ptr::null();
+    let mut wrapped_planes: [ffi::pl_tex; 4] = [std::ptr::null(); 4];
+    let log2_cw = u32::from(unsafe { (*desc).log2_chroma_w });
+    let log2_ch = u32::from(unsafe { (*desc).log2_chroma_h });
+    let coded_w = unsafe { (*hwfc).width }.max(1);
+    let coded_h = unsafe { (*hwfc).height }.max(1);
+
+    for n in 0..(num_planes as usize) {
+        let vk_fmt_raw = unsafe { (*vkfc).format[n] };
+        let vk_img = unsafe { (*vkf).img[n] };
+        if vk_fmt_raw == 0 || vk_img.is_null() {
+            for slot in &mut wrapped_planes {
+                if !slot.is_null() {
+                    unsafe {
+                        ffi::pl_tex_destroy(gpu, slot);
+                    }
+                }
+            }
+            bail!("missing VkFormat or VkImage for Vulkan frame plane {n}");
+        }
+        let mut mapped_shift: c_int = 0;
+        let mapped_fmt = unsafe { map_vk_fmt(&*vkfc, vk_fmt_raw, &mut mapped_shift) };
+        let is_chroma = n == 1 || n == 2;
+        let pw = if is_chroma {
+            ((coded_w as u32).div_ceil(1u32 << log2_cw)) as c_int
+        } else {
+            coded_w
+        };
+        let ph = if is_chroma {
+            ((coded_h as u32).div_ceil(1u32 << log2_ch)) as c_int
+        } else {
+            coded_h
+        };
+        let mut wrap: ffi::pl_vulkan_wrap_params = unsafe { std::mem::zeroed() };
+        wrap.image = vk_img;
+        wrap.width = pw;
+        wrap.height = ph;
+        wrap.format = mapped_fmt;
+        wrap.usage = unsafe { (*vkfc).usage };
+        wrap.debug_tag = c"avvkframe".as_ptr();
+
+        let tex = unsafe { ffi::pl_vulkan_wrap(gpu, &wrap) };
+        if tex.is_null() {
+            for slot in &mut wrapped_planes {
+                if !slot.is_null() {
+                    unsafe {
+                        ffi::pl_tex_destroy(gpu, slot);
+                    }
+                }
+            }
+            bail!("pl_vulkan_wrap failed for Vulkan frame plane {n}");
+        }
+
+        let num_subplanes = unsafe { (*(*tex).params.format).num_planes };
+        if num_subplanes > 0 {
+            if n == 0 && num_subplanes > 1 && repr.bits.bit_shift != 0 {
+                let mutable = unsafe {
+                    ((*vkfc).img_flags
+                        & ffi::VkImageCreateFlagBits_VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
+                        != 0
+                };
+                if mutable && mapped_shift != 0 {
+                    repr.bits.bit_shift = mapped_shift;
+                } else if !mutable {
+                    repr.bits.bit_shift = 0;
+                }
+            }
+            planar_tex = tex;
+            let usable = (num_subplanes as usize).min(4);
+            src_frame.num_planes = usable as c_int;
+            for (i, dst_plane) in src_frame.planes.iter_mut().enumerate().take(usable) {
+                dst_plane.texture = unsafe { (*tex).planes[i] };
+            }
+            break;
+        }
+        wrapped_planes[n] = tex;
+        src_frame.planes[n].texture = tex;
+    }
+
+    if !src_frame.planes[0].texture.is_null() {
+        repr.bits.sample_depth =
+            unsafe { (*(*src_frame.planes[0].texture).params.format).component_depth[0] };
+    }
+    src_frame.repr = repr;
+    src_frame.color = if vk_frame.is_hdr {
+        unsafe { ffi::pl_color_space_hdr10 }
+    } else {
+        unsafe { ffi::pl_color_space_srgb }
+    };
+    src_frame.crop = ffi::pl_rect2df {
+        x0: 0.0,
+        y0: 0.0,
+        x1: vk_frame.width.max(1) as f32,
+        y1: vk_frame.height.max(1) as f32,
+    };
+    unsafe {
+        ffi::pl_frame_set_chroma_location(&mut src_frame, ffi::pl_chroma_location_PL_CHROMA_LEFT);
+    }
+
+    let [x0, y0, x1, y1] = compute_placebo_target_rect(
+        vk_frame.width,
+        vk_frame.height,
+        target_w,
+        target_h,
+        options.scale_mode,
+    );
+    target.crop = ffi::pl_rect2df { x0, y0, x1, y1 };
+
+    if let Some(lock_fn) = unsafe { (*vkfc).lock_frame } {
+        unsafe {
+            lock_fn(hwfc, vkf);
+        }
+    }
+
+    let sem_count = if !planar_tex.is_null() {
+        1
+    } else {
+        src_frame.num_planes as usize
+    };
+    for (n, wrapped) in wrapped_planes.iter().copied().enumerate().take(sem_count) {
+        let tex = if !planar_tex.is_null() {
+            planar_tex
+        } else {
+            wrapped
+        };
+        let mut rel: ffi::pl_vulkan_release_params = unsafe { std::mem::zeroed() };
+        rel.tex = tex;
+        rel.layout = unsafe { (*vkf).layout[n] };
+        rel.qf = ffi::VK_QUEUE_FAMILY_IGNORED as u32;
+        rel.semaphore = ffi::pl_vulkan_sem {
+            sem: unsafe { (*vkf).sem[n] },
+            value: unsafe { (*vkf).sem_value[n] },
+        };
+        unsafe {
+            ffi::pl_vulkan_release_ex(gpu, &rel);
+        }
+    }
+
+    let render_res = render_pl_frame(renderer, cas_hook, &src_frame, target, options);
+
+    for (n, wrapped) in wrapped_planes.iter().copied().enumerate().take(sem_count) {
+        let tex = if !planar_tex.is_null() {
+            planar_tex
+        } else {
+            wrapped
+        };
+        let next_sem_val = unsafe { (*vkf).sem_value[n].saturating_add(1) };
+        let mut hold: ffi::pl_vulkan_hold_params = unsafe { std::mem::zeroed() };
+        hold.tex = tex;
+        hold.out_layout = unsafe { &raw mut (*vkf).layout[n] };
+        hold.qf = ffi::VK_QUEUE_FAMILY_IGNORED as u32;
+        hold.semaphore = ffi::pl_vulkan_sem {
+            sem: unsafe { (*vkf).sem[n] },
+            value: next_sem_val,
+        };
+        let ok = unsafe { ffi::pl_vulkan_hold_ex(gpu, &hold) };
+        unsafe {
+            (*vkf).access[n] = 0;
+            if ok {
+                (*vkf).sem_value[n] = next_sem_val;
+            }
+        }
+    }
+
+    if let Some(unlock_fn) = unsafe { (*vkfc).unlock_frame } {
+        unsafe {
+            unlock_fn(hwfc, vkf);
+        }
+    }
+
+    if !planar_tex.is_null() {
+        unsafe {
+            ffi::pl_tex_destroy(gpu, &mut planar_tex);
+        }
+    }
+    for slot in &mut wrapped_planes {
+        if !slot.is_null() {
+            unsafe {
+                ffi::pl_tex_destroy(gpu, slot);
+            }
+        }
+    }
+
+    render_res
 }
 
 fn build_swapchain_params(
@@ -1249,21 +1872,14 @@ mod tests {
         let mut log = unsafe { ffi::pl_log_create_387(ffi::PL_API_VER as c_int, &log_params) };
         assert!(!log.is_null(), "pl_log_create should succeed");
 
-        let inst_params = unsafe { ffi::pl_vk_inst_default_params };
-        let mut inst = unsafe { ffi::pl_vk_inst_create(log, &inst_params) };
+        let mut inst = unsafe { create_pl_vk_inst_with_ffmpeg_exts(log, &[]) };
         if inst.is_null() {
             unsafe { ffi::pl_log_destroy(&mut log) };
             eprintln!("skipping headless libplacebo pass test: no Vulkan ICD available");
             return;
         }
 
-        let mut vk_params = unsafe { ffi::pl_vulkan_default_params };
-        unsafe {
-            vk_params.instance = (*inst).instance;
-            vk_params.get_proc_addr = (*inst).get_proc_addr;
-            vk_params.allow_software = true;
-        }
-        let mut vk = unsafe { ffi::pl_vulkan_create(log, &vk_params) };
+        let mut vk = unsafe { create_pl_vulkan_with_video(log, inst, std::ptr::null_mut(), true) };
         if vk.is_null() {
             unsafe {
                 ffi::pl_vk_inst_destroy(&mut inst);
@@ -1427,6 +2043,254 @@ mod tests {
             ffi::pl_mpv_user_shader_destroy(&mut cas_hook);
             ffi::pl_pass_destroy(gpu, &mut pass);
             ffi::pl_renderer_destroy(&mut renderer);
+            ffi::pl_vulkan_destroy(&mut vk);
+            ffi::pl_vk_inst_destroy(&mut inst);
+            ffi::pl_log_destroy(&mut log);
+        }
+    }
+
+    fn encode_synthetic_green_annex_b(
+        codec: crate::video_decoder::MediaCodec,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        let codec_id = match codec {
+            crate::video_decoder::MediaCodec::H264 => ffi::AVCodecID_AV_CODEC_ID_H264,
+            crate::video_decoder::MediaCodec::Hevc | crate::video_decoder::MediaCodec::HevcHdr => {
+                ffi::AVCodecID_AV_CODEC_ID_HEVC
+            }
+        };
+        let enc = unsafe { ffi::avcodec_find_encoder(codec_id) };
+        if enc.is_null() {
+            return None;
+        }
+        let mut ctx = unsafe { ffi::avcodec_alloc_context3(enc) };
+        if ctx.is_null() {
+            return None;
+        }
+        unsafe {
+            (*ctx).width = width as c_int;
+            (*ctx).height = height as c_int;
+            (*ctx).time_base = ffi::AVRational { num: 1, den: 60 };
+            (*ctx).framerate = ffi::AVRational { num: 60, den: 1 };
+            (*ctx).pix_fmt = ffi::AVPixelFormat_AV_PIX_FMT_YUV420P;
+            (*ctx).gop_size = 30;
+            (*ctx).max_b_frames = 0;
+            (*ctx).flags &= !(ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+            if ffi::avcodec_open2(ctx, enc, std::ptr::null_mut()) < 0 {
+                ffi::avcodec_free_context(&mut ctx);
+                return None;
+            }
+        }
+
+        let mut frame = unsafe { ffi::av_frame_alloc() };
+        let mut pkt = unsafe { ffi::av_packet_alloc() };
+        assert!(!frame.is_null() && !pkt.is_null());
+        unsafe {
+            (*frame).format = ffi::AVPixelFormat_AV_PIX_FMT_YUV420P;
+            (*frame).width = width as c_int;
+            (*frame).height = height as c_int;
+            (*frame).pts = 0;
+            assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+            for r in 0..(height as usize) {
+                std::ptr::write_bytes(
+                    (*frame).data[0].add(r * (*frame).linesize[0] as usize),
+                    175,
+                    width as usize,
+                );
+            }
+            for r in 0..((height as usize) / 2) {
+                std::ptr::write_bytes(
+                    (*frame).data[1].add(r * (*frame).linesize[1] as usize),
+                    42,
+                    (width as usize) / 2,
+                );
+                std::ptr::write_bytes(
+                    (*frame).data[2].add(r * (*frame).linesize[2] as usize),
+                    42,
+                    (width as usize) / 2,
+                );
+            }
+        }
+
+        let mut out = Vec::new();
+        unsafe {
+            if ffi::avcodec_send_frame(ctx, frame) >= 0 {
+                let _ = ffi::avcodec_send_frame(ctx, std::ptr::null());
+                while ffi::avcodec_receive_packet(ctx, pkt) == 0 {
+                    let s = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
+                    out.extend_from_slice(s);
+                    ffi::av_packet_unref(pkt);
+                }
+            }
+            ffi::av_packet_free(&mut pkt);
+            ffi::av_frame_free(&mut frame);
+            ffi::avcodec_free_context(&mut ctx);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    #[test]
+    fn headless_vulkan_video_zero_copy_decodes_and_renders_nonblack_pixels() {
+        use crate::video_decoder::{DecoderHardware, MediaCodec, VideoDecoder};
+
+        let log_params = ffi::pl_log_params {
+            log_cb: Some(placebo_log_cb),
+            log_priv: std::ptr::null_mut(),
+            log_level: ffi::pl_log_level_PL_LOG_WARN,
+        };
+        let mut log = unsafe { ffi::pl_log_create_387(ffi::PL_API_VER as c_int, &log_params) };
+        assert!(!log.is_null());
+
+        let mut inst = unsafe { create_pl_vk_inst_with_ffmpeg_exts(log, &[]) };
+        if inst.is_null() {
+            unsafe { ffi::pl_log_destroy(&mut log) };
+            eprintln!("skipping headless Vulkan Video test: no Vulkan ICD available");
+            return;
+        }
+        let mut vk = unsafe { create_pl_vulkan_with_video(log, inst, std::ptr::null_mut(), false) };
+        if vk.is_null() {
+            unsafe {
+                ffi::pl_vk_inst_destroy(&mut inst);
+                ffi::pl_log_destroy(&mut log);
+            }
+            eprintln!("skipping headless Vulkan Video test: no hardware Vulkan device available");
+            return;
+        }
+        let Some(vk_dev) = (unsafe { probe_vulkan_video_device(inst, vk) }) else {
+            unsafe {
+                ffi::pl_vulkan_destroy(&mut vk);
+                ffi::pl_vk_inst_destroy(&mut inst);
+                ffi::pl_log_destroy(&mut log);
+            }
+            eprintln!("skipping headless Vulkan Video test: GPU lacks VK_KHR_video_decode_queue");
+            return;
+        };
+
+        let gpu = unsafe { (*vk).gpu };
+        let mut renderer = unsafe { ffi::pl_renderer_create(log, gpu) };
+        assert!(!renderer.is_null());
+        let cas_hook = unsafe {
+            ffi::pl_mpv_user_shader_parse(gpu, CAS_HOOK_GLSL.as_ptr().cast(), CAS_HOOK_GLSL.len())
+        };
+
+        let target_fmt = unsafe {
+            ffi::pl_find_fmt(
+                gpu,
+                ffi::pl_fmt_type_PL_FMT_UNORM,
+                4,
+                8,
+                8,
+                (ffi::pl_fmt_caps_PL_FMT_CAP_RENDERABLE
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_BLITTABLE
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_HOST_READABLE)
+                    as ffi::pl_fmt_caps,
+            )
+        };
+        assert!(!target_fmt.is_null(), "renderable RGBA8 target format");
+
+        let (w, h) = (320u32, 240u32);
+        let mut dst_tex_params: ffi::pl_tex_params = unsafe { std::mem::zeroed() };
+        dst_tex_params.w = w as c_int;
+        dst_tex_params.h = h as c_int;
+        dst_tex_params.format = target_fmt;
+        dst_tex_params.renderable = true;
+        dst_tex_params.blit_dst = true;
+        dst_tex_params.host_readable = true;
+        let mut dst_tex = unsafe { ffi::pl_tex_create(gpu, &dst_tex_params) };
+        assert!(!dst_tex.is_null());
+
+        let mut tested_codecs = 0u32;
+        for (codec, supported) in [
+            (MediaCodec::H264, vk_dev.supports_h264()),
+            (MediaCodec::Hevc, vk_dev.supports_h265()),
+        ] {
+            if !supported {
+                continue;
+            }
+            let Some(bitstream) = encode_synthetic_green_annex_b(codec, w, h) else {
+                continue;
+            };
+            tested_codecs += 1;
+
+            let mut decoder = VideoDecoder::new_with_mode(
+                codec,
+                DecoderHardware::VulkanZeroCopy(Arc::clone(&vk_dev)),
+            )
+            .expect("VulkanZeroCopy decoder opens");
+            let frames = decoder.decode(&bitstream).expect("Annex-B IDR decodes");
+            assert!(!frames.is_empty(), "expected decoded frame for {codec:?}");
+            let DecodedFrame::Vulkan(ref vk_frame) = frames[0] else {
+                panic!("expected zero-copy DecodedFrame::Vulkan for {codec:?}");
+            };
+            assert!(decoder.is_hw_active());
+
+            unsafe {
+                ffi::pl_tex_clear_ex(
+                    gpu,
+                    dst_tex,
+                    ffi::pl_clear_color {
+                        f: [0.0, 0.0, 0.0, 1.0],
+                    },
+                );
+            }
+
+            let mut target: ffi::pl_frame = unsafe { std::mem::zeroed() };
+            target.num_planes = 1;
+            target.planes[0].texture = dst_tex;
+            target.planes[0].components = 4;
+            target.planes[0].component_mapping = [0, 1, 2, 3];
+            target.color = unsafe { ffi::pl_color_space_srgb };
+            target.repr = unsafe { ffi::pl_color_repr_rgb };
+
+            unsafe {
+                render_vulkan_zero_copy_frame(
+                    gpu,
+                    renderer,
+                    cas_hook,
+                    vk_frame,
+                    &mut target,
+                    w,
+                    h,
+                    VideoRenderOptions {
+                        filter_mode: VideoFilterMode::Cas,
+                        sharpness: 0.5,
+                        scale_mode: ScaleMode::Fit,
+                    },
+                )
+                .expect("zero-copy Vulkan Video render succeeds");
+                ffi::pl_gpu_finish(gpu);
+            }
+
+            let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+            let mut dl: ffi::pl_tex_transfer_params = unsafe { std::mem::zeroed() };
+            dl.tex = dst_tex;
+            dl.row_pitch = (w as usize) * 4;
+            dl.ptr = rgba.as_mut_ptr().cast();
+            assert!(unsafe { ffi::pl_tex_download(gpu, &dl) });
+
+            let center = ((h as usize / 2) * (w as usize) + (w as usize / 2)) * 4;
+            let pixel = &rgba[center..center + 4];
+            assert!(
+                pixel[1] > 100 && pixel[1] > pixel[0] && pixel[1] > pixel[2],
+                "expected bright green zero-copy pixel for {codec:?}, got {pixel:?}"
+            );
+        }
+
+        assert!(
+            tested_codecs > 0,
+            "at least one of H.264/HEVC Vulkan Video paths should be tested"
+        );
+
+        let mut cas_mut = cas_hook;
+        unsafe {
+            ffi::pl_gpu_finish(gpu);
+            ffi::pl_tex_destroy(gpu, &mut dst_tex);
+            if !cas_mut.is_null() {
+                ffi::pl_mpv_user_shader_destroy(&mut cas_mut);
+            }
+            ffi::pl_renderer_destroy(&mut renderer);
+            drop(vk_dev);
             ffi::pl_vulkan_destroy(&mut vk);
             ffi::pl_vk_inst_destroy(&mut inst);
             ffi::pl_log_destroy(&mut log);

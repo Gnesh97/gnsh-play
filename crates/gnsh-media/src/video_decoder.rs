@@ -1,3 +1,4 @@
+use crate::annex_b::is_header_only_annex_b;
 use crate::ffi;
 use anyhow::{Context, Result, bail};
 use std::ffi::CStr;
@@ -21,7 +22,13 @@ pub enum MediaCodec {
 }
 
 pub(crate) struct AvFrameGuard {
-    ptr: *mut ffi::AVFrame,
+    pub(crate) ptr: *mut ffi::AVFrame,
+}
+
+impl AvFrameGuard {
+    pub(crate) fn as_ptr(&self) -> *mut ffi::AVFrame {
+        self.ptr
+    }
 }
 
 unsafe impl Send for AvFrameGuard {}
@@ -45,7 +52,7 @@ pub struct D3D11Frame {
     pub pts: i64,
     pub is_hdr: bool,
     // Retains FFmpeg's AVBufferRef until the texture slice is finished rendering.
-    _av_frame: AvFrameGuard,
+    pub(crate) av_frame: Arc<AvFrameGuard>,
 }
 
 pub struct D3D12Frame {
@@ -67,6 +74,15 @@ impl D3D12Frame {
     }
 }
 
+pub struct VulkanFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pts: i64,
+    pub is_hdr: bool,
+    // Retains FFmpeg's AVVkFrame pool slot until libplacebo signals timeline semaphore completion.
+    pub(crate) av_frame: Arc<AvFrameGuard>,
+}
+
 /// Hardware acceleration mode for `VideoDecoder`.
 #[derive(Debug, Clone)]
 pub enum DecoderHardware {
@@ -74,11 +90,13 @@ pub enum DecoderHardware {
     D3D11ZeroCopy(ID3D11Device),
     D3D11Transfer,
     D3D12ZeroCopy(ID3D12Device),
+    VulkanZeroCopy(Arc<crate::vulkan_renderer::VulkanVideoDevice>),
 }
 
 pub enum DecodedFrame {
     D3D11(D3D11Frame),
     D3D12(D3D12Frame),
+    Vulkan(VulkanFrame),
     SoftwareYuv420 {
         y: Vec<u8>,
         u: Vec<u8>,
@@ -119,6 +137,7 @@ impl DecodedFrame {
         match self {
             Self::D3D11(frame) => frame.pts,
             Self::D3D12(frame) => frame.pts,
+            Self::Vulkan(frame) => frame.pts,
             Self::SoftwareYuv420 { pts, .. }
             | Self::SoftwareNv12 { pts, .. }
             | Self::SoftwareP010 { pts, .. } => *pts,
@@ -130,6 +149,7 @@ impl DecodedFrame {
         match self {
             Self::D3D11(frame) => frame.is_hdr,
             Self::D3D12(frame) => frame.is_hdr,
+            Self::Vulkan(frame) => frame.is_hdr,
             Self::SoftwareYuv420 { is_hdr, .. }
             | Self::SoftwareNv12 { is_hdr, .. }
             | Self::SoftwareP010 { is_hdr, .. } => *is_hdr,
@@ -143,6 +163,7 @@ enum HwKind {
     D3D11ZeroCopy,
     D3D11Transfer,
     D3D12ZeroCopy,
+    VulkanZeroCopy,
 }
 
 pub struct VideoDecoder {
@@ -181,10 +202,21 @@ impl VideoDecoder {
     }
 
     pub fn new_with_mode(codec: MediaCodec, hw: DecoderHardware) -> Result<Self> {
-        if !matches!(hw, DecoderHardware::None)
-            && let Ok(dec) = Self::open_internal(codec, hw)
-        {
-            return Ok(dec);
+        let try_d3d11_transfer = matches!(
+            hw,
+            DecoderHardware::VulkanZeroCopy(_) | DecoderHardware::D3D12ZeroCopy(_)
+        );
+        if !matches!(hw, DecoderHardware::None) {
+            match Self::open_internal(codec, hw) {
+                Ok(dec) => return Ok(dec),
+                Err(err) => tracing::warn!("Hardware video decoder init failed: {err:#}"),
+            }
+        }
+        if try_d3d11_transfer {
+            match Self::open_internal(codec, DecoderHardware::D3D11Transfer) {
+                Ok(dec) => return Ok(dec),
+                Err(err) => tracing::warn!("D3D11Transfer fallback init failed: {err:#}"),
+            }
         }
         Self::open_internal(codec, DecoderHardware::None)
     }
@@ -324,6 +356,12 @@ impl VideoDecoder {
 
     fn fallback_next(&mut self, reason: &str) -> Result<bool> {
         let next_hw = match self.hw_kind {
+            HwKind::VulkanZeroCopy => {
+                tracing::warn!(
+                    "Vulkan Video unavailable ({reason}); switching to D3D11VA hardware transfer"
+                );
+                DecoderHardware::D3D11Transfer
+            }
             HwKind::D3D12ZeroCopy => {
                 tracing::warn!(
                     "D3D12VA unavailable ({reason}); switching to D3D11VA hardware transfer"
@@ -363,6 +401,7 @@ impl VideoDecoder {
             let fmt = unsafe { (*self.frame).format };
             if !self.decoded_any {
                 let unexpected_hw = match self.hw_kind {
+                    HwKind::VulkanZeroCopy => fmt != ffi::AVPixelFormat_AV_PIX_FMT_VULKAN,
                     HwKind::D3D12ZeroCopy => fmt != ffi::AVPixelFormat_AV_PIX_FMT_D3D12,
                     HwKind::D3D11ZeroCopy | HwKind::D3D11Transfer => {
                         fmt != ffi::AVPixelFormat_AV_PIX_FMT_D3D11
@@ -532,6 +571,42 @@ impl VideoDecoder {
                     }
                 }
             }
+            DecoderHardware::VulkanZeroCopy(vk_dev) => {
+                let supported = match codec {
+                    MediaCodec::H264 => vk_dev.supports_h264(),
+                    MediaCodec::Hevc | MediaCodec::HevcHdr => vk_dev.supports_h265(),
+                };
+                if !supported {
+                    unsafe {
+                        ffi::av_packet_free(&mut { pkt });
+                        ffi::av_frame_free(&mut { frame });
+                        ffi::av_frame_free(&mut { sw_frame });
+                        ffi::avcodec_free_context(&mut { ctx });
+                    }
+                    bail!("Vulkan Video does not advertise decode support for {codec:?}");
+                }
+                match unsafe { create_vulkan_device_ctx(&vk_dev) } {
+                    Ok(buf_ref) => {
+                        unsafe {
+                            (*ctx).hw_device_ctx = ffi::av_buffer_ref(buf_ref);
+                            (*ctx).get_format = Some(select_vulkan_format);
+                            (*ctx).thread_count = 1;
+                        }
+                        hw_device_ctx = buf_ref;
+                        hw_active = true;
+                        hw_kind = HwKind::VulkanZeroCopy;
+                    }
+                    Err(e) => {
+                        unsafe {
+                            ffi::av_packet_free(&mut { pkt });
+                            ffi::av_frame_free(&mut { frame });
+                            ffi::av_frame_free(&mut { sw_frame });
+                            ffi::avcodec_free_context(&mut { ctx });
+                        }
+                        return Err(e).context("Vulkan Video device setup failed");
+                    }
+                }
+            }
             DecoderHardware::None => unsafe {
                 (*ctx).thread_count = 4;
             },
@@ -667,6 +742,114 @@ unsafe fn create_d3d12va_device_ctx(dev: &ID3D12Device) -> Result<*mut ffi::AVBu
     Ok(hw_ref)
 }
 
+unsafe extern "C" fn vulkan_hwdevice_free_cb(ctx: *mut ffi::AVHWDeviceContext) {
+    if ctx.is_null() {
+        return;
+    }
+    let ptr = unsafe {
+        (*ctx)
+            .user_opaque
+            .cast::<Arc<crate::vulkan_renderer::VulkanVideoDevice>>()
+    };
+    if !ptr.is_null() {
+        unsafe {
+            drop(Box::from_raw(ptr));
+            (*ctx).user_opaque = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe extern "C" fn vulkan_lock_queue_cb(
+    ctx: *mut ffi::AVHWDeviceContext,
+    queue_family: u32,
+    index: u32,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let ptr = unsafe {
+        (*ctx)
+            .user_opaque
+            .cast::<Arc<crate::vulkan_renderer::VulkanVideoDevice>>()
+    };
+    if !ptr.is_null() {
+        let vk_dev = unsafe { &*ptr };
+        vk_dev.lock_queue(queue_family, index);
+    }
+}
+
+unsafe extern "C" fn vulkan_unlock_queue_cb(
+    ctx: *mut ffi::AVHWDeviceContext,
+    queue_family: u32,
+    index: u32,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let ptr = unsafe {
+        (*ctx)
+            .user_opaque
+            .cast::<Arc<crate::vulkan_renderer::VulkanVideoDevice>>()
+    };
+    if !ptr.is_null() {
+        let vk_dev = unsafe { &*ptr };
+        vk_dev.unlock_queue(queue_family, index);
+    }
+}
+
+unsafe fn create_vulkan_device_ctx(
+    vk_dev: &Arc<crate::vulkan_renderer::VulkanVideoDevice>,
+) -> Result<*mut ffi::AVBufferRef> {
+    if vk_dev.queue_families.is_empty() || vk_dev.queue_families.len() > 64 {
+        bail!(
+            "invalid Vulkan queue family count {}",
+            vk_dev.queue_families.len()
+        );
+    }
+    let mut hw_ref =
+        unsafe { ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType_AV_HWDEVICE_TYPE_VULKAN) };
+    if hw_ref.is_null() {
+        bail!("av_hwdevice_ctx_alloc(VULKAN) returned null");
+    }
+
+    unsafe {
+        let hw_dev_ctx = (*hw_ref).data.cast::<ffi::AVHWDeviceContext>();
+        let boxed_dev = Box::into_raw(Box::new(Arc::clone(vk_dev)));
+        (*hw_dev_ctx).user_opaque = boxed_dev.cast();
+        (*hw_dev_ctx).free = Some(vulkan_hwdevice_free_cb);
+
+        let vk_ctx = (*hw_dev_ctx).hwctx.cast::<ffi::AVVulkanDeviceContext>();
+        (*vk_ctx).get_proc_addr = (*vk_dev.vk).get_proc_addr;
+        (*vk_ctx).inst = (*vk_dev.vk).instance;
+        (*vk_ctx).phys_dev = (*vk_dev.vk).phys_device;
+        (*vk_ctx).act_dev = (*vk_dev.vk).device;
+        if !(*vk_dev.vk).features.is_null() {
+            (*vk_ctx).device_features = *(*vk_dev.vk).features;
+        }
+        (*vk_ctx).enabled_inst_extensions = (*vk_dev.vk_inst).extensions;
+        (*vk_ctx).nb_enabled_inst_extensions = (*vk_dev.vk_inst).num_extensions;
+        (*vk_ctx).enabled_dev_extensions = (*vk_dev.vk).extensions;
+        (*vk_ctx).nb_enabled_dev_extensions = (*vk_dev.vk).num_extensions;
+        (*vk_ctx).lock_queue = Some(vulkan_lock_queue_cb);
+        (*vk_ctx).unlock_queue = Some(vulkan_unlock_queue_cb);
+        for (i, &qf) in vk_dev.queue_families.iter().enumerate() {
+            (*vk_ctx).qf[i] = qf;
+        }
+        (*vk_ctx).nb_qf = vk_dev.queue_families.len() as i32;
+
+        let init_err = ffi::av_hwdevice_ctx_init(hw_ref);
+        if init_err < 0 {
+            ffi::av_buffer_unref(&mut hw_ref);
+            bail!(
+                "av_hwdevice_ctx_init(VULKAN) failed: {}",
+                av_err_string(init_err)
+            );
+        }
+    }
+
+    Ok(hw_ref)
+}
+
 unsafe fn select_hw_pix_fmt(
     pix_fmts: *const ffi::AVPixelFormat,
     preferred: ffi::AVPixelFormat,
@@ -699,6 +882,13 @@ unsafe extern "C" fn select_d3d12_format(
     unsafe { select_hw_pix_fmt(pix_fmts, ffi::AVPixelFormat_AV_PIX_FMT_D3D12) }
 }
 
+unsafe extern "C" fn select_vulkan_format(
+    _ctx: *mut ffi::AVCodecContext,
+    pix_fmts: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    unsafe { select_hw_pix_fmt(pix_fmts, ffi::AVPixelFormat_AV_PIX_FMT_VULKAN) }
+}
+
 unsafe fn extract_frame(
     src: *mut ffi::AVFrame,
     is_hdr: bool,
@@ -720,7 +910,7 @@ unsafe fn extract_frame(
         if cloned.is_null() {
             bail!("av_frame_clone returned null");
         }
-        let guard = AvFrameGuard { ptr: cloned };
+        let guard = Arc::new(AvFrameGuard { ptr: cloned });
         let raw_tex = unsafe { (*cloned).data[0].cast::<c_void>() };
         let slice_index = unsafe { (*cloned).data[1] as usize as u32 };
         let texture = unsafe { ID3D11Texture2D::from_raw_borrowed(&raw_tex) }
@@ -733,7 +923,22 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr,
-            _av_frame: guard,
+            av_frame: guard,
+        })));
+    }
+
+    if fmt == ffi::AVPixelFormat_AV_PIX_FMT_VULKAN {
+        let cloned = unsafe { ffi::av_frame_clone(src) };
+        if cloned.is_null() {
+            bail!("av_frame_clone returned null");
+        }
+        let guard = Arc::new(AvFrameGuard { ptr: cloned });
+        return Ok(Some(DecodedFrame::Vulkan(VulkanFrame {
+            width,
+            height,
+            pts,
+            is_hdr,
+            av_frame: guard,
         })));
     }
 
@@ -952,7 +1157,7 @@ unsafe fn extract_frame(
     Ok(None)
 }
 
-fn validate_plane_layout(
+pub(crate) fn validate_plane_layout(
     ptr: *const u8,
     linesize: i32,
     min_row_bytes: usize,
@@ -979,7 +1184,7 @@ fn validate_plane_layout(
     Ok(stride)
 }
 
-fn copy_plane(src: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u8> {
+pub(crate) fn copy_plane(src: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(width * rows);
     if stride == width {
         let all = unsafe { std::slice::from_raw_parts(src, width * rows) };
@@ -1013,39 +1218,7 @@ fn copy_plane_10le_to_u8(
     out
 }
 
-fn is_header_only_annex_b(data: &[u8], codec: MediaCodec) -> bool {
-    let mut i = 0;
-    let mut saw_nal = false;
-    while i + 3 <= data.len() {
-        let sc_len = if data[i..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if data[i..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            i += 1;
-            continue;
-        };
-        let hdr_idx = i + sc_len;
-        if hdr_idx >= data.len() {
-            break;
-        }
-        let b = data[hdr_idx];
-        let is_header = match codec {
-            MediaCodec::H264 => matches!(b & 0x1F, 6 | 7 | 8 | 9 | 13),
-            MediaCodec::Hevc | MediaCodec::HevcHdr => {
-                matches!((b >> 1) & 0x3F, 32 | 33 | 34 | 35 | 39 | 40)
-            }
-        };
-        if !is_header {
-            return false;
-        }
-        saw_nal = true;
-        i = hdr_idx + 1;
-    }
-    saw_nal
-}
-
-fn av_err_string(err: i32) -> String {
+pub(crate) fn av_err_string(err: i32) -> String {
     let mut buf = [0i8; 128];
     unsafe {
         ffi::av_strerror(err, buf.as_mut_ptr(), buf.len());
@@ -1084,6 +1257,7 @@ mod tests {
             }
             DecodedFrame::D3D11(_)
             | DecodedFrame::D3D12(_)
+            | DecodedFrame::Vulkan(_)
             | DecodedFrame::SoftwareNv12 { .. }
             | DecodedFrame::SoftwareP010 { .. } => panic!("expected software YUV420 frame"),
         }
@@ -1277,7 +1451,9 @@ mod tests {
                 assert!(decoder.is_hw_active());
             }
             DecodedFrame::SoftwareYuv420 { .. } => assert!(!decoder.is_hw_active()),
-            DecodedFrame::D3D11(_) => panic!("unexpected D3D11 frame from D3D12ZeroCopy mode"),
+            DecodedFrame::D3D11(_) | DecodedFrame::Vulkan(_) => {
+                panic!("unexpected D3D11/Vulkan frame from D3D12ZeroCopy mode")
+            }
         }
     }
 
@@ -1366,7 +1542,9 @@ mod tests {
                 assert!(decoder.is_hw_active());
             }
             DecodedFrame::SoftwareYuv420 { .. } => assert!(!decoder.is_hw_active()),
-            DecodedFrame::D3D11(_) => panic!("unexpected D3D11 frame from D3D12ZeroCopy mode"),
+            DecodedFrame::D3D11(_) | DecodedFrame::Vulkan(_) => {
+                panic!("unexpected D3D11/Vulkan frame from D3D12ZeroCopy mode")
+            }
         }
     }
 }

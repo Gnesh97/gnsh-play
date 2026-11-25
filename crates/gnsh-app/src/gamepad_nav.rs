@@ -191,9 +191,9 @@ pub(crate) fn settings_row_count(
     match tab {
         SettingsTab::Video => {
             if wan_profile_enabled {
-                13
+                15
             } else {
-                10
+                12
             }
         }
         SettingsTab::Audio => 3,
@@ -353,6 +353,30 @@ fn slider_dir(event: HomeNavEvent) -> Option<isize> {
     }
 }
 
+fn adjust_replay_buffer(settings: &mut StreamSettings, event: HomeNavEvent) -> bool {
+    match event {
+        HomeNavEvent::Connect => {
+            settings.replay_buffer_enabled = !settings.replay_buffer_enabled;
+            true
+        }
+        HomeNavEvent::Left | HomeNavEvent::Right => {
+            const DURATIONS: [u16; 3] = [15, 30, 60];
+            let idx = DURATIONS
+                .iter()
+                .position(|&s| s == settings.replay_buffer_secs)
+                .unwrap_or(1);
+            let next = if matches!(event, HomeNavEvent::Right) {
+                (idx + 1) % DURATIONS.len()
+            } else {
+                (idx + DURATIONS.len() - 1) % DURATIONS.len()
+            };
+            settings.replay_buffer_secs = DURATIONS[next];
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Applies Left/Right/Cross navigation input to the focused row of the Settings modal.
 pub(crate) fn apply_settings_nav(
     settings: &mut StreamSettings,
@@ -385,17 +409,19 @@ pub(crate) fn apply_settings_nav(
             }
             8 => nav_dir(event)
                 .is_some_and(|dir| adjust_renderer_backend(&mut settings.renderer_backend, dir)),
-            9 if nav_dir(event).is_some() => {
+            9 => adjust_replay_buffer(settings, event),
+            10 => false,
+            11 if nav_dir(event).is_some() => {
                 settings.wan_profile_enabled = !settings.wan_profile_enabled;
                 true
             }
-            10 if !is_streaming && settings.wan_profile_enabled => {
+            12 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_preset(&mut settings.wan_preset, event)
             }
-            11 if !is_streaming && settings.wan_profile_enabled => {
+            13 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_codec(&mut settings.wan_codec, event)
             }
-            12 if !is_streaming && settings.wan_profile_enabled => {
+            14 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_bitrate(&mut settings.wan_bitrate_kbps, event, 2_000)
             }
             _ => false,
@@ -632,8 +658,8 @@ mod tests {
         let audio = vec!["Speakers".to_string(), "Headset".to_string()];
         let mic = vec!["USB Mic".to_string()];
 
-        assert_eq!(settings_row_count(SettingsTab::Video, false, false), 10);
-        assert_eq!(settings_row_count(SettingsTab::Video, false, true), 13);
+        assert_eq!(settings_row_count(SettingsTab::Video, false, false), 12);
+        assert_eq!(settings_row_count(SettingsTab::Video, false, true), 15);
         assert_eq!(settings_row_count(SettingsTab::Audio, false, false), 3);
         assert_eq!(settings_row_count(SettingsTab::Input, false, false), 2);
         assert_eq!(settings_row_count(SettingsTab::Input, true, false), 6);
@@ -719,7 +745,7 @@ mod tests {
         ));
         assert!(!s.auto_reconnect);
 
-        // Renderer selector at row 8 and WAN profile rows 9..=12 gate adjustments cleanly.
+        // Renderer selector at row 8, replay buffer at row 9, and WAN profile rows 11..=14 gate adjustments cleanly.
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
@@ -740,15 +766,6 @@ mod tests {
             &mic
         ));
         assert_eq!(s.renderer_backend, RendererBackend::Vulkan);
-        assert!(!apply_settings_nav(
-            &mut s,
-            SettingsTab::Video,
-            10,
-            HomeNavEvent::Right,
-            false,
-            &audio,
-            &mic
-        ));
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
@@ -758,11 +775,49 @@ mod tests {
             &audio,
             &mic
         ));
-        assert!(s.wan_profile_enabled);
+        assert!(s.replay_buffer_enabled);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            9,
+            HomeNavEvent::Right,
+            true,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.replay_buffer_secs, 60);
         assert!(!apply_settings_nav(
             &mut s,
             SettingsTab::Video,
             10,
+            HomeNavEvent::Right,
+            false,
+            &audio,
+            &mic
+        ));
+        assert!(!apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            12,
+            HomeNavEvent::Right,
+            false,
+            &audio,
+            &mic
+        ));
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            11,
+            HomeNavEvent::Connect,
+            true,
+            &audio,
+            &mic
+        ));
+        assert!(s.wan_profile_enabled);
+        assert!(!apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            12,
             HomeNavEvent::Right,
             true,
             &audio,
@@ -771,7 +826,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            10,
+            12,
             HomeNavEvent::Left,
             false,
             &audio,
@@ -781,7 +836,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            11,
+            13,
             HomeNavEvent::Left,
             false,
             &audio,
@@ -791,7 +846,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            12,
+            14,
             HomeNavEvent::Right,
             false,
             &audio,

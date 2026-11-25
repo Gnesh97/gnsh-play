@@ -1126,7 +1126,7 @@ impl D3D11Renderer {
                 };
                 (*width, *height, *width, *height, None, mode)
             }
-            DecodedFrame::D3D12(f) => (f.width, f.height, f.width, f.height, None, 0.0),
+            DecodedFrame::D3D12(_) | DecodedFrame::Vulkan(_) => (0, 0, 0, 0, None, 0.0),
         }
     }
 
@@ -1201,8 +1201,8 @@ impl D3D11Renderer {
                 let fmt = d3d_format.expect("D3D11 format populated");
                 self.draw_d3d11_frame(d3d_frame, tw, th, fmt)?;
             }
-            DecodedFrame::D3D12(_) => {
-                bail!("D3D11Renderer cannot consume zero-copy D3D12 frames directly");
+            DecodedFrame::D3D12(_) | DecodedFrame::Vulkan(_) => {
+                bail!("D3D11Renderer cannot consume zero-copy D3D12/Vulkan frames directly");
             }
             DecodedFrame::SoftwareYuv420 {
                 y,

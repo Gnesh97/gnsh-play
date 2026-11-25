@@ -1205,8 +1205,8 @@ impl D3D12Renderer {
                     fmt,
                 )
             }
-            DecodedFrame::D3D11(_) => {
-                bail!("D3D12Renderer cannot consume zero-copy D3D11 frames directly")
+            DecodedFrame::D3D11(_) | DecodedFrame::Vulkan(_) => {
+                bail!("D3D12Renderer cannot consume zero-copy D3D11/Vulkan frames directly")
             }
             DecodedFrame::SoftwareYuv420 {
                 y,
@@ -1712,6 +1712,7 @@ fn inspect_frame(
             (*width, *height, *width, *height, None, mode)
         }
         DecodedFrame::D3D11(f) => (f.width, f.height, f.width, f.height, None, 0.0),
+        DecodedFrame::Vulkan(f) => (f.width, f.height, f.width, f.height, None, 0.0),
     }
 }
 

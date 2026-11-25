@@ -1,5 +1,5 @@
 use super::{SettingsTab, StreamSettings, theme};
-use crate::{AppMode, AppState};
+use crate::{AppMode, AppState, StatusBanner};
 use gnsh_media::{RendererBackend, ScaleMode, VideoFilterMode};
 use gnsh_proto::{MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, VideoCodec, VideoPreset};
 
@@ -68,7 +68,7 @@ pub(crate) fn render_renderer_backend_selector(ui: &mut egui::Ui, backend: &mut 
             .on_hover_text("Direct3D 11 swapchain with HLSL CAS / FSR 1.0");
         ui.selectable_value(backend, RendererBackend::Vulkan, "Vulkan")
             .on_hover_text(
-                "libplacebo Vulkan renderer (Bilinear / Spline36 + live CAS sharpening). Restart required.",
+                "libplacebo Vulkan renderer with zero-copy Vulkan Video decode (Bilinear / Spline36 + live CAS sharpening). Restart required.",
             );
         ui.selectable_value(backend, RendererBackend::D3D12, "D3D12")
             .on_hover_text(
@@ -404,7 +404,54 @@ impl AppState {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, "WAN Profile", focus_row, 9);
+                settings_row_label(ui, "Replay Buffer", focus_row, 9);
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.settings.replay_buffer_enabled,
+                        "Keep rolling clip buffer",
+                    )
+                    .on_hover_text("Records a bounded rolling buffer in RAM so F10 saves the last 15-60s with zero re-encoding.");
+                    for secs in [15u16, 30, 60] {
+                        ui.selectable_value(
+                            &mut self.settings.replay_buffer_secs,
+                            secs,
+                            format!("{secs}s"),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new("(F10 saves clip)")
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, "Capture Folder", focus_row, 10);
+                ui.horizontal(|ui| {
+                    let mut custom_dir = self.settings.capture_dir.clone().unwrap_or_default();
+                    let edit = egui::TextEdit::singleline(&mut custom_dir)
+                        .hint_text("Default (Videos\\gnsh-play & Pictures\\gnsh-play)")
+                        .desired_width(260.0);
+                    if ui.add(edit).changed() {
+                        let trimmed = custom_dir.trim();
+                        self.settings.capture_dir = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
+                    }
+                    if ui.add(theme::secondary_button("Open")).clicked()
+                        && let Err(err) =
+                            crate::open_capture_folder(self.settings.capture_dir.as_deref())
+                    {
+                        self.status_banner = Some(StatusBanner::error(format!(
+                            "Failed opening capture folder: {err:#}"
+                        )));
+                    }
+                });
+                ui.end_row();
+
+                settings_row_label(ui, "WAN Profile", focus_row, 11);
                 ui.checkbox(
                     &mut self.settings.wan_profile_enabled,
                     "Use separate stream profile for WAN / VPN connections",
@@ -415,19 +462,19 @@ impl AppState {
                 ui.end_row();
 
                 if self.settings.wan_profile_enabled {
-                    settings_row_label(ui, "WAN Preset", focus_row, 10);
+                    settings_row_label(ui, "WAN Preset", focus_row, 12);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         render_preset_controls(ui, &mut self.settings.wan_preset);
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, "WAN Codec", focus_row, 11);
+                    settings_row_label(ui, "WAN Codec", focus_row, 13);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         render_codec_controls(ui, &mut self.settings.wan_codec);
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, "WAN Bitrate", focus_row, 12);
+                    settings_row_label(ui, "WAN Bitrate", focus_row, 14);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         ui.add(
                             egui::Slider::new(

@@ -1,13 +1,16 @@
 use crate::storage::{SavedConsole, StoredSettings};
 use anyhow::{Context as _, Result};
-use crossbeam_channel::{Receiver, RecvTimeoutError, select};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, select};
 use gnsh_input::GamepadManager;
 use gnsh_media::{
     AudioOutput, DecodedFrame, DecoderHardware, HapticsAudioOutput, MediaCodec, MicCapture,
-    VideoDecoder, volume_pct_to_gain,
+    MkvMuxer, ReplayClipSnapshot, ReplayRingBuffer, VideoDecoder, build_capture_path,
+    contains_keyframe_nal, default_screenshot_dir, default_video_dir, extract_parameter_sets,
+    extract_screenshot_pixels, is_header_only_annex_b, save_screenshot_png, volume_pct_to_gain,
 };
-use gnsh_proto::{Ps5Session, Ps5SessionConfig, SessionEvent, VideoCodec};
+use gnsh_proto::{Ps5Session, Ps5SessionConfig, SessionEvent, VideoCodec, VideoPreset};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -22,6 +25,71 @@ use windows::Win32::System::Threading::{
 
 pub(crate) const IDR_COOLDOWN: Duration = Duration::from_millis(500);
 const PIPELINE_HISTORY_LEN: usize = 120;
+const CAPTURE_TOAST_DURATION: Duration = Duration::from_secs(4);
+const RECORDER_PKT_CHANNEL_CAP: usize = 256;
+const RECORDER_CMD_CHANNEL_CAP: usize = 32;
+
+pub(crate) fn resolve_capture_dir(override_dir: Option<&str>, is_video: bool) -> PathBuf {
+    if let Some(custom) = override_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    if is_video {
+        default_video_dir()
+    } else {
+        default_screenshot_dir()
+    }
+}
+
+fn preset_dimensions(preset: VideoPreset) -> (u32, u32) {
+    match preset {
+        VideoPreset::P720Fps30 | VideoPreset::P720Fps60 => (1280, 720),
+        VideoPreset::P1080Fps30 | VideoPreset::P1080Fps60 => (1920, 1080),
+    }
+}
+
+fn frame_dimensions(frame: &DecodedFrame) -> (u32, u32) {
+    match frame {
+        DecodedFrame::D3D11(f) => (f.width, f.height),
+        DecodedFrame::D3D12(f) => (f.width, f.height),
+        DecodedFrame::Vulkan(f) => (f.width, f.height),
+        DecodedFrame::SoftwareNv12 { width, height, .. }
+        | DecodedFrame::SoftwareP010 { width, height, .. }
+        | DecodedFrame::SoftwareYuv420 { width, height, .. } => (*width, *height),
+    }
+}
+
+enum RecorderPacket {
+    Video {
+        data: Vec<u8>,
+        ts_us: i64,
+    },
+    Audio {
+        samples: Vec<i16>,
+        sample_rate: u32,
+        channels: u32,
+        ts_us: i64,
+    },
+    ParamSetSeed(Vec<u8>),
+}
+
+enum RecorderCommand {
+    StartRecording { path: PathBuf },
+    StopRecording,
+    SaveReplayClip { path: PathBuf },
+    SetReplayConfig { enabled: bool, secs: u16 },
+    SetVideoDims { width: u32, height: u32 },
+    Shutdown,
+}
+
+enum CaptureNotice {
+    ScreenshotSaved(PathBuf),
+    RecordingStarted,
+    RecordingSaved(PathBuf),
+    RecordingAborted(String),
+    ClipSaved(PathBuf, f32),
+    Info(String),
+    Error(String),
+}
 
 struct SleepInhibitor {
     high_res_timer_active: bool,
@@ -170,6 +238,18 @@ pub(crate) struct ActiveStream {
     pub(crate) last_seen_lost: u64,
     pub(crate) packet_loss_notice_until: Option<Instant>,
     pub(crate) rumble_active_until: Option<Instant>,
+    pub(crate) capture_needed: Arc<AtomicBool>,
+    pub(crate) replay_enabled: bool,
+    pub(crate) recording_pending: bool,
+    pub(crate) recording_started_at: Option<Instant>,
+    pub(crate) screenshot_requested: bool,
+    pub(crate) record_toggle_requested: bool,
+    pub(crate) save_clip_requested: bool,
+    pub(crate) capture_toast: Option<(String, bool, Instant)>,
+    capture_cmd_tx: Option<Sender<RecorderCommand>>,
+    capture_notice_rx: Receiver<CaptureNotice>,
+    capture_notice_tx: Sender<CaptureNotice>,
+    recorder_thread: Option<JoinHandle<()>>,
 }
 
 impl ActiveStream {
@@ -229,6 +309,27 @@ impl ActiveStream {
         let haptics_recheck = Arc::new(AtomicBool::new(false));
         let haptics_device_label = Arc::new(Mutex::new(None));
         let sleep_inhibitor = SleepInhibitor::acquire();
+        let (init_w, init_h) = preset_dimensions(preset);
+        let capture_needed = Arc::new(AtomicBool::new(settings.replay_buffer_enabled));
+        let (recorder_pkt_tx, recorder_pkt_rx) = bounded(RECORDER_PKT_CHANNEL_CAP);
+        let (capture_cmd_tx, capture_cmd_rx) = bounded(RECORDER_CMD_CHANNEL_CAP);
+        let (capture_notice_tx, capture_notice_rx) = bounded(RECORDER_CMD_CHANNEL_CAP);
+        let stream_start = Instant::now();
+
+        let recorder_args = RecorderWorkerArgs {
+            codec: media_codec,
+            width: init_w,
+            height: init_h,
+            replay_enabled: settings.replay_buffer_enabled,
+            replay_secs: settings.replay_buffer_secs,
+            pkt_rx: recorder_pkt_rx,
+            cmd_rx: capture_cmd_rx,
+            notice_tx: capture_notice_tx.clone(),
+        };
+        let recorder_thread = thread::Builder::new()
+            .name("gnsh-recorder".into())
+            .spawn(move || run_recorder_loop(recorder_args))
+            .context("failed spawning recorder worker thread")?;
 
         let video_args = VideoWorkerArgs {
             codec: media_codec,
@@ -241,6 +342,11 @@ impl ActiveStream {
             idr_needed: Arc::clone(&idr_needed),
             init_error: Arc::clone(&video_init_error),
             stop_flag: Arc::clone(&stop_flag),
+            capture_needed: Arc::clone(&capture_needed),
+            recorder_pkt_tx: recorder_pkt_tx.clone(),
+            recorder_cmd_tx: capture_cmd_tx.clone(),
+            initial_dims: (init_w, init_h),
+            stream_start,
         };
         let video_thread = thread::Builder::new()
             .name("gnsh-video-decode".into())
@@ -259,6 +365,9 @@ impl ActiveStream {
             volume_pct: Arc::clone(&volume_pct),
             audio_device: Arc::clone(&audio_device),
             audio_device_recheck: Arc::clone(&audio_device_recheck),
+            capture_needed: Arc::clone(&capture_needed),
+            recorder_pkt_tx,
+            stream_start,
             stop_flag: Arc::clone(&stop_flag),
         };
         let audio_thread = thread::Builder::new()
@@ -325,6 +434,18 @@ impl ActiveStream {
             last_seen_lost: 0,
             packet_loss_notice_until: None,
             rumble_active_until: None,
+            capture_needed,
+            replay_enabled: settings.replay_buffer_enabled,
+            recording_pending: false,
+            recording_started_at: None,
+            screenshot_requested: false,
+            record_toggle_requested: false,
+            save_clip_requested: false,
+            capture_toast: None,
+            capture_cmd_tx: Some(capture_cmd_tx),
+            capture_notice_rx,
+            capture_notice_tx,
+            recorder_thread: Some(recorder_thread),
         })
     }
 
@@ -434,16 +555,221 @@ impl ActiveStream {
         }
     }
 
+    fn sync_capture_needed(&self) {
+        self.capture_needed.store(
+            self.replay_enabled || self.recording_pending || self.recording_started_at.is_some(),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn set_toast(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.capture_toast = Some((
+            msg.into(),
+            is_error,
+            Instant::now() + CAPTURE_TOAST_DURATION,
+        ));
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recording_pending || self.recording_started_at.is_some()
+    }
+
+    pub(crate) fn recording_elapsed_secs(&self) -> Option<u64> {
+        if let Some(started) = self.recording_started_at {
+            Some(started.elapsed().as_secs())
+        } else if self.recording_pending {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn active_toast(&self) -> Option<(&str, bool)> {
+        let (msg, is_error, expires_at) = self.capture_toast.as_ref()?;
+        if Instant::now() < *expires_at {
+            Some((msg.as_str(), *is_error))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_active_toast(&self) -> bool {
+        self.active_toast().is_some()
+    }
+
+    pub(crate) fn trigger_screenshot(&mut self, capture_dir: Option<&str>) {
+        let pixels_res = if let Some(ref latest) = self.current_frame {
+            extract_screenshot_pixels(&latest.frame)
+        } else if let Ok(guard) = self.frame_sync.0.lock()
+            && let Some(ref latest) = *guard
+        {
+            extract_screenshot_pixels(&latest.frame)
+        } else {
+            self.set_toast("No active video frame to capture", true);
+            return;
+        };
+
+        let pixels = match pixels_res {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!("Screenshot capture failed: {err:#}");
+                self.set_toast(format!("Screenshot failed: {err:#}"), true);
+                return;
+            }
+        };
+
+        let out_path = build_capture_path(capture_dir, false, &self.console_name, "png");
+        let notice_tx = self.capture_notice_tx.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("gnsh-screenshot".into())
+            .spawn(move || match save_screenshot_png(&pixels, &out_path) {
+                Ok(saved) => {
+                    let _ = notice_tx.try_send(CaptureNotice::ScreenshotSaved(saved));
+                }
+                Err(err) => {
+                    tracing::warn!("Screenshot save failed: {err:#}");
+                    let _ = notice_tx.try_send(CaptureNotice::Error(format!(
+                        "Screenshot save failed: {err:#}"
+                    )));
+                }
+            })
+        {
+            self.set_toast(format!("Screenshot thread failed: {err:#}"), true);
+        }
+    }
+
+    pub(crate) fn toggle_recording(&mut self, capture_dir: Option<&str>) {
+        let Some(ref cmd_tx) = self.capture_cmd_tx else {
+            return;
+        };
+        if self.is_recording() {
+            self.recording_pending = false;
+            self.recording_started_at = None;
+            self.sync_capture_needed();
+            let _ = cmd_tx.send(RecorderCommand::StopRecording);
+        } else {
+            let out_path = build_capture_path(capture_dir, true, &self.console_name, "mkv");
+            self.recording_pending = true;
+            self.recording_started_at = None;
+            self.sync_capture_needed();
+            self.idr_needed.store(true, Ordering::Relaxed);
+            if let Err(err) = cmd_tx.send(RecorderCommand::StartRecording { path: out_path }) {
+                self.recording_pending = false;
+                self.sync_capture_needed();
+                self.set_toast(format!("Recording unavailable: {err}"), true);
+            } else {
+                self.set_toast("Starting recording...", false);
+            }
+        }
+    }
+
+    pub(crate) fn save_replay_clip(&mut self, capture_dir: Option<&str>) {
+        if !self.replay_enabled {
+            self.set_toast("Replay Buffer is off (enable in Settings > Video)", true);
+            return;
+        }
+        let Some(ref cmd_tx) = self.capture_cmd_tx else {
+            return;
+        };
+        let out_path = build_capture_path(
+            capture_dir,
+            true,
+            &format!("{}_clip", self.console_name),
+            "mkv",
+        );
+        if let Err(err) = cmd_tx.send(RecorderCommand::SaveReplayClip { path: out_path }) {
+            self.set_toast(format!("Replay clip unavailable: {err}"), true);
+        } else {
+            self.set_toast("Saving replay clip...", false);
+        }
+    }
+
+    pub(crate) fn update_replay_settings(&mut self, enabled: bool, secs: u16) {
+        self.replay_enabled = enabled;
+        self.sync_capture_needed();
+        if let Some(ref cmd_tx) = self.capture_cmd_tx {
+            let _ = cmd_tx.send(RecorderCommand::SetReplayConfig { enabled, secs });
+        }
+    }
+
+    pub(crate) fn poll_capture_notices(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(notice) = self.capture_notice_rx.try_recv() {
+            changed = true;
+            match notice {
+                CaptureNotice::ScreenshotSaved(path) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("screenshot.png");
+                    tracing::info!(path = %path.display(), "Saved screenshot");
+                    self.set_toast(format!("Screenshot saved: {name}"), false);
+                }
+                CaptureNotice::RecordingStarted => {
+                    self.recording_pending = false;
+                    self.recording_started_at = Some(Instant::now());
+                    self.sync_capture_needed();
+                    self.set_toast("Recording started", false);
+                }
+                CaptureNotice::RecordingSaved(path) => {
+                    self.recording_pending = false;
+                    self.recording_started_at = None;
+                    self.sync_capture_needed();
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("recording.mkv");
+                    tracing::info!(path = %path.display(), "Saved MKV recording");
+                    self.set_toast(format!("Recording saved: {name}"), false);
+                }
+                CaptureNotice::ClipSaved(path, secs) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("clip.mkv");
+                    tracing::info!(path = %path.display(), secs, "Saved replay clip");
+                    self.set_toast(format!("Clip saved ({secs:.0}s): {name}"), false);
+                }
+                CaptureNotice::Info(msg) => {
+                    self.set_toast(msg, false);
+                }
+                CaptureNotice::RecordingAborted(err) => {
+                    self.recording_pending = false;
+                    self.recording_started_at = None;
+                    self.sync_capture_needed();
+                    self.set_toast(err, true);
+                }
+                CaptureNotice::Error(err) => {
+                    self.set_toast(err, true);
+                }
+            }
+        }
+        if let Some((_, _, expires_at)) = self.capture_toast
+            && Instant::now() >= expires_at
+        {
+            self.capture_toast = None;
+            changed = true;
+        }
+        changed
+    }
+
     pub(crate) fn shutdown(&mut self) {
         if self.session.is_none()
             && self.video_thread.is_none()
             && self.audio_thread.is_none()
+            && self.recorder_thread.is_none()
             && self.mic_capture.is_none()
             && self.current_frame.is_none()
         {
             return;
         }
         tracing::info!(host = %self.console_host, "Shutting down active stream session");
+        if let Some(cmd_tx) = self.capture_cmd_tx.take() {
+            if self.is_recording() {
+                let _ = cmd_tx.send(RecorderCommand::StopRecording);
+            }
+            let _ = cmd_tx.send(RecorderCommand::Shutdown);
+        }
         self.stop_flag.store(true, Ordering::Relaxed);
         self.mic_capture = None;
         // Drop queued D3D11VA/AVFrame surfaces before joining the decode worker and destroying its context.
@@ -460,6 +786,9 @@ impl ActiveStream {
             let _ = handle.join();
         }
         if let Some(handle) = self.audio_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.recorder_thread.take() {
             let _ = handle.join();
         }
         self.current_frame = None;
@@ -487,6 +816,11 @@ struct VideoWorkerArgs {
     idr_needed: Arc<AtomicBool>,
     init_error: Arc<Mutex<Option<String>>>,
     stop_flag: Arc<AtomicBool>,
+    capture_needed: Arc<AtomicBool>,
+    recorder_pkt_tx: Sender<RecorderPacket>,
+    recorder_cmd_tx: Sender<RecorderCommand>,
+    initial_dims: (u32, u32),
+    stream_start: Instant,
 }
 
 fn run_video_decode_loop(args: VideoWorkerArgs) {
@@ -511,6 +845,8 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
     let mut consecutive_errors: u32 = 0;
     let mut next_seq: i64 = 1;
     let mut seq_arrivals: VecDeque<(i64, Instant)> = VecDeque::with_capacity(32);
+    let mut param_sets_seeded = false;
+    let mut last_reported_dims = args.initial_dims;
 
     while !args.stop_flag.load(Ordering::Relaxed) {
         match args.video_rx.recv_timeout(Duration::from_millis(50)) {
@@ -526,6 +862,27 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                     if !pkt.recovered {
                         args.idr_needed.store(true, Ordering::Relaxed);
                     }
+                }
+
+                if args.capture_needed.load(Ordering::Relaxed) {
+                    let ts_us =
+                        i64::try_from(args.stream_start.elapsed().as_micros()).unwrap_or(i64::MAX);
+                    if let Err(TrySendError::Full(_)) =
+                        args.recorder_pkt_tx.try_send(RecorderPacket::Video {
+                            data: pkt.data.clone(),
+                            ts_us,
+                        })
+                    {
+                        tracing::debug!("Recorder video channel full; dropping capture packet");
+                    }
+                    param_sets_seeded = true;
+                } else if !param_sets_seeded
+                    && let Some(ps) = extract_parameter_sets(&pkt.data, args.codec)
+                {
+                    let _ = args
+                        .recorder_pkt_tx
+                        .try_send(RecorderPacket::ParamSetSeed(ps));
+                    param_sets_seeded = true;
                 }
 
                 let seq = next_seq;
@@ -546,6 +903,16 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                             consecutive_errors = 0;
                         }
                         if let Some(frame) = frames.into_iter().last() {
+                            let dims = frame_dimensions(&frame);
+                            if dims.0 > 0 && dims.1 > 0 && dims != last_reported_dims {
+                                last_reported_dims = dims;
+                                let _ =
+                                    args.recorder_cmd_tx
+                                        .try_send(RecorderCommand::SetVideoDims {
+                                            width: dims.0,
+                                            height: dims.1,
+                                        });
+                            }
                             let out_pts = frame.pts();
                             let matched_arrived = seq_arrivals
                                 .iter()
@@ -633,6 +1000,9 @@ struct AudioWorkerArgs {
     volume_pct: Arc<AtomicU8>,
     audio_device: Arc<Mutex<Option<String>>>,
     audio_device_recheck: Arc<AtomicBool>,
+    capture_needed: Arc<AtomicBool>,
+    recorder_pkt_tx: Sender<RecorderPacket>,
+    stream_start: Instant,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -709,6 +1079,16 @@ fn run_audio_output_loop(args: AudioWorkerArgs) {
         select! {
             recv(args.audio_rx) -> msg => match msg {
                 Ok(frame) => {
+                    if args.capture_needed.load(Ordering::Relaxed) {
+                        let ts_us = i64::try_from(args.stream_start.elapsed().as_micros())
+                            .unwrap_or(i64::MAX);
+                        let _ = args.recorder_pkt_tx.try_send(RecorderPacket::Audio {
+                            samples: frame.samples.clone(),
+                            sample_rate: frame.sample_rate,
+                            channels: frame.channels,
+                            ts_us,
+                        });
+                    }
                     if let Some(out) = audio.as_mut()
                         && let Err(err) =
                             out.push_pcm(&frame.samples, frame.channels, frame.sample_rate)
@@ -740,6 +1120,390 @@ fn run_audio_output_loop(args: AudioWorkerArgs) {
     }
 
     args.usb_haptics_active.store(false, Ordering::Release);
+}
+
+struct RecorderWorkerArgs {
+    codec: MediaCodec,
+    width: u32,
+    height: u32,
+    replay_enabled: bool,
+    replay_secs: u16,
+    pkt_rx: Receiver<RecorderPacket>,
+    cmd_rx: Receiver<RecorderCommand>,
+    notice_tx: Sender<CaptureNotice>,
+}
+
+struct RecorderState {
+    codec: MediaCodec,
+    width: u32,
+    height: u32,
+    replay_enabled: bool,
+    replay_buffer: ReplayRingBuffer,
+    latest_param_sets: Vec<u8>,
+    pending_recording: Option<PathBuf>,
+    active_muxer: Option<MkvMuxer>,
+    recording_base_ts_us: i64,
+    recording_audio_rate: u32,
+    recording_audio_channels: u32,
+    audio_sample_rate: u32,
+    audio_channels: u32,
+    notice_tx: Sender<CaptureNotice>,
+}
+
+impl RecorderState {
+    fn new(args: &RecorderWorkerArgs) -> Self {
+        Self {
+            codec: args.codec,
+            width: args.width,
+            height: args.height,
+            replay_enabled: args.replay_enabled,
+            replay_buffer: ReplayRingBuffer::new(args.codec, args.replay_secs),
+            latest_param_sets: Vec::new(),
+            pending_recording: None,
+            active_muxer: None,
+            recording_base_ts_us: 0,
+            recording_audio_rate: 48_000,
+            recording_audio_channels: 2,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            notice_tx: args.notice_tx.clone(),
+        }
+    }
+
+    fn handle_packet(&mut self, pkt: RecorderPacket) {
+        match pkt {
+            RecorderPacket::ParamSetSeed(ps) => {
+                if !ps.is_empty() {
+                    self.latest_param_sets = ps;
+                }
+            }
+            RecorderPacket::Video { data, ts_us } => {
+                self.handle_video_packet(data, ts_us);
+            }
+            RecorderPacket::Audio {
+                samples,
+                sample_rate,
+                channels,
+                ts_us,
+            } => {
+                self.handle_audio_packet(samples, sample_rate, channels, ts_us);
+            }
+        }
+    }
+
+    fn handle_video_packet(&mut self, data: Vec<u8>, ts_us: i64) {
+        if let Some(ps) = extract_parameter_sets(&data, self.codec) {
+            self.latest_param_sets = ps;
+        }
+        let header_only = is_header_only_annex_b(&data, self.codec);
+        let is_kf = !header_only && contains_keyframe_nal(&data, self.codec);
+
+        let recording_wants = self.active_muxer.is_some() || self.pending_recording.is_some();
+        if self.replay_enabled {
+            let for_rec = if recording_wants && !header_only {
+                Some(data.clone())
+            } else {
+                None
+            };
+            self.replay_buffer.push_video(data, ts_us);
+            let Some(rec_data) = for_rec else {
+                return;
+            };
+            self.write_or_open_recording_video(&rec_data, ts_us, is_kf);
+        } else if recording_wants && !header_only {
+            self.write_or_open_recording_video(&data, ts_us, is_kf);
+        }
+    }
+
+    fn write_or_open_recording_video(&mut self, data: &[u8], ts_us: i64, is_kf: bool) {
+        if self.pending_recording.is_some() && is_kf {
+            let Some(path) = self.pending_recording.take() else {
+                return;
+            };
+            let extradata = if self.latest_param_sets.is_empty() {
+                extract_parameter_sets(data, self.codec).unwrap_or_default()
+            } else {
+                self.latest_param_sets.clone()
+            };
+            match MkvMuxer::create(
+                &path,
+                self.codec,
+                self.width,
+                self.height,
+                &extradata,
+                self.audio_sample_rate,
+                self.audio_channels,
+            ) {
+                Ok(mut muxer) => {
+                    if let Err(err) = muxer.write_video_packet(data, 0, true) {
+                        tracing::warn!("Initial recording frame write failed: {err:#}");
+                        let _ = self
+                            .notice_tx
+                            .try_send(CaptureNotice::RecordingAborted(format!(
+                                "Recording write failed: {err:#}"
+                            )));
+                        return;
+                    }
+                    self.recording_base_ts_us = ts_us;
+                    self.recording_audio_rate = self.audio_sample_rate;
+                    self.recording_audio_channels = self.audio_channels;
+                    self.active_muxer = Some(muxer);
+                    let _ = self.notice_tx.try_send(CaptureNotice::RecordingStarted);
+                }
+                Err(err) => {
+                    tracing::warn!("MkvMuxer::create failed: {err:#}");
+                    let _ = self
+                        .notice_tx
+                        .try_send(CaptureNotice::RecordingAborted(format!(
+                            "Recording start failed: {err:#}"
+                        )));
+                }
+            }
+            return;
+        }
+
+        if let Some(muxer) = self.active_muxer.as_mut() {
+            let rel_ts = ts_us.saturating_sub(self.recording_base_ts_us).max(0);
+            if let Err(err) = muxer.write_video_packet(data, rel_ts, is_kf) {
+                tracing::warn!("MkvMuxer::write_video_packet failed: {err:#}");
+                self.active_muxer = None;
+                let _ = self
+                    .notice_tx
+                    .try_send(CaptureNotice::RecordingAborted(format!(
+                        "Recording write failed: {err:#}"
+                    )));
+            }
+        }
+    }
+
+    fn handle_audio_packet(
+        &mut self,
+        samples: Vec<i16>,
+        sample_rate: u32,
+        channels: u32,
+        ts_us: i64,
+    ) {
+        if samples.is_empty() || sample_rate == 0 || channels == 0 {
+            return;
+        }
+        self.audio_sample_rate = sample_rate;
+        self.audio_channels = channels;
+
+        if self.replay_enabled {
+            let rec_copy = if self.active_muxer.is_some() {
+                Some(samples.clone())
+            } else {
+                None
+            };
+            self.replay_buffer
+                .push_audio(samples, sample_rate, channels, ts_us);
+            if let Some(ref rec_samples) = rec_copy
+                && sample_rate == self.recording_audio_rate
+                && channels == self.recording_audio_channels
+            {
+                self.write_recording_audio(rec_samples, ts_us);
+            }
+        } else if self.active_muxer.is_some()
+            && sample_rate == self.recording_audio_rate
+            && channels == self.recording_audio_channels
+        {
+            self.write_recording_audio(&samples, ts_us);
+        }
+    }
+
+    fn write_recording_audio(&mut self, samples: &[i16], ts_us: i64) {
+        let Some(muxer) = self.active_muxer.as_mut() else {
+            return;
+        };
+        let rel_ts = ts_us.saturating_sub(self.recording_base_ts_us).max(0);
+        if let Err(err) = muxer.write_audio_pcm(samples, rel_ts) {
+            tracing::warn!("MkvMuxer::write_audio_pcm failed: {err:#}");
+            self.active_muxer = None;
+            let _ = self
+                .notice_tx
+                .try_send(CaptureNotice::RecordingAborted(format!(
+                    "Recording audio write failed: {err:#}"
+                )));
+        }
+    }
+
+    fn finish_recording(&mut self) {
+        let had_pending = self.pending_recording.take().is_some();
+        if let Some(muxer) = self.active_muxer.take() {
+            match muxer.finish() {
+                Ok(path) => {
+                    let _ = self.notice_tx.try_send(CaptureNotice::RecordingSaved(path));
+                }
+                Err(err) => {
+                    tracing::warn!("MkvMuxer::finish failed: {err:#}");
+                    let _ = self
+                        .notice_tx
+                        .try_send(CaptureNotice::RecordingAborted(format!(
+                            "Recording finalize failed: {err:#}"
+                        )));
+                }
+            }
+        } else if had_pending {
+            let _ = self.notice_tx.try_send(CaptureNotice::Info(
+                "Recording stopped before keyframe arrived".to_string(),
+            ));
+        }
+    }
+
+    fn save_replay_clip(&self, path: PathBuf) {
+        if !self.replay_enabled {
+            let _ = self.notice_tx.try_send(CaptureNotice::Error(
+                "Replay Buffer is disabled in Settings > Video".to_string(),
+            ));
+            return;
+        }
+        let Some(snap) = self.replay_buffer.snapshot_for_clip() else {
+            let _ = self.notice_tx.try_send(CaptureNotice::Info(
+                "Replay Buffer has no buffered keyframe yet".to_string(),
+            ));
+            return;
+        };
+        let codec = self.codec;
+        let width = self.width;
+        let height = self.height;
+        let notice_tx = self.notice_tx.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("gnsh-clip-save".into())
+            .spawn(
+                move || match write_replay_clip_to_disk(&path, codec, width, height, snap) {
+                    Ok((saved, secs)) => {
+                        let _ = notice_tx.try_send(CaptureNotice::ClipSaved(saved, secs));
+                    }
+                    Err(err) => {
+                        tracing::warn!("Replay clip save failed: {err:#}");
+                        let _ = notice_tx.try_send(CaptureNotice::Error(format!(
+                            "Replay clip save failed: {err:#}"
+                        )));
+                    }
+                },
+            )
+        {
+            let _ = self.notice_tx.try_send(CaptureNotice::Error(format!(
+                "Replay clip thread failed: {err:#}"
+            )));
+        }
+    }
+
+    fn handle_command(&mut self, cmd: RecorderCommand, pkt_rx: &Receiver<RecorderPacket>) -> bool {
+        match cmd {
+            RecorderCommand::StartRecording { path } => {
+                if self.active_muxer.is_some() {
+                    self.finish_recording();
+                }
+                self.pending_recording = Some(path);
+                true
+            }
+            RecorderCommand::StopRecording => {
+                while let Ok(pkt) = pkt_rx.try_recv() {
+                    self.handle_packet(pkt);
+                }
+                self.finish_recording();
+                true
+            }
+            RecorderCommand::SaveReplayClip { path } => {
+                while let Ok(pkt) = pkt_rx.try_recv() {
+                    self.handle_packet(pkt);
+                }
+                self.save_replay_clip(path);
+                true
+            }
+            RecorderCommand::SetReplayConfig { enabled, secs } => {
+                self.replay_enabled = enabled;
+                self.replay_buffer.set_duration_secs(secs);
+                if !enabled {
+                    self.replay_buffer.clear();
+                }
+                true
+            }
+            RecorderCommand::SetVideoDims { width, height } => {
+                if width > 0 && height > 0 {
+                    self.width = width;
+                    self.height = height;
+                }
+                true
+            }
+            RecorderCommand::Shutdown => {
+                while let Ok(pkt) = pkt_rx.try_recv() {
+                    self.handle_packet(pkt);
+                }
+                self.finish_recording();
+                false
+            }
+        }
+    }
+}
+
+fn write_replay_clip_to_disk(
+    path: &Path,
+    codec: MediaCodec,
+    width: u32,
+    height: u32,
+    snap: ReplayClipSnapshot,
+) -> Result<(PathBuf, f32)> {
+    let duration_secs = snap.duration_secs;
+    let mut muxer = MkvMuxer::create(
+        path,
+        codec,
+        width,
+        height,
+        &snap.extradata,
+        snap.audio_sample_rate,
+        snap.audio_channels,
+    )?;
+    for pkt in snap.packets {
+        match pkt.kind {
+            gnsh_media::BufferedPacketKind::Video {
+                data, is_keyframe, ..
+            } => {
+                muxer.write_video_packet(&data, pkt.ts_us, is_keyframe)?;
+            }
+            gnsh_media::BufferedPacketKind::Audio {
+                samples,
+                sample_rate,
+                channels,
+            } => {
+                if sample_rate == snap.audio_sample_rate && channels == snap.audio_channels {
+                    muxer.write_audio_pcm(&samples, pkt.ts_us)?;
+                }
+            }
+        }
+    }
+    let saved = muxer.finish()?;
+    Ok((saved, duration_secs))
+}
+
+fn run_recorder_loop(args: RecorderWorkerArgs) {
+    let mut state = RecorderState::new(&args);
+    loop {
+        select! {
+            recv(args.cmd_rx) -> msg => match msg {
+                Ok(cmd) => {
+                    if !state.handle_command(cmd, &args.pkt_rx) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    while let Ok(pkt) = args.pkt_rx.try_recv() {
+                        state.handle_packet(pkt);
+                    }
+                    state.finish_recording();
+                    break;
+                }
+            },
+            recv(args.pkt_rx) -> msg => match msg {
+                Ok(pkt) => state.handle_packet(pkt),
+                Err(_) => {
+                    state.finish_recording();
+                    break;
+                }
+            },
+        }
+    }
 }
 
 #[cfg(test)]

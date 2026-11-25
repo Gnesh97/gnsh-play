@@ -438,7 +438,10 @@ impl ActiveBackend {
             Self::D3D12 { renderer, .. } => {
                 DecoderHardware::D3D12ZeroCopy(renderer.device().clone())
             }
-            Self::Vulkan { .. } => DecoderHardware::D3D11Transfer,
+            Self::Vulkan { renderer, .. } => match renderer.video_device() {
+                Some(vk_dev) => DecoderHardware::VulkanZeroCopy(vk_dev),
+                None => DecoderHardware::D3D11Transfer,
+            },
         }
     }
 
@@ -695,9 +698,15 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         let mut escape_for_shortcuts = summary.escape_pressed;
         let mut toggle_mic_for_shortcuts = summary.toggle_mic;
         let mut go_home_for_shortcuts = summary.go_home;
+        let mut take_screenshot_for_shortcuts = summary.take_screenshot;
+        let mut toggle_recording_for_shortcuts = summary.toggle_recording;
+        let mut save_replay_clip_for_shortcuts = summary.save_replay_clip;
         if app.kbm_modal_open {
             toggle_mic_for_shortcuts = false;
             go_home_for_shortcuts = false;
+            take_screenshot_for_shortcuts = false;
+            toggle_recording_for_shortcuts = false;
+            save_replay_clip_for_shortcuts = false;
             if let Some(action) = app.kbm_listening_action {
                 if summary.escape_pressed {
                     app.kbm_listening_action = None;
@@ -738,12 +747,15 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             }
         }
 
-        app.handle_shortcuts(
-            summary.toggle_hud,
-            escape_for_shortcuts,
-            toggle_mic_for_shortcuts,
-            go_home_for_shortcuts,
-        );
+        app.handle_shortcuts(StreamShortcuts {
+            toggle_hud: summary.toggle_hud,
+            escape_pressed: escape_for_shortcuts,
+            toggle_mic: toggle_mic_for_shortcuts,
+            go_home: go_home_for_shortcuts,
+            take_screenshot: take_screenshot_for_shortcuts,
+            toggle_recording: toggle_recording_for_shortcuts,
+            save_replay_clip: save_replay_clip_for_shortcuts,
+        });
         if summary.audio_devices_changed {
             app.audio_devices = list_playback_devices();
             app.mic_devices = list_recording_devices();
@@ -801,6 +813,9 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             || summary.toggle_mouse_lock
             || summary.toggle_mic
             || summary.go_home
+            || summary.take_screenshot
+            || summary.toggle_recording
+            || summary.save_replay_clip
             || summary.escape_pressed
             || last_present.elapsed() >= IDLE_UI_REFRESH_INTERVAL;
         if !should_render {
@@ -850,7 +865,12 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             || app.kbm_modal_open
             || matches!(
                 &app.mode,
-                AppMode::Streaming(s) if s.show_hud || s.pin_prompt.is_some() || s.osk_prompt.is_some()
+                AppMode::Streaming(s)
+                    if s.show_hud
+                        || s.pin_prompt.is_some()
+                        || s.osk_prompt.is_some()
+                        || s.is_recording()
+                        || s.has_active_toast()
             );
         let hdr_output_active = backend.is_hdr_output_active();
         let mouse_locked = window.is_relative_mouse_mode();
@@ -1051,6 +1071,49 @@ fn open_url(url: &str) {
             "ShellExecuteW failed opening URL"
         );
     }
+}
+
+pub(crate) fn open_capture_folder(override_dir: Option<&str>) -> Result<()> {
+    let dir = stream::resolve_capture_dir(override_dir, true);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed creating capture folder {}", dir.display()))?;
+    if !dir.is_dir() {
+        anyhow::bail!("capture path is not a directory: {}", dir.display());
+    }
+    let dir_str = dir
+        .to_str()
+        .context("capture folder path contains non-UTF-8 characters")?;
+    let op = HSTRING::from("explore");
+    let target = HSTRING::from(dir_str);
+    let ret = unsafe {
+        ShellExecuteW(
+            Some(HWND::default()),
+            &op,
+            &target,
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if (ret.0 as isize) <= 32 {
+        anyhow::bail!(
+            "ShellExecuteW failed opening {} (code {})",
+            dir.display(),
+            ret.0 as isize
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct StreamShortcuts {
+    toggle_hud: bool,
+    escape_pressed: bool,
+    toggle_mic: bool,
+    go_home: bool,
+    take_screenshot: bool,
+    toggle_recording: bool,
+    save_replay_clip: bool,
 }
 
 pub(crate) enum AppMode {
@@ -1435,16 +1498,10 @@ impl AppState {
         self.wake_rx = Some(rx);
     }
 
-    fn handle_shortcuts(
-        &mut self,
-        toggle_hud: bool,
-        escape_pressed: bool,
-        toggle_mic: bool,
-        go_home: bool,
-    ) {
+    fn handle_shortcuts(&mut self, shortcuts: StreamShortcuts) {
         match &mut self.mode {
             AppMode::Home => {
-                if escape_pressed {
+                if shortcuts.escape_pressed {
                     if self.edit_modal.is_some() {
                         self.edit_modal = None;
                     } else if self.register_modal.is_some() {
@@ -1457,19 +1514,28 @@ impl AppState {
                 }
             }
             AppMode::Streaming(stream) => {
-                if toggle_hud {
+                if shortcuts.toggle_hud {
                     stream.show_hud = !stream.show_hud;
                     if !stream.show_hud {
                         stream.hud_drawer_open = false;
                     }
                 }
-                if toggle_mic {
+                if shortcuts.toggle_mic {
                     stream.mic_toggle_requested = true;
                 }
-                if go_home && stream.osk_prompt.is_none() && stream.pin_prompt.is_none() {
+                if shortcuts.go_home && stream.osk_prompt.is_none() && stream.pin_prompt.is_none() {
                     stream.go_home_requested = true;
                 }
-                if escape_pressed {
+                if shortcuts.take_screenshot {
+                    stream.screenshot_requested = true;
+                }
+                if shortcuts.toggle_recording {
+                    stream.record_toggle_requested = true;
+                }
+                if shortcuts.save_replay_clip {
+                    stream.save_clip_requested = true;
+                }
+                if shortcuts.escape_pressed {
                     if let Some(osk) = stream.osk_prompt.as_mut() {
                         osk.cancel_requested = true;
                     } else if self.settings_open {
@@ -1735,6 +1801,21 @@ impl AppState {
                 if gamepad_mic_toggle || ui_mic_toggle {
                     stream.toggle_mic(gamepads);
                 }
+
+                let capture_dir = prev_pad_settings.capture_dir.as_deref();
+                if std::mem::take(&mut stream.screenshot_requested) {
+                    stream.trigger_screenshot(capture_dir);
+                    ui_dirty = true;
+                }
+                if std::mem::take(&mut stream.record_toggle_requested) {
+                    stream.toggle_recording(capture_dir);
+                    ui_dirty = true;
+                }
+                if std::mem::take(&mut stream.save_clip_requested) {
+                    stream.save_replay_clip(capture_dir);
+                    ui_dirty = true;
+                }
+                ui_dirty |= stream.poll_capture_notices();
 
                 if stream.connected
                     && !stream.mic_muted
@@ -2100,6 +2181,14 @@ impl AppState {
             }
             if self.settings.mic_device != prev.mic_device {
                 stream.set_mic_device(self.settings.mic_device.clone());
+            }
+            if self.settings.replay_buffer_enabled != prev.replay_buffer_enabled
+                || self.settings.replay_buffer_secs != prev.replay_buffer_secs
+            {
+                stream.update_replay_settings(
+                    self.settings.replay_buffer_enabled,
+                    self.settings.replay_buffer_secs,
+                );
             }
         }
         if self.settings.renderer_backend != prev.renderer_backend {

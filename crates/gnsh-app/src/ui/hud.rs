@@ -59,10 +59,39 @@ pub(crate) fn render_streaming_ui(
                     }
                 });
             });
+    } else if let Some(rec_text) = format_rec_pill(stream) {
+        egui::Area::new(egui::Id::unique("stream_rec_badge"))
+            .anchor(egui::Align2::LEFT_TOP, [14.0, 14.0])
+            .show(ui.ctx(), |ui| {
+                theme::hud_frame().show(ui, |ui| {
+                    theme::status_pill(ui, theme::DANGER_SOLID_BG, theme::TEXT_PRIMARY, &rec_text);
+                });
+            });
+    }
+
+    if let Some((msg, is_error)) = stream.active_toast() {
+        let fg = if is_error {
+            theme::DANGER_FG
+        } else {
+            theme::SUCCESS_FG
+        };
+        egui::Area::new(egui::Id::unique("capture_toast"))
+            .anchor(egui::Align2::RIGHT_TOP, [-14.0, 14.0])
+            .show(ui.ctx(), |ui| {
+                theme::hud_frame().show(ui, |ui| {
+                    ui.label(egui::RichText::new(msg).small().strong().color(fg));
+                });
+            });
     }
 
     render_pin_modal(ui, stream);
     render_osk_modal(ui, stream);
+}
+
+fn format_rec_pill(stream: &ActiveStream) -> Option<String> {
+    stream
+        .recording_elapsed_secs()
+        .map(|secs| format!("REC {:02}:{:02}", secs / 60, secs % 60))
 }
 
 fn hud_label(ui: &mut egui::Ui, label: &str, focus_row: Option<usize>, row_idx: usize) {
@@ -107,6 +136,7 @@ fn render_hud_top_pill(
             match &info.frame {
                 gnsh_media::DecodedFrame::D3D12(_) => "D3D12VA",
                 gnsh_media::DecodedFrame::D3D11(_) => "D3D11VA",
+                gnsh_media::DecodedFrame::Vulkan(_) => "VulkanVA",
                 gnsh_media::DecodedFrame::SoftwareNv12 { .. }
                 | gnsh_media::DecodedFrame::SoftwareP010 { .. }
                     if info.is_hw =>
@@ -191,6 +221,10 @@ fn render_hud_top_pill(
                 theme::WARN_FG,
                 &format!("Connecting ({})...", stream.console_host),
             );
+        }
+
+        if let Some(rec_text) = format_rec_pill(stream) {
+            theme::status_pill(ui, theme::DANGER_SOLID_BG, theme::TEXT_PRIMARY, &rec_text);
         }
 
         let summary = format!(
@@ -438,9 +472,39 @@ fn render_hud_quick_drawer(
     });
 
     ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add(theme::secondary_button("Screenshot (F12)"))
+            .clicked()
+        {
+            stream.screenshot_requested = true;
+        }
+        let rec_btn = if stream.is_recording() {
+            theme::secondary_button("Stop Rec (F9)").fill(theme::DANGER_SOLID_BG)
+        } else {
+            theme::secondary_button("Record (F9)")
+        };
+        if ui.add(rec_btn).clicked() {
+            stream.record_toggle_requested = true;
+        }
+        if ui
+            .add_enabled(
+                settings.replay_buffer_enabled,
+                theme::secondary_button("Save Clip (F10)"),
+            )
+            .on_hover_text("Flush rolling Replay Buffer clip to Videos\\gnsh-play")
+            .clicked()
+        {
+            stream.save_clip_requested = true;
+        }
+        ui.checkbox(&mut settings.replay_buffer_enabled, "Replay Buffer")
+            .on_hover_text("Keep rolling in-memory clip buffer ready for F10");
+    });
+
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "F3: Toggle HUD  ·  F8: Lock Mouse  ·  F11: Fullscreen  ·  Home: PS Home  ·  Ctrl+M: Mic  ·  Esc: Close / Disconnect",
+            "F3: HUD  ·  F8: Mouse  ·  F9: Rec  ·  F10: Clip  ·  F11: Fullscreen  ·  F12: Shot  ·  Home: PS Home  ·  Ctrl+M: Mic  ·  Esc: Back / Disconnect",
         )
         .small()
         .color(theme::TEXT_MUTED),

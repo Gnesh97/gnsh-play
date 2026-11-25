@@ -1,12 +1,16 @@
 #include <errno.h>
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/hwcontext_d3d12va.h>
+#include <libavutil/hwcontext_vulkan.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 #include <libplacebo/dither.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/shaders/colorspace.h>

@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use gnsh_input::KbmBindings;
-use gnsh_media::{RendererBackend, ScaleMode, VideoFilterMode};
+use gnsh_media::{
+    MAX_REPLAY_BUFFER_SECS, MIN_REPLAY_BUFFER_SECS, RendererBackend, ScaleMode, VideoFilterMode,
+};
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -369,6 +371,9 @@ mod tests {
             sharpness_pct: 250,
             scale_mode: ScaleMode::Zoom,
             renderer_backend: RendererBackend::Vulkan,
+            replay_buffer_enabled: true,
+            replay_buffer_secs: 90,
+            capture_dir: Some("  C:\\Captures\\PS5  ".into()),
             volume_pct: 220,
             audio_device: Some("  Speakers (Realtek Audio) ".into()),
             mic_device: Some("  USB Microphone ".into()),
@@ -395,6 +400,9 @@ mod tests {
         assert_eq!(loaded.sharpness_pct, 100);
         assert_eq!(loaded.scale_mode, ScaleMode::Zoom);
         assert_eq!(loaded.renderer_backend, RendererBackend::Vulkan);
+        assert!(loaded.replay_buffer_enabled);
+        assert_eq!(loaded.replay_buffer_secs, MAX_REPLAY_BUFFER_SECS);
+        assert_eq!(loaded.capture_dir.as_deref(), Some("C:\\Captures\\PS5"));
         assert_eq!(loaded.volume_pct, 100);
         assert_eq!(
             loaded.audio_device.as_deref(),
@@ -436,6 +444,9 @@ mod tests {
         assert!(defaulted.auto_reconnect);
         assert!(!defaulted.wan_profile_enabled);
         assert_eq!(defaulted.renderer_backend, RendererBackend::Auto);
+        assert!(!defaulted.replay_buffer_enabled);
+        assert_eq!(defaulted.replay_buffer_secs, 30);
+        assert_eq!(defaulted.capture_dir, None);
         assert_eq!(defaulted.wan_preset, VideoPreset::P720Fps60);
         assert_eq!(defaulted.wan_codec, VideoCodec::Hevc);
         assert_eq!(defaulted.wan_bitrate_kbps, 12_000);
@@ -495,6 +506,9 @@ pub struct StoredSettings {
     pub sharpness_pct: u8,
     pub scale_mode: ScaleMode,
     pub renderer_backend: RendererBackend,
+    pub replay_buffer_enabled: bool,
+    pub replay_buffer_secs: u16,
+    pub capture_dir: Option<String>,
     pub volume_pct: u8,
     pub audio_device: Option<String>,
     pub mic_device: Option<String>,
@@ -523,6 +537,9 @@ impl Default for StoredSettings {
             sharpness_pct: 0,
             scale_mode: ScaleMode::Fit,
             renderer_backend: RendererBackend::Auto,
+            replay_buffer_enabled: false,
+            replay_buffer_secs: 30,
+            capture_dir: None,
             volume_pct: 100,
             audio_device: None,
             mic_device: None,
@@ -566,6 +583,13 @@ fn normalize_settings(settings: &mut StoredSettings) {
     settings.bitrate_kbps = clamp_bitrate_kbps(settings.bitrate_kbps);
     settings.wan_bitrate_kbps = clamp_bitrate_kbps(settings.wan_bitrate_kbps);
     settings.sharpness_pct = settings.sharpness_pct.min(100);
+    if settings.replay_buffer_secs == 0 {
+        settings.replay_buffer_secs = 30;
+    }
+    settings.replay_buffer_secs = settings
+        .replay_buffer_secs
+        .clamp(MIN_REPLAY_BUFFER_SECS, MAX_REPLAY_BUFFER_SECS);
+    normalize_device_opt(&mut settings.capture_dir);
     settings.volume_pct = settings.volume_pct.min(100);
     settings.kbm_sensitivity_pct = settings.kbm_sensitivity_pct.clamp(1, 100);
     settings.kbm_deadzone_pct = settings.kbm_deadzone_pct.min(40);

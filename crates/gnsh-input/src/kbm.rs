@@ -252,7 +252,15 @@ impl KbmBindings {
     pub fn is_reserved_shortcut(input: KbmInput) -> bool {
         matches!(
             input,
-            KbmInput::Key(ffi::SDLK_ESCAPE | ffi::SDLK_F3 | ffi::SDLK_F8 | ffi::SDLK_F11)
+            KbmInput::Key(
+                ffi::SDLK_ESCAPE
+                    | ffi::SDLK_F3
+                    | ffi::SDLK_F8
+                    | ffi::SDLK_F9
+                    | ffi::SDLK_F10
+                    | ffi::SDLK_F11
+                    | ffi::SDLK_F12
+            )
         )
     }
 
