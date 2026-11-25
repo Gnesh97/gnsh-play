@@ -325,7 +325,7 @@ fn render_hud_top_pill(
             let (lock_label, lock_bg, lock_fg) = if mouse_locked {
                 ("Mouse Locked", theme::SUCCESS_BG, theme::SUCCESS_FG)
             } else {
-                ("Lock Mouse (F8)", theme::ACCENT, egui::Color32::WHITE)
+                ("Lock Mouse (F8)", theme::ACCENT, theme::ON_ACCENT)
             };
             if ui
                 .add(theme::small_pill_button(lock_label, lock_bg, lock_fg, None))
@@ -337,7 +337,7 @@ fn render_hud_top_pill(
         }
 
         let (tune_bg, tune_fg, tune_border) = if stream.hud_drawer_open {
-            (theme::ACCENT, egui::Color32::WHITE, None)
+            (theme::ACCENT, theme::ON_ACCENT, None)
         } else {
             (
                 theme::SURFACE_RAISED,

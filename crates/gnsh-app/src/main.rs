@@ -841,7 +841,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         let clear_rgba = if is_streaming {
             [0.0, 0.0, 0.0, 1.0]
         } else {
-            [0.04, 0.05, 0.08, 1.0]
+            [32.0 / 255.0, 39.0 / 255.0, 52.0 / 255.0, 1.0]
         };
         backend.begin_frame(clear_rgba);
 

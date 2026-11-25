@@ -1,39 +1,40 @@
 use crate::ui::StatusBanner;
 use gnsh_proto::ConsoleState;
 
-pub(crate) const CANVAS: egui::Color32 = egui::Color32::from_rgb(10, 13, 20);
-pub(crate) const CHROME: egui::Color32 = egui::Color32::from_rgb(16, 20, 30);
-pub(crate) const SURFACE: egui::Color32 = egui::Color32::from_rgb(22, 27, 40);
-pub(crate) const SURFACE_RAISED: egui::Color32 = egui::Color32::from_rgb(30, 37, 54);
-pub(crate) const SURFACE_HOVER: egui::Color32 = egui::Color32::from_rgb(39, 48, 70);
-pub(crate) const HUD_GLASS: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 12, 18, 228);
+pub(crate) const CANVAS: egui::Color32 = egui::Color32::from_rgb(32, 39, 52);
+pub(crate) const CHROME: egui::Color32 = egui::Color32::from_rgb(27, 33, 45);
+pub(crate) const SURFACE: egui::Color32 = egui::Color32::from_rgb(41, 50, 68);
+pub(crate) const SURFACE_RAISED: egui::Color32 = egui::Color32::from_rgb(54, 65, 90);
+pub(crate) const SURFACE_HOVER: egui::Color32 = egui::Color32::from_rgb(66, 79, 109);
+pub(crate) const HUD_GLASS: egui::Color32 = egui::Color32::from_rgba_premultiplied(29, 35, 47, 232);
 
-pub(crate) const BORDER_SUBTLE: egui::Color32 = egui::Color32::from_rgb(36, 45, 64);
-pub(crate) const BORDER_STRONG: egui::Color32 = egui::Color32::from_rgb(54, 66, 92);
-pub(crate) const FOCUS_RING: egui::Color32 = egui::Color32::from_rgb(90, 169, 255);
+pub(crate) const BORDER_SUBTLE: egui::Color32 = egui::Color32::from_rgb(54, 65, 90);
+pub(crate) const BORDER_STRONG: egui::Color32 = egui::Color32::from_rgb(78, 93, 126);
+pub(crate) const FOCUS_RING: egui::Color32 = egui::Color32::from_rgb(224, 248, 199);
 
-pub(crate) const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(240, 244, 252);
-pub(crate) const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(176, 186, 206);
-pub(crate) const TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(136, 149, 176);
+pub(crate) const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(224, 248, 199);
+pub(crate) const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(198, 216, 184);
+pub(crate) const TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(163, 180, 168);
 
-pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(14, 118, 214);
-pub(crate) const ACCENT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(11, 96, 176);
+pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(183, 216, 148);
+pub(crate) const ACCENT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(224, 248, 199);
+pub(crate) const ON_ACCENT: egui::Color32 = egui::Color32::from_rgb(32, 39, 52);
 
-pub(crate) const SUCCESS_BG: egui::Color32 = egui::Color32::from_rgb(21, 66, 48);
-pub(crate) const SUCCESS_BORDER: egui::Color32 = egui::Color32::from_rgb(46, 152, 98);
-pub(crate) const SUCCESS_FG: egui::Color32 = egui::Color32::from_rgb(124, 230, 174);
+pub(crate) const SUCCESS_BG: egui::Color32 = egui::Color32::from_rgb(40, 61, 50);
+pub(crate) const SUCCESS_BORDER: egui::Color32 = egui::Color32::from_rgb(183, 216, 148);
+pub(crate) const SUCCESS_FG: egui::Color32 = egui::Color32::from_rgb(224, 248, 199);
 
-pub(crate) const WARN_BG: egui::Color32 = egui::Color32::from_rgb(71, 51, 20);
-pub(crate) const WARN_FG: egui::Color32 = egui::Color32::from_rgb(248, 202, 118);
+pub(crate) const WARN_BG: egui::Color32 = egui::Color32::from_rgb(74, 59, 36);
+pub(crate) const WARN_FG: egui::Color32 = egui::Color32::from_rgb(246, 211, 139);
 
-pub(crate) const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(74, 28, 34);
-pub(crate) const DANGER_BORDER: egui::Color32 = egui::Color32::from_rgb(185, 62, 68);
-pub(crate) const DANGER_FG: egui::Color32 = egui::Color32::from_rgb(252, 165, 165);
+pub(crate) const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(76, 37, 46);
+pub(crate) const DANGER_BORDER: egui::Color32 = egui::Color32::from_rgb(201, 91, 103);
+pub(crate) const DANGER_FG: egui::Color32 = egui::Color32::from_rgb(252, 168, 176);
 pub(crate) const DANGER_SOLID_BG: egui::Color32 = egui::Color32::from_rgb(158, 43, 53);
 
-pub(crate) const INFO_BG: egui::Color32 = egui::Color32::from_rgb(22, 48, 77);
-pub(crate) const INFO_BORDER: egui::Color32 = egui::Color32::from_rgb(48, 108, 184);
-pub(crate) const INFO_FG: egui::Color32 = egui::Color32::from_rgb(158, 208, 255);
+pub(crate) const INFO_BG: egui::Color32 = egui::Color32::from_rgb(42, 54, 77);
+pub(crate) const INFO_BORDER: egui::Color32 = egui::Color32::from_rgb(183, 216, 148);
+pub(crate) const INFO_FG: egui::Color32 = egui::Color32::from_rgb(224, 248, 199);
 
 pub(crate) const RADIUS_CARD: u8 = 12;
 pub(crate) const RADIUS_CONTROL: u8 = 8;
@@ -54,17 +55,17 @@ pub(crate) fn apply_theme(ctx: &egui::Context) {
         offset: [0, 8],
         blur: 18,
         spread: 0,
-        color: egui::Color32::from_rgba_unmultiplied(4, 7, 14, 110),
+        color: egui::Color32::from_rgba_unmultiplied(12, 16, 24, 120),
     };
     visuals.popup_shadow = egui::Shadow {
         offset: [0, 4],
         blur: 12,
         spread: 0,
-        color: egui::Color32::from_rgba_unmultiplied(4, 7, 14, 96),
+        color: egui::Color32::from_rgba_unmultiplied(12, 16, 24, 104),
     };
 
     visuals.selection.bg_fill = ACCENT;
-    visuals.selection.stroke = egui::Stroke::new(1.5, FOCUS_RING);
+    visuals.selection.stroke = egui::Stroke::new(1.5, ON_ACCENT);
 
     visuals.widgets.noninteractive.bg_fill = SURFACE;
     visuals.widgets.noninteractive.weak_bg_fill = SURFACE_RAISED;
@@ -81,13 +82,13 @@ pub(crate) fn apply_theme(ctx: &egui::Context) {
     visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
     visuals.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, ACCENT_ACTIVE);
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     visuals.widgets.active.bg_fill = ACCENT_ACTIVE;
     visuals.widgets.active.weak_bg_fill = ACCENT;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, FOCUS_RING);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, ON_ACCENT);
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     visuals.widgets.open.bg_fill = SURFACE_HOVER;
@@ -152,13 +153,9 @@ pub(crate) fn hud_frame() -> egui::Frame {
 }
 
 pub(crate) fn primary_button(label: &str) -> egui::Button<'static> {
-    egui::Button::new(
-        egui::RichText::new(label)
-            .color(egui::Color32::WHITE)
-            .strong(),
-    )
-    .fill(ACCENT)
-    .corner_radius(egui::CornerRadius::same(RADIUS_CONTROL))
+    egui::Button::new(egui::RichText::new(label).color(ON_ACCENT).strong())
+        .fill(ACCENT)
+        .corner_radius(egui::CornerRadius::same(RADIUS_CONTROL))
 }
 
 pub(crate) fn emerald_button(label: &str) -> egui::Button<'static> {
@@ -277,12 +274,15 @@ mod tests {
     #[test]
     fn theme_tokens_meet_contrast_and_concentric_radius_rules() {
         assert!(contrast_ratio(TEXT_PRIMARY, SURFACE) >= 4.5);
+        assert!(contrast_ratio(TEXT_PRIMARY, SURFACE_RAISED) >= 4.5);
         assert!(contrast_ratio(TEXT_PRIMARY, CANVAS) >= 4.5);
         assert!(contrast_ratio(TEXT_SECONDARY, SURFACE) >= 4.5);
         assert!(contrast_ratio(TEXT_MUTED, CANVAS) >= 4.5);
         assert!(contrast_ratio(TEXT_MUTED, SURFACE) >= 4.5);
-        assert!(contrast_ratio(egui::Color32::WHITE, ACCENT) >= 4.5);
+        assert!(contrast_ratio(ON_ACCENT, ACCENT) >= 4.5);
+        assert!(contrast_ratio(ON_ACCENT, ACCENT_ACTIVE) >= 4.5);
         assert!(contrast_ratio(SUCCESS_FG, SUCCESS_BG) >= 4.5);
+        assert!(contrast_ratio(INFO_FG, INFO_BG) >= 4.5);
         assert!(contrast_ratio(WARN_FG, WARN_BG) >= 4.5);
         assert!(contrast_ratio(DANGER_FG, DANGER_BG) >= 4.5);
         const {

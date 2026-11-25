@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Updated the UI color palette in [`crates/gnsh-app/src/ui/theme.rs`](crates/gnsh-app/src/ui/theme.rs), [`crates/gnsh-app/src/ui/hud.rs`](crates/gnsh-app/src/ui/hud.rs), [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs), and [`DESIGN.md`](DESIGN.md) to the slate-navy & sage-lime scheme (`#202734`, `#36415A`, `#B7D894`, `#E0F8C7`) with WCAG `>= 4.5:1` contrast (`ON_ACCENT` `#202734` foreground on active/accent controls).
+
 ### Added
 - Added **zero-copy Vulkan Video hardware decode** (`VK_KHR_video_decode_h264` / `VK_KHR_video_decode_h265` via FFmpeg `AV_HWDEVICE_TYPE_VULKAN` sharing `VulkanPlaceboRenderer`'s `VkInstance`/`VkDevice` queues, `AVVkFrame` wrap/hold/release, `VulkanZeroCopy -> D3D11Transfer -> SW` fallback chain, `"VulkanVA"` HUD badge, and headless H.264/HEVC Vulkan Video + `libplacebo` CAS verification) and fixed `CAS_HOOK_GLSL` to run on `//!HOOK PRE_OUTPUT` cleanly with `PL_CLEAR_SKIP` in [`crates/gnsh-media/src/vulkan_renderer.rs`](crates/gnsh-media/src/vulkan_renderer.rs), [`crates/gnsh-media/src/video_decoder.rs`](crates/gnsh-media/src/video_decoder.rs), [`crates/gnsh-media/src/d3d11_renderer.rs`](crates/gnsh-media/src/d3d11_renderer.rs), [`crates/gnsh-media/src/d3d12_renderer.rs`](crates/gnsh-media/src/d3d12_renderer.rs), [`crates/gnsh-app/src/main.rs`](crates/gnsh-app/src/main.rs), and [`crates/gnsh-app/src/ui/hud.rs`](crates/gnsh-app/src/ui/hud.rs).
 - Added zero-overhead **Screenshots (`F12`), Raw-Remux Recording (`F9`), and Rolling Replay Buffer (`F10`)**:
