@@ -155,7 +155,14 @@ pub struct VideoDecoder {
     hw_active: bool,
     hw_kind: HwKind,
     decoded_any: bool,
+    pending_header: Vec<u8>,
+    bootstrap_packets: Vec<(Vec<u8>, i64)>,
+    bootstrap_bytes: usize,
 }
+
+const MAX_PENDING_HEADER_BYTES: usize = 64 * 1024;
+const MAX_BOOTSTRAP_PACKETS: usize = 16;
+const MAX_BOOTSTRAP_BYTES: usize = 8 * 1024 * 1024;
 
 unsafe impl Send for VideoDecoder {}
 
@@ -208,9 +215,82 @@ impl VideoDecoder {
                 annex_b.len()
             );
         }
-        let pkt_len = i32::try_from(annex_b.len()).context("video packet size exceeds i32")?;
+        let _ = i32::try_from(annex_b.len()).context("video packet size exceeds i32")?;
+
+        if is_header_only_annex_b(annex_b, self.codec) {
+            if annex_b.len() <= MAX_PENDING_HEADER_BYTES {
+                if self.pending_header.len() + annex_b.len() > MAX_PENDING_HEADER_BYTES {
+                    self.pending_header.clear();
+                }
+                self.pending_header.extend_from_slice(annex_b);
+            }
+            return Ok(Vec::new());
+        }
+
+        let combined: Vec<u8>;
+        let packet_bytes: &[u8] = if self.pending_header.is_empty() {
+            annex_b
+        } else {
+            let hdr = std::mem::take(&mut self.pending_header);
+            let total = hdr.len() + annex_b.len();
+            if total > MAX_VIDEO_PACKET_BYTES {
+                bail!("combined video packet size {total} exceeds 16 MiB safety limit");
+            }
+            let _ = i32::try_from(total).context("combined video packet size exceeds i32")?;
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(&hdr);
+            buf.extend_from_slice(annex_b);
+            combined = buf;
+            &combined
+        };
+
+        if !self.decoded_any
+            && self.bootstrap_packets.len() < MAX_BOOTSTRAP_PACKETS
+            && self.bootstrap_bytes.saturating_add(packet_bytes.len()) <= MAX_BOOTSTRAP_BYTES
+        {
+            self.bootstrap_bytes += packet_bytes.len();
+            self.bootstrap_packets.push((packet_bytes.to_vec(), pts));
+        }
 
         let mut frames = Vec::new();
+        if matches!(
+            self.decode_single_packet(packet_bytes, pts, &mut frames)?,
+            DrainOutcome::FallbackRetry
+        ) {
+            self.replay_bootstrap(&mut frames)?;
+        }
+
+        Ok(frames)
+    }
+
+    fn replay_bootstrap(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
+        for _attempt in 0..3 {
+            frames.clear();
+            let buffered = self.bootstrap_packets.clone();
+            let mut retry = false;
+            for (pkt_data, pkt_pts) in &buffered {
+                if matches!(
+                    self.decode_single_packet(pkt_data, *pkt_pts, frames)?,
+                    DrainOutcome::FallbackRetry
+                ) {
+                    retry = true;
+                    break;
+                }
+            }
+            if !retry {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_single_packet(
+        &mut self,
+        annex_b: &[u8],
+        pts: i64,
+        frames: &mut Vec<DecodedFrame>,
+    ) -> Result<DrainOutcome> {
+        let pkt_len = i32::try_from(annex_b.len()).context("video packet size exceeds i32")?;
         let mut send_err = unsafe {
             (*self.pkt).data = annex_b.as_ptr().cast_mut();
             (*self.pkt).size = pkt_len;
@@ -220,8 +300,8 @@ impl VideoDecoder {
         };
 
         if send_err == ffi::GNSH_AVERROR_EAGAIN {
-            if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackRetry) {
-                return self.decode_with_pts(annex_b, pts);
+            if matches!(self.drain_frames(frames)?, DrainOutcome::FallbackRetry) {
+                return Ok(DrainOutcome::FallbackRetry);
             }
             send_err = unsafe {
                 (*self.pkt).data = annex_b.as_ptr().cast_mut();
@@ -234,16 +314,12 @@ impl VideoDecoder {
 
         if send_err < 0 && send_err != ffi::GNSH_AVERROR_EAGAIN {
             if !self.decoded_any && self.fallback_next(&av_err_string(send_err))? {
-                return self.decode_with_pts(annex_b, pts);
+                return Ok(DrainOutcome::FallbackRetry);
             }
             bail!("avcodec_send_packet failed: {}", av_err_string(send_err));
         }
 
-        if matches!(self.drain_frames(&mut frames)?, DrainOutcome::FallbackRetry) {
-            return self.decode_with_pts(annex_b, pts);
-        }
-
-        Ok(frames)
+        self.drain_frames(frames)
     }
 
     fn fallback_next(&mut self, reason: &str) -> Result<bool> {
@@ -262,7 +338,10 @@ impl VideoDecoder {
             }
             HwKind::None => return Ok(false),
         };
-        let next = Self::open_internal(self.codec, next_hw)?;
+        let mut next = Self::open_internal(self.codec, next_hw)?;
+        next.pending_header = std::mem::take(&mut self.pending_header);
+        next.bootstrap_packets = std::mem::take(&mut self.bootstrap_packets);
+        next.bootstrap_bytes = std::mem::take(&mut self.bootstrap_bytes);
         *self = next;
         Ok(true)
     }
@@ -329,7 +408,11 @@ impl VideoDecoder {
                 unsafe { extract_frame(self.frame, is_hdr_codec, transfer_hw)? }
             };
             if let Some(decoded) = decoded {
-                self.decoded_any = true;
+                if !self.decoded_any {
+                    self.decoded_any = true;
+                    self.bootstrap_packets = Vec::new();
+                    self.bootstrap_bytes = 0;
+                }
                 frames.push(decoded);
             }
             unsafe {
@@ -478,6 +561,9 @@ impl VideoDecoder {
             hw_active,
             hw_kind,
             decoded_any: false,
+            pending_header: Vec::new(),
+            bootstrap_packets: Vec::new(),
+            bootstrap_bytes: 0,
         })
     }
 }
@@ -894,10 +980,15 @@ fn validate_plane_layout(
 }
 
 fn copy_plane(src: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u8> {
-    let mut out = vec![0u8; width * rows];
-    for r in 0..rows {
-        let src_row = unsafe { std::slice::from_raw_parts(src.add(r * stride), width) };
-        out[r * width..(r + 1) * width].copy_from_slice(src_row);
+    let mut out = Vec::with_capacity(width * rows);
+    if stride == width {
+        let all = unsafe { std::slice::from_raw_parts(src, width * rows) };
+        out.extend_from_slice(all);
+    } else {
+        for r in 0..rows {
+            let src_row = unsafe { std::slice::from_raw_parts(src.add(r * stride), width) };
+            out.extend_from_slice(src_row);
+        }
     }
     out
 }
@@ -920,6 +1011,38 @@ fn copy_plane_10le_to_u8(
         }
     }
     out
+}
+
+fn is_header_only_annex_b(data: &[u8], codec: MediaCodec) -> bool {
+    let mut i = 0;
+    let mut saw_nal = false;
+    while i + 3 <= data.len() {
+        let sc_len = if data[i..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[i..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let hdr_idx = i + sc_len;
+        if hdr_idx >= data.len() {
+            break;
+        }
+        let b = data[hdr_idx];
+        let is_header = match codec {
+            MediaCodec::H264 => matches!(b & 0x1F, 6 | 7 | 8 | 9 | 13),
+            MediaCodec::Hevc | MediaCodec::HevcHdr => {
+                matches!((b >> 1) & 0x3F, 32 | 33 | 34 | 35 | 39 | 40)
+            }
+        };
+        if !is_header {
+            return false;
+        }
+        saw_nal = true;
+        i = hdr_idx + 1;
+    }
+    saw_nal
 }
 
 fn av_err_string(err: i32) -> String {
@@ -1148,6 +1271,95 @@ mod tests {
                 .expect("D3D12ZeroCopy or fallback initializes");
         let frames = decoder.decode(TEST_H264_IDR).expect("IDR decode ok");
         assert!(!frames.is_empty(), "expected decoded IDR frame");
+        match &frames[0] {
+            DecodedFrame::D3D12(_) => assert!(decoder.is_hw_active()),
+            DecodedFrame::SoftwareNv12 { .. } | DecodedFrame::SoftwareP010 { .. } => {
+                assert!(decoder.is_hw_active());
+            }
+            DecodedFrame::SoftwareYuv420 { .. } => assert!(!decoder.is_hw_active()),
+            DecodedFrame::D3D11(_) => panic!("unexpected D3D11 frame from D3D12ZeroCopy mode"),
+        }
+    }
+
+    #[test]
+    fn d3d12_fallback_replays_split_sps_pps_and_idr_packets() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
+
+        let mut device: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device) }.is_err() {
+            eprintln!("skipping split-header D3D12 fallback test: no D3D12 device available");
+            return;
+        }
+        let dev = device.expect("D3D12CreateDevice populated device");
+        let idr_offset = TEST_H264_IDR
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x01, 0x65])
+            .expect("TEST_H264_IDR contains IDR NAL start code");
+        let (header_pkt, idr_pkt) = TEST_H264_IDR.split_at(idr_offset);
+
+        let mut decoder =
+            VideoDecoder::new_with_mode(MediaCodec::H264, DecoderHardware::D3D12ZeroCopy(dev))
+                .expect("D3D12ZeroCopy or fallback initializes");
+        let pre = decoder
+            .decode_with_pts(header_pkt, 1)
+            .expect("header packet should succeed");
+        assert!(pre.is_empty(), "header-only packet emits no frames");
+
+        let frames = decoder
+            .decode_with_pts(idr_pkt, 2)
+            .expect("split IDR decode should replay header packet across fallback");
+        assert!(
+            !frames.is_empty(),
+            "expected decoded IDR frame after replaying buffered SPS/PPS header"
+        );
+        assert_eq!(frames[0].pts(), 2);
+    }
+
+    const TEST_HEVC_IDR: &[u8] = &[
+        // VPS (0x40), SPS (0x42), PPS (0x44)
+        0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x1E, 0xBA, 0x02, 0x40, 0x00, 0x00,
+        0x00, 0x01, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+        0x00, 0x00, 0x03, 0x00, 0x1E, 0xA0, 0x20, 0x81, 0x05, 0x96, 0xE9, 0x29, 0x30, 0xBC, 0x05,
+        0xA0, 0x20, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x03, 0x03, 0x21, 0x00, 0x00, 0x00,
+        0x01, 0x44, 0x01, 0xC0, 0x73, 0xC0, 0x89, // IDR_N_LP (0x28)
+        0x00, 0x00, 0x01, 0x28, 0x01, 0xAC, 0x76, 0x0D, 0x90, 0x91, 0xD2, 0x38,
+    ];
+
+    #[test]
+    fn d3d12_fallback_replays_split_hevc_vps_sps_pps_and_idr() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
+
+        let mut device: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device) }.is_err() {
+            eprintln!("skipping split-HEVC D3D12 fallback test: no D3D12 device available");
+            return;
+        }
+        let dev = device.expect("D3D12CreateDevice populated device");
+        let idr_offset = TEST_HEVC_IDR
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x01, 0x28])
+            .expect("TEST_HEVC_IDR contains IDR_N_LP NAL start code");
+        let (vps_sps_pps, idr_slice) = TEST_HEVC_IDR.split_at(idr_offset);
+
+        let mut decoder =
+            VideoDecoder::new_with_mode(MediaCodec::Hevc, DecoderHardware::D3D12ZeroCopy(dev))
+                .expect("D3D12ZeroCopy or fallback initializes");
+        let pre = decoder
+            .decode_with_pts(vps_sps_pps, 1)
+            .expect("HEVC VPS/SPS/PPS header packet should succeed");
+        assert!(pre.is_empty(), "header-only packet emits no frames");
+
+        let frames = decoder
+            .decode_with_pts(idr_slice, 2)
+            .expect("split HEVC IDR decode should combine and replay header across fallback");
+        assert!(
+            !frames.is_empty(),
+            "expected decoded HEVC IDR frame after replaying buffered VPS/SPS/PPS header"
+        );
+        assert_eq!(frames[0].pts(), 2);
         match &frames[0] {
             DecodedFrame::D3D12(_) => assert!(decoder.is_hw_active()),
             DecodedFrame::SoftwareNv12 { .. } | DecodedFrame::SoftwareP010 { .. } => {

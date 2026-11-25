@@ -137,6 +137,7 @@ pub struct VulkanPlaceboRenderer {
     ui_textures: HashMap<u64, ffi::pl_tex>,
     ui_passes: HashMap<u64, ffi::pl_pass>,
     active_frame: Cell<Option<ffi::pl_swapchain_frame>>,
+    pending_swap_buffers: Cell<bool>,
     hdr_output_active: Cell<bool>,
     hdr_requested: bool,
     vsync: bool,
@@ -207,6 +208,8 @@ impl VulkanPlaceboRenderer {
             vk_params.instance = (*vk_inst).instance;
             vk_params.get_proc_addr = (*vk_inst).get_proc_addr;
             vk_params.surface = surface.cast();
+            // Execute uploads and rendering on a single queue to avoid cross-queue semaphore stalls on AMD.
+            vk_params.async_transfer = false;
         }
         let mut vk = unsafe { ffi::pl_vulkan_create(log, &vk_params) };
         if vk.is_null() {
@@ -233,6 +236,11 @@ impl VulkanPlaceboRenderer {
             }
             bail!("pl_vulkan_create_swapchain failed");
         }
+        tracing::info!(
+            vsync,
+            swapchain_latency = unsafe { ffi::pl_swapchain_latency(sw) },
+            "Vulkan swapchain configured"
+        );
 
         let mut w = width.max(1) as c_int;
         let mut h = height.max(1) as c_int;
@@ -326,12 +334,21 @@ impl VulkanPlaceboRenderer {
             ui_textures: HashMap::new(),
             ui_passes: HashMap::new(),
             active_frame: Cell::new(None),
+            pending_swap_buffers: Cell::new(false),
             hdr_output_active: Cell::new(false),
             hdr_requested: false,
             vsync,
             width: u32::try_from(w.max(1)).unwrap_or(1),
             height: u32::try_from(h.max(1)).unwrap_or(1),
         })
+    }
+
+    fn flush_swap_buffers(&self) {
+        if self.pending_swap_buffers.replace(false) && !self.sw.is_null() {
+            unsafe {
+                ffi::pl_swapchain_swap_buffers(self.sw);
+            }
+        }
     }
 
     pub fn set_vsync(&mut self, vsync: bool) -> Result<()> {
@@ -342,6 +359,7 @@ impl VulkanPlaceboRenderer {
             bail!("cannot recreate Vulkan swapchain while a frame is active");
         }
 
+        self.flush_swap_buffers();
         let gpu = unsafe { (*self.vk).gpu };
         unsafe {
             ffi::pl_gpu_finish(gpu);
@@ -360,6 +378,11 @@ impl VulkanPlaceboRenderer {
         if sw.is_null() {
             bail!("pl_vulkan_create_swapchain failed while updating VSync");
         }
+        tracing::info!(
+            vsync,
+            swapchain_latency = unsafe { ffi::pl_swapchain_latency(sw) },
+            "Vulkan swapchain configured"
+        );
         self.sw = sw;
         self.vsync = vsync;
 
@@ -629,6 +652,7 @@ impl VideoRenderer for VulkanPlaceboRenderer {
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.flush_swap_buffers();
         let mut w = width.max(1) as c_int;
         let mut h = height.max(1) as c_int;
         if !unsafe { ffi::pl_swapchain_resize(self.sw, &mut w, &mut h) } {
@@ -660,9 +684,12 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         Ok(self.hdr_output_active.get())
     }
 
-    fn wait_for_frame_latency(&self, _timeout_ms: u32) {}
+    fn wait_for_frame_latency(&self, _timeout_ms: u32) {
+        self.flush_swap_buffers();
+    }
 
     fn clear_video_cache(&mut self) {
+        self.flush_swap_buffers();
         let gpu = unsafe { (*self.vk).gpu };
         unsafe {
             ffi::pl_gpu_finish(gpu);
@@ -681,6 +708,7 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         if self.active_frame.get().is_some() {
             return;
         }
+        self.flush_swap_buffers();
         let mut sw_frame: ffi::pl_swapchain_frame = unsafe { std::mem::zeroed() };
         if !unsafe { ffi::pl_swapchain_start_frame(self.sw, &mut sw_frame) } {
             self.active_frame.set(None);
@@ -982,6 +1010,8 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         target.crop = ffi::pl_rect2df { x0, y0, x1, y1 };
 
         let mut params = unsafe { ffi::pl_render_fast_params };
+        params.skip_caching_single_frame = true;
+        params.disable_linear_scaling = true;
         params.upscaler = match options.filter_mode {
             VideoFilterMode::Bilinear => &raw const ffi::pl_filter_bilinear,
             VideoFilterMode::Cas | VideoFilterMode::Fsr1 => &raw const ffi::pl_filter_spline36,
@@ -1019,9 +1049,7 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         if !unsafe { ffi::pl_swapchain_submit_frame(self.sw) } {
             bail!("pl_swapchain_submit_frame failed");
         }
-        unsafe {
-            ffi::pl_swapchain_swap_buffers(self.sw);
-        }
+        self.pending_swap_buffers.set(true);
         Ok(())
     }
 }
@@ -1054,6 +1082,7 @@ impl UiOverlayRenderer for VulkanPlaceboRenderer {
 
 impl Drop for VulkanPlaceboRenderer {
     fn drop(&mut self) {
+        self.flush_swap_buffers();
         let gpu = unsafe { (*self.vk).gpu };
         let inst_ptr = unsafe { (*self.vk_inst).instance.cast::<c_void>() };
         unsafe {
@@ -1108,7 +1137,7 @@ fn build_swapchain_params(
     } else {
         ffi::VkPresentModeKHR_VK_PRESENT_MODE_IMMEDIATE_KHR
     };
-    params.swapchain_depth = 1;
+    params.swapchain_depth = 2;
     params.allow_suboptimal = false;
     params
 }

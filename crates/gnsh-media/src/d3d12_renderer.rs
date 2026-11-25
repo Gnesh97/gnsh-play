@@ -3236,4 +3236,252 @@ mod tests {
         )
         .expect("HDR10 D3D12 PSO set creates");
     }
+
+    #[test]
+    fn headless_d3d12_semiplanar_nv12_renders_nonblack_pixels() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        };
+
+        let Ok((_factory, device)) = create_d3d12_device() else {
+            eprintln!("skipping headless D3D12 semiplanar test: no D3D12 device available");
+            return;
+        };
+        let queue: ID3D12CommandQueue = unsafe {
+            device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Priority: 0,
+                    Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .expect("command queue creates")
+        };
+        let rtv_heap: ID3D12DescriptorHeap = unsafe {
+            device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .expect("RTV heap creates")
+        };
+        let srv_heap: ID3D12DescriptorHeap = unsafe {
+            device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: TOTAL_SRV_SLOTS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("SRV heap creates")
+        };
+        let srv_inc = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let sampler_heap: ID3D12DescriptorHeap = unsafe {
+            device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: 6,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("Sampler heap creates")
+        };
+
+        let shaders = compile_all_shaders().expect("shaders compile");
+        let (video_sig, ui_sig) = create_root_signatures(&device).expect("root sigs create");
+        let pso_sdr = create_pipeline_set(
+            &device,
+            &video_sig,
+            &ui_sig,
+            &shaders,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+        )
+        .expect("SDR PSO set creates");
+
+        let slot0 = create_frame_slot(&device).expect("slot0 creates");
+        let slot1 = create_frame_slot(&device).expect("slot1 creates");
+        let cmd_list: ID3D12GraphicsCommandList = unsafe {
+            device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &slot0.allocator, None)
+                .expect("cmd_list creates")
+        };
+        unsafe {
+            cmd_list.Close().expect("initial cmd_list close");
+        }
+        let fence: ID3D12Fence = unsafe {
+            device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("fence creates")
+        };
+        let fence_event = unsafe { CreateEventW(None, false, false, None).expect("event creates") };
+
+        let mut state = RendererState {
+            backbuffers: [None, None],
+            frames: [slot0, slot1],
+            active_slot: 0,
+            frame_open: false,
+            next_fence_value: 0,
+            pending_decode_waits: Vec::new(),
+            sw_textures: None,
+            sw_semiplanar: None,
+            fsr_src_rt: None,
+            fsr_easu_rt: None,
+            ui_textures: HashMap::new(),
+            ui_next_slot: 0,
+            ui_free_slots: Vec::new(),
+            hdr_output_active: false,
+            swapchain_format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            width: 16,
+            height: 16,
+        };
+
+        let rt = create_texture_2d(
+            &device,
+            16,
+            16,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            None,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        )
+        .expect("RT texture creates");
+        let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        unsafe {
+            device.CreateRenderTargetView(&rt, None, rtv);
+        }
+
+        let row_pitch = align_up(16 * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+        let readback_bytes = row_pitch * 16;
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 0,
+            VisibleNodeMask: 0,
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: readback_bytes as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut readback_opt: Option<ID3D12Resource> = None;
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback_opt,
+                )
+                .expect("readback buffer creates");
+        }
+        let readback = readback_opt.expect("readback buffer populated");
+
+        prepare_frame_slot(
+            &fence,
+            fence_event,
+            &cmd_list,
+            &srv_heap,
+            &sampler_heap,
+            &mut state,
+            0,
+        )
+        .expect("prepare_frame_slot ok");
+        bind_rt_target(&cmd_list, rtv, 16, 16);
+        unsafe {
+            cmd_list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+        }
+
+        let params = compute_video_params(16, 16, 16, 16, 16, 16, 0.0, 0.0, ScaleMode::Stretch);
+        let cb_gpu = upload_constant_struct(&device, &mut state.frames[0], &params).expect("cb");
+        unsafe {
+            cmd_list.SetGraphicsRootSignature(&video_sig);
+            cmd_list.IASetVertexBuffers(0, None);
+            cmd_list.IASetIndexBuffer(None);
+            cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            cmd_list.SetGraphicsRootConstantBufferView(0, cb_gpu);
+            cmd_list.SetGraphicsRootConstantBufferView(1, cb_gpu);
+        }
+
+        let y_plane = [200u8; 16 * 16];
+        let uv_plane = [128u8; 8 * 8 * 2];
+        draw_sw_semiplanar(
+            &device, &cmd_list, &pso_sdr, &srv_heap, srv_inc, &mut state, &y_plane, &uv_plane, 16,
+            16, 16, 16, false,
+        )
+        .expect("draw_sw_semiplanar ok");
+
+        transition_subresources(
+            &cmd_list,
+            &[(
+                &rt,
+                0,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )],
+        );
+        let mut dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        Width: 16,
+                        Height: 16,
+                        Depth: 1,
+                        RowPitch: row_pitch as u32,
+                    },
+                },
+            },
+        };
+        let mut src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(rt.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        unsafe {
+            cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            ManuallyDrop::drop(&mut dst_loc.pResource);
+            ManuallyDrop::drop(&mut src_loc.pResource);
+            cmd_list.Close().expect("cmd_list close");
+            let cmd: ID3D12CommandList = cmd_list.cast().expect("cmd cast");
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            queue.Signal(&fence, 1).expect("queue signal");
+        }
+        wait_for_fence_value(&fence, fence_event, 1).expect("fence wait");
+
+        let mut ptr = std::ptr::null_mut();
+        unsafe {
+            readback.Map(0, None, Some(&mut ptr)).expect("readback map");
+            let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), readback_bytes);
+            let off = 8 * row_pitch + 8 * 4;
+            let (b, g, r) = (bytes[off], bytes[off + 1], bytes[off + 2]);
+            readback.Unmap(0, None);
+            let _ = CloseHandle(fence_event);
+            assert!(
+                b > 170 && g > 170 && r > 170,
+                "expected bright neutral pixel from NV12 Y=200 UV=128, got BGRA=({b}, {g}, {r})"
+            );
+        }
+    }
 }

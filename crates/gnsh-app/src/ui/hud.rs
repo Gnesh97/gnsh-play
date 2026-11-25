@@ -118,6 +118,11 @@ fn render_hud_top_pill(
         ),
         None => ("-- ms".to_string(), "Pending"),
     };
+    let render_ms_text = if stream.render_ms > 0.0 {
+        format!("{:.2} ms", stream.render_ms)
+    } else {
+        "-- ms".to_string()
+    };
     let buf_frames = stream.decoder_lag_frames.load(Ordering::Relaxed);
     let pipe_short = if stream.pipe_p50_ms > 0.0 {
         format!("{:.1} ms", stream.pipe_p50_ms)
@@ -201,7 +206,7 @@ fn render_hud_top_pill(
             filter_badge
         );
         let mut hover = format!(
-            "Renderer: {active_renderer_short}\nPipe: {pipe_full}\nDecode: {decode_ms_text} ({decoder_badge})\nUDP Buf: {udp_buf_text}\nGamepad: {pad_label}\nHaptics: {haptics_label}"
+            "Renderer: {active_renderer_short}\nPipe: {pipe_full}\nDecode: {decode_ms_text} ({decoder_badge})\nRender: {render_ms_text}\nUDP Buf: {udp_buf_text}\nGamepad: {pad_label}\nHaptics: {haptics_label}"
         );
         if let Ok(guard) = stream.haptics_device_label.lock()
             && let Some(ref dev_name) = *guard

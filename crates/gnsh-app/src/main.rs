@@ -822,6 +822,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
             tracing::warn!("Failed updating VSync mode ({vsync}): {err:#}");
         }
 
+        let render_t0 = Instant::now();
         let clear_rgba = if is_streaming {
             [0.0, 0.0, 0.0, 1.0]
         } else {
@@ -882,8 +883,27 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
         match backend.present(vsync) {
             Ok(()) => {
                 last_present = Instant::now();
+                let render_ms = render_t0.elapsed().as_secs_f32() * 1000.0;
                 if let AppMode::Streaming(ref mut stream) = app.mode {
+                    stream.render_ms = render_ms;
                     stream.record_present_latency();
+                    if !stream.logged_pipeline_diag
+                        && stream.frames_decoded.load(Ordering::Relaxed) >= 60
+                    {
+                        stream.logged_pipeline_diag = true;
+                        let decode_ms = stream.current_frame.as_ref().map_or(0.0, |f| f.decode_ms);
+                        let buf_frames = stream.decoder_lag_frames.load(Ordering::Relaxed);
+                        tracing::info!(
+                            renderer = backend.short_label(),
+                            decode_ms,
+                            render_ms,
+                            pipe_p50_ms = stream.pipe_p50_ms,
+                            pipe_p95_ms = stream.pipe_p95_ms,
+                            buf_frames,
+                            vsync,
+                            "Pipeline latency sample"
+                        );
+                    }
                 }
             }
             Err(err) => {
