@@ -89,6 +89,7 @@ jobs:
       - name: Run Clippy
         run: |
           MINGW_WIN="$(cygpath -m /mingw64)"
+          export PATH="$PATH:$(cygpath -u "$CARGO_HOME/bin")"
           export MINGW_PREFIX="$MINGW_WIN"
           export LIBCLANG_PATH="$MINGW_WIN/bin"
           cargo clippy --workspace --all-targets -- -D warnings
@@ -96,6 +97,7 @@ jobs:
       - name: Run non-GPU crate test suites
         run: |
           MINGW_WIN="$(cygpath -m /mingw64)"
+          export PATH="$PATH:$(cygpath -u "$CARGO_HOME/bin")"
           export MINGW_PREFIX="$MINGW_WIN"
           export LIBCLANG_PATH="$MINGW_WIN/bin"
           cargo test -p gnsh-proto -p gnsh-input -p gnsh-app -p gnsh-chiaki-sys
