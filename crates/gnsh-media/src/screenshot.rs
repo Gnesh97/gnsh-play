@@ -1,6 +1,7 @@
 use crate::ffi;
 use crate::video_decoder::{
-    AvFrameGuard, DecodedFrame, av_err_string, copy_plane, validate_plane_layout,
+    AvFrameGuard, DecodedFrame, FrameColorInfo, YuvColorMatrix, av_err_string, copy_plane,
+    validate_plane_layout,
 };
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ pub struct ScreenshotPixels {
     pub width: u32,
     pub height: u32,
     pub is_hdr: bool,
+    pub color_info: FrameColorInfo,
     pub format: ScreenshotPixelFormat,
 }
 
@@ -38,10 +40,17 @@ pub enum ScreenshotPixelFormat {
 
 /// Extracts CPU-accessible YUV planes from any `DecodedFrame` (`D3D11`/`D3D12`/`Vulkan` via `av_hwframe_transfer_data`, or software planes directly).
 pub fn extract_screenshot_pixels(frame: &DecodedFrame) -> Result<ScreenshotPixels> {
+    let color_info = frame.color_info();
     match frame {
-        DecodedFrame::D3D11(f) => unsafe { hw_avframe_to_pixels(f.av_frame.as_ptr(), f.is_hdr) },
-        DecodedFrame::D3D12(f) => unsafe { hw_avframe_to_pixels(f._av_frame.as_ptr(), f.is_hdr) },
-        DecodedFrame::Vulkan(f) => unsafe { hw_avframe_to_pixels(f.av_frame.as_ptr(), f.is_hdr) },
+        DecodedFrame::D3D11(f) => unsafe {
+            hw_avframe_to_pixels(f.av_frame.as_ptr(), f.is_hdr, color_info)
+        },
+        DecodedFrame::D3D12(f) => unsafe {
+            hw_avframe_to_pixels(f._av_frame.as_ptr(), f.is_hdr, color_info)
+        },
+        DecodedFrame::Vulkan(f) => unsafe {
+            hw_avframe_to_pixels(f.av_frame.as_ptr(), f.is_hdr, color_info)
+        },
         DecodedFrame::SoftwareNv12 {
             y,
             uv,
@@ -55,6 +64,7 @@ pub fn extract_screenshot_pixels(frame: &DecodedFrame) -> Result<ScreenshotPixel
             width: *width,
             height: *height,
             is_hdr: *is_hdr,
+            color_info,
             format: ScreenshotPixelFormat::Nv12 {
                 y: y.clone(),
                 uv: uv.clone(),
@@ -75,6 +85,7 @@ pub fn extract_screenshot_pixels(frame: &DecodedFrame) -> Result<ScreenshotPixel
             width: *width,
             height: *height,
             is_hdr: *is_hdr,
+            color_info,
             format: ScreenshotPixelFormat::P010 {
                 y: y.clone(),
                 uv: uv.clone(),
@@ -97,6 +108,7 @@ pub fn extract_screenshot_pixels(frame: &DecodedFrame) -> Result<ScreenshotPixel
             width: *width,
             height: *height,
             is_hdr: *is_hdr,
+            color_info,
             format: ScreenshotPixelFormat::Yuv420 {
                 y: y.clone(),
                 u: u.clone(),
@@ -112,6 +124,7 @@ pub fn extract_screenshot_pixels(frame: &DecodedFrame) -> Result<ScreenshotPixel
 unsafe fn hw_avframe_to_pixels(
     hw_frame: *mut ffi::AVFrame,
     is_hdr: bool,
+    color_info: FrameColorInfo,
 ) -> Result<ScreenshotPixels> {
     if hw_frame.is_null() {
         bail!("hardware AVFrame pointer was null");
@@ -154,6 +167,7 @@ unsafe fn hw_avframe_to_pixels(
             width,
             height,
             is_hdr,
+            color_info,
             format: ScreenshotPixelFormat::Nv12 {
                 y: copy_plane(yp, ys, w, h),
                 uv: copy_plane(uvp, uvs, cw * 2, ch),
@@ -176,6 +190,7 @@ unsafe fn hw_avframe_to_pixels(
             width,
             height,
             is_hdr: true,
+            color_info,
             format: ScreenshotPixelFormat::P010 {
                 y: copy_plane(yp, ys, w * 2, h),
                 uv: copy_plane(uvp, uvs, cw * 4, ch),
@@ -200,6 +215,7 @@ unsafe fn hw_avframe_to_pixels(
             width,
             height,
             is_hdr,
+            color_info,
             format: ScreenshotPixelFormat::Yuv420 {
                 y: copy_plane(yp, ys, w, h),
                 u: copy_plane(up, us, cw, ch),
@@ -347,8 +363,24 @@ fn sws_yuv_to_rgb24(pixels: &ScreenshotPixels) -> Result<Vec<u8>> {
     }
 
     unsafe {
-        let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
-        ffi::sws_setColorspaceDetails(sws, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
+        let src_cs = match pixels.color_info.matrix {
+            YuvColorMatrix::Bt601 => ffi::SWS_CS_ITU601,
+            YuvColorMatrix::Bt709 => ffi::SWS_CS_ITU709,
+            YuvColorMatrix::Bt2020 => ffi::SWS_CS_BT2020,
+        };
+        let src_coeffs = ffi::sws_getCoefficients(src_cs as i32);
+        let dst_coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
+        let src_range = i32::from(pixels.color_info.full_range);
+        ffi::sws_setColorspaceDetails(
+            sws,
+            src_coeffs,
+            src_range,
+            dst_coeffs,
+            1,
+            0,
+            1 << 16,
+            1 << 16,
+        );
     }
 
     let mut rgb = vec![0u8; (pixels.width as usize) * (pixels.height as usize) * 3];
@@ -456,11 +488,18 @@ pub fn save_screenshot_png(pixels: &ScreenshotPixels, path: &Path) -> Result<Pat
                 );
             }
             let row_bytes = (pixels.width as usize) * 3;
-            let dst_stride = (*frame).linesize[0] as usize;
+            let dst_ptr = (*frame).data[0];
+            if dst_ptr.is_null() {
+                bail!("av_frame_get_buffer(PNG) produced null plane");
+            }
+            let dst_stride = usize::try_from((*frame).linesize[0])
+                .ok()
+                .filter(|&s| s >= row_bytes)
+                .context("invalid PNG AVFrame stride")?;
             for r in 0..(pixels.height as usize) {
                 std::ptr::copy_nonoverlapping(
                     rgb.as_ptr().add(r * row_bytes),
-                    (*frame).data[0].add(r * dst_stride),
+                    dst_ptr.add(r * dst_stride),
                     row_bytes,
                 );
             }
@@ -479,7 +518,13 @@ pub fn save_screenshot_png(pixels: &ScreenshotPixels, path: &Path) -> Result<Pat
                     av_err_string(recv_err)
                 );
             }
-            let encoded = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize).to_vec();
+            let pkt_data = (*pkt).data;
+            let pkt_size = usize::try_from((*pkt).size).context("negative PNG AVPacket size")?;
+            if pkt_data.is_null() {
+                ffi::av_packet_unref(pkt);
+                bail!("avcodec_receive_packet(PNG) returned null packet data");
+            }
+            let encoded = std::slice::from_raw_parts(pkt_data, pkt_size).to_vec();
             ffi::av_packet_unref(pkt);
             Ok(encoded)
         }
@@ -555,6 +600,7 @@ mod tests {
             width: 64,
             height: 64,
             is_hdr: false,
+            color_info: FrameColorInfo::default(),
             format: ScreenshotPixelFormat::Nv12 {
                 y: vec![175u8; 64 * 64],
                 uv: vec![42u8; 64 * 32],
@@ -571,6 +617,33 @@ mod tests {
             sdr_rgb[center + 1] > 150 && sdr_rgb[center + 1] > sdr_rgb[center],
             "expected green SDR PNG pixel, got {:?}",
             &sdr_rgb[center..center + 3]
+        );
+
+        // BT.601 Full-range SDR NV12 screenshot preserves matrix + full-range conversion.
+        let bt601_full = ScreenshotPixels {
+            width: 64,
+            height: 64,
+            is_hdr: false,
+            color_info: FrameColorInfo {
+                matrix: YuvColorMatrix::Bt601,
+                full_range: true,
+            },
+            format: ScreenshotPixelFormat::Nv12 {
+                y: vec![200u8; 64 * 64],
+                uv: vec![70u8; 64 * 32],
+                y_stride: 64,
+                uv_stride: 64,
+            },
+        };
+        let bt601_path = dir.join("bt601_full.png");
+        save_screenshot_png(&bt601_full, &bt601_path).expect("save BT.601 full SDR PNG");
+        let (bw, bh, bt601_rgb) = decode_png_rgb24(&bt601_path);
+        assert_eq!((bw, bh), (64, 64));
+        assert!(
+            bt601_rgb[center + 1] > bt601_rgb[center] + 30
+                && bt601_rgb[center + 1] > bt601_rgb[center + 2] + 30,
+            "expected green BT.601 full-range PNG pixel, got {:?}",
+            &bt601_rgb[center..center + 3]
         );
 
         // HDR10 P010 bright green image (64x64)
@@ -590,6 +663,10 @@ mod tests {
             width: 64,
             height: 64,
             is_hdr: true,
+            color_info: FrameColorInfo {
+                matrix: YuvColorMatrix::Bt2020,
+                full_range: false,
+            },
             format: ScreenshotPixelFormat::P010 {
                 y: p010_y,
                 uv: p010_uv,

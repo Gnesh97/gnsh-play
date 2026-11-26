@@ -1,6 +1,6 @@
 pub use crate::renderer::ScaleMode;
-use crate::renderer::{VideoFilterMode, VideoRenderOptions, VideoRenderer};
-use crate::video_decoder::{D3D11Frame, DecodedFrame};
+use crate::renderer::{VideoFilterMode, VideoImageAdjustments, VideoRenderOptions, VideoRenderer};
+use crate::video_decoder::{D3D11Frame, DecodedFrame, FrameColorInfo, YuvColorMatrix};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -41,10 +41,12 @@ use windows::core::{BOOL, Interface as _, PCSTR, s};
 
 pub(crate) const VIDEO_VS_HLSL: &str = r#"
 cbuffer VideoParams : register(b0) {
-    float4 pos_scale;    // xy = scale, zw = offset
-    float4 uv_rect;      // xy = active scale, zw = offset
-    float4 uv_clamp;     // xy = luma max uv, zw = chroma max uv
-    float4 sharp_params; // x = sharpness (0..1), y = 1/tex_w, z = 1/tex_h, w = color mode
+    float4 pos_scale;     // xy = scale, zw = offset
+    float4 uv_rect;       // xy = active scale, zw = offset
+    float4 uv_clamp;      // xy = luma max uv, zw = chroma max uv
+    float4 sharp_params;  // x = sharpness (0..1), y = 1/tex_w, z = 1/tex_h, w = color mode
+    float4 color_grade;   // x = vibrance, y = contrast, z = gamma, w = hdr_sdr_exposure
+    float4 signal_params; // x = matrix (0=709,1=601,2=2020), y = full_range, z = deband, w = chroma_left_u
 };
 
 struct VSOut {
@@ -83,6 +85,18 @@ float3 cas_filter(float3 c, float3 n, float3 s, float3 w, float3 e, float sharpn
     return lerp(c, sharp, saturate(sharpness));
 }
 
+float deband_hash(float2 pos) {
+    return frac(sin(dot(pos, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float3 deband_blend(float3 c, float3 s0, float3 s1, float3 s2, float3 s3, float threshold, float h) {
+    float3 avg = 0.25 * (s0 + s1 + s2 + s3);
+    float3 delta = abs(c - avg);
+    float diff = max(delta.r, max(delta.g, delta.b));
+    float w = smoothstep(threshold, 0.0, diff);
+    return saturate(lerp(c, avg, w) + (h - 0.5) / 255.0);
+}
+
 float3 bt2020_yuv_to_pq(float y, float cb, float cr) {
     float r = y + 1.4746 * cr;
     float g = y - 0.1645531268 * cb - 0.5713531268 * cr;
@@ -95,6 +109,38 @@ float3 bt709_yuv_to_srgb(float y, float cb, float cr) {
     float g = y - 0.187324 * cb - 0.468124 * cr;
     float b = y + 1.8556 * cb;
     return saturate(float3(r, g, b));
+}
+
+float3 bt601_yuv_to_srgb(float y, float cb, float cr) {
+    float r = y + 1.402 * cr;
+    float g = y - 0.344136 * cb - 0.714136 * cr;
+    float b = y + 1.772 * cb;
+    return saturate(float3(r, g, b));
+}
+
+float3 yuv_to_rgb_matrix(float y, float cb, float cr, float matrix_id) {
+    if (matrix_id > 1.5) {
+        return bt2020_yuv_to_pq(y, cb, cr);
+    }
+    if (matrix_id > 0.5) {
+        return bt601_yuv_to_srgb(y, cb, cr);
+    }
+    return bt709_yuv_to_srgb(y, cb, cr);
+}
+
+float3 apply_image_grade(float3 c, float4 grade) {
+    if (abs(grade.z - 1.0) > 1e-4) {
+        c = pow(max(c, 0.0), 1.0 / grade.z);
+    }
+    if (abs(grade.y - 1.0) > 1e-4) {
+        c = saturate((c - 0.5) * grade.y + 0.5);
+    }
+    if (abs(grade.x) > 1e-4) {
+        float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+        float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+        c = saturate(lerp(float3(luma, luma, luma), c, 1.0 + grade.x * (1.0 - sat)));
+    }
+    return saturate(c);
 }
 
 float3 srgb_to_linear(float3 c) {
@@ -131,8 +177,8 @@ float3 srgb_to_bt2020_pq(float3 srgb, float white_nits) {
     return linear_to_pq(lin2020 * (white_nits / 10000.0));
 }
 
-float3 pq_bt2020_to_sdr_srgb(float3 pq) {
-    float3 lin2020 = pq_to_linear(pq) * 40.0;
+float3 pq_bt2020_to_sdr_srgb(float3 pq, float exposure) {
+    float3 lin2020 = pq_to_linear(pq) * (40.0 * max(exposure, 0.1));
     float3 lin709 = max(float3(
          1.660491 * lin2020.r - 0.587641 * lin2020.g - 0.072850 * lin2020.b,
         -0.124550 * lin2020.r + 1.132900 * lin2020.g - 0.008350 * lin2020.b,
@@ -152,6 +198,8 @@ cbuffer VideoParams : register(b0) {
     float4 uv_rect;
     float4 uv_clamp;
     float4 sharp_params;
+    float4 color_grade;
+    float4 signal_params;
 };
 
 struct PSIn {
@@ -161,17 +209,35 @@ struct PSIn {
 
 float3 sample_nv12(float2 uv) {
     float2 uv_y = clamp(uv, float2(0.0, 0.0), uv_clamp.xy);
-    float2 uv_c = clamp(uv, float2(0.0, 0.0), uv_clamp.zw);
+    float2 uv_c = clamp(float2(uv.x + signal_params.w, uv.y), float2(0.0, 0.0), uv_clamp.zw);
     float y_raw = texY.SampleLevel(sampLinear, float3(uv_y, 0.0), 0.0);
     float2 uv_raw = texUV.SampleLevel(sampLinear, float3(uv_c, 0.0), 0.0);
-    float y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
-    float cb = (uv_raw.x - 128.0 / 255.0) * (255.0 / 224.0);
-    float cr = (uv_raw.y - 128.0 / 255.0) * (255.0 / 224.0);
-    return bt709_yuv_to_srgb(y, cb, cr);
+    float y = (signal_params.y > 0.5) ? y_raw : ((y_raw - 16.0 / 255.0) * (255.0 / 219.0));
+    float cb = (signal_params.y > 0.5) ? (uv_raw.x - 128.0 / 255.0) : ((uv_raw.x - 128.0 / 255.0) * (255.0 / 224.0));
+    float cr = (signal_params.y > 0.5) ? (uv_raw.y - 128.0 / 255.0) : ((uv_raw.y - 128.0 / 255.0) * (255.0 / 224.0));
+    return yuv_to_rgb_matrix(y, cb, cr, signal_params.x);
 }
 
 float4 PSMain(PSIn i) : SV_TARGET {
     float3 c = sample_nv12(i.uv);
+    [branch]
+    if (signal_params.z > 0.5) {
+        float h0 = deband_hash(i.pos.xy);
+        float h1 = deband_hash(i.pos.xy + float2(17.0, 31.0));
+        float angle = h0 * 6.2831853;
+        float radius = lerp(3.0, 10.0, h1);
+        float2 off = float2(cos(angle), sin(angle)) * radius * sharp_params.yz;
+        float2 off_p = float2(-off.y, off.x);
+        c = deband_blend(
+            c,
+            sample_nv12(i.uv + off),
+            sample_nv12(i.uv - off),
+            sample_nv12(i.uv + off_p),
+            sample_nv12(i.uv - off_p),
+            14.0 / 255.0,
+            h0
+        );
+    }
     [branch]
     if (sharp_params.x > 0.001) {
         float2 dx = float2(sharp_params.y, 0.0);
@@ -185,6 +251,7 @@ float4 PSMain(PSIn i) : SV_TARGET {
             sharp_params.x
         );
     }
+    c = apply_image_grade(c, color_grade);
     if (sharp_params.w > 0.5) {
         c = srgb_to_bt2020_pq(c, 200.0);
     }
@@ -201,6 +268,8 @@ cbuffer VideoParams : register(b0) {
     float4 uv_rect;
     float4 uv_clamp;
     float4 sharp_params;
+    float4 color_grade;
+    float4 signal_params;
 };
 
 struct PSIn {
@@ -210,17 +279,35 @@ struct PSIn {
 
 float3 sample_p010(float2 uv) {
     float2 uv_y = clamp(uv, float2(0.0, 0.0), uv_clamp.xy);
-    float2 uv_c = clamp(uv, float2(0.0, 0.0), uv_clamp.zw);
+    float2 uv_c = clamp(float2(uv.x + signal_params.w, uv.y), float2(0.0, 0.0), uv_clamp.zw);
     float y_raw = texY.SampleLevel(sampLinear, float3(uv_y, 0.0), 0.0);
     float2 uv_raw = texUV.SampleLevel(sampLinear, float3(uv_c, 0.0), 0.0);
-    float y  = (y_raw    - 4096.0  / 65535.0) * (65535.0 / 56064.0);
-    float cb = (uv_raw.x - 32768.0 / 65535.0) * (65535.0 / 57344.0);
-    float cr = (uv_raw.y - 32768.0 / 65535.0) * (65535.0 / 57344.0);
+    float y = (signal_params.y > 0.5) ? y_raw : ((y_raw - 4096.0 / 65535.0) * (65535.0 / 56064.0));
+    float cb = (signal_params.y > 0.5) ? (uv_raw.x - 32768.0 / 65535.0) : ((uv_raw.x - 32768.0 / 65535.0) * (65535.0 / 57344.0));
+    float cr = (signal_params.y > 0.5) ? (uv_raw.y - 32768.0 / 65535.0) : ((uv_raw.y - 32768.0 / 65535.0) * (65535.0 / 57344.0));
     return bt2020_yuv_to_pq(y, cb, cr);
 }
 
 float4 PSMain(PSIn i) : SV_TARGET {
     float3 c = sample_p010(i.uv);
+    [branch]
+    if (signal_params.z > 0.5) {
+        float h0 = deband_hash(i.pos.xy);
+        float h1 = deband_hash(i.pos.xy + float2(17.0, 31.0));
+        float angle = h0 * 6.2831853;
+        float radius = lerp(3.0, 10.0, h1);
+        float2 off = float2(cos(angle), sin(angle)) * radius * sharp_params.yz;
+        float2 off_p = float2(-off.y, off.x);
+        c = deband_blend(
+            c,
+            sample_p010(i.uv + off),
+            sample_p010(i.uv - off),
+            sample_p010(i.uv + off_p),
+            sample_p010(i.uv - off_p),
+            10.0 / 255.0,
+            h0
+        );
+    }
     [branch]
     if (sharp_params.x > 0.001) {
         float2 dx = float2(sharp_params.y, 0.0);
@@ -237,7 +324,7 @@ float4 PSMain(PSIn i) : SV_TARGET {
     if (sharp_params.w > 0.5) {
         return float4(c, 1.0);
     }
-    return float4(pq_bt2020_to_sdr_srgb(c), 1.0);
+    return float4(apply_image_grade(pq_bt2020_to_sdr_srgb(c, color_grade.w), color_grade), 1.0);
 }
 "#;
 
@@ -249,6 +336,10 @@ pub(crate) struct VideoParams {
     pub(crate) uv_clamp: [f32; 4],
     // x = sharpness (0..=1), y = 1.0/tex_w, z = 1.0/tex_h, w = color mode flag
     pub(crate) sharp_params: [f32; 4],
+    // x = vibrance, y = contrast, z = gamma, w = hdr_sdr_exposure
+    pub(crate) color_grade: [f32; 4],
+    // x = matrix (0=709,1=601,2=2020), y = full_range, z = deband, w = chroma_left_u
+    pub(crate) signal_params: [f32; 4],
 }
 
 impl Default for VideoParams {
@@ -258,6 +349,8 @@ impl Default for VideoParams {
             uv_rect: [1.0, 1.0, 0.0, 0.0],
             uv_clamp: [1.0, 1.0, 1.0, 1.0],
             sharp_params: [0.0, 0.0, 0.0, 0.0],
+            color_grade: [0.0, 1.0, 1.0, 1.0],
+            signal_params: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -272,6 +365,8 @@ cbuffer VideoParams : register(b0) {
     float4 uv_rect;
     float4 uv_clamp;
     float4 sharp_params;
+    float4 color_grade;
+    float4 signal_params;
 };
 
 struct PSIn {
@@ -280,23 +375,41 @@ struct PSIn {
 };
 
 float3 sample_yuv420(float2 uv, bool is_hdr_src) {
-    float2 uvc = saturate(uv);
-    float y_raw = texY.SampleLevel(sampLinear, uvc, 0.0);
+    float2 uvy = saturate(uv);
+    float2 uvc = saturate(float2(uv.x + signal_params.w, uv.y));
+    float y_raw = texY.SampleLevel(sampLinear, uvy, 0.0);
     float u_raw = texU.SampleLevel(sampLinear, uvc, 0.0);
     float v_raw = texV.SampleLevel(sampLinear, uvc, 0.0);
-    float y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
-    float cb = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    float cr = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    if (is_hdr_src) {
-        return bt2020_yuv_to_pq(y, cb, cr);
-    }
-    return bt709_yuv_to_srgb(y, cb, cr);
+    float y = (signal_params.y > 0.5) ? y_raw : ((y_raw - 16.0 / 255.0) * (255.0 / 219.0));
+    float cb = (signal_params.y > 0.5) ? (u_raw - 128.0 / 255.0) : ((u_raw - 128.0 / 255.0) * (255.0 / 224.0));
+    float cr = (signal_params.y > 0.5) ? (v_raw - 128.0 / 255.0) : ((v_raw - 128.0 / 255.0) * (255.0 / 224.0));
+    float mat_id = is_hdr_src ? 2.0 : signal_params.x;
+    return yuv_to_rgb_matrix(y, cb, cr, mat_id);
 }
 
 float4 PSMain(PSIn i) : SV_TARGET {
     // mode: 0 = SDR->SDR, 1 = HDR->SDR (ACES), 2 = HDR->HDR (PQ), 3 = SDR->HDR (200 nits)
     bool is_hdr_src = (sharp_params.w > 0.5 && sharp_params.w < 2.5);
     float3 c = sample_yuv420(i.uv, is_hdr_src);
+    [branch]
+    if (signal_params.z > 0.5) {
+        float h0 = deband_hash(i.pos.xy);
+        float h1 = deband_hash(i.pos.xy + float2(17.0, 31.0));
+        float angle = h0 * 6.2831853;
+        float radius = lerp(3.0, 10.0, h1);
+        float2 off = float2(cos(angle), sin(angle)) * radius * sharp_params.yz;
+        float2 off_p = float2(-off.y, off.x);
+        float thresh = is_hdr_src ? (10.0 / 255.0) : (14.0 / 255.0);
+        c = deband_blend(
+            c,
+            sample_yuv420(i.uv + off, is_hdr_src),
+            sample_yuv420(i.uv - off, is_hdr_src),
+            sample_yuv420(i.uv + off_p, is_hdr_src),
+            sample_yuv420(i.uv - off_p, is_hdr_src),
+            thresh,
+            h0
+        );
+    }
     [branch]
     if (sharp_params.x > 0.001) {
         float2 dx = float2(sharp_params.y, 0.0);
@@ -311,15 +424,15 @@ float4 PSMain(PSIn i) : SV_TARGET {
         );
     }
     if (sharp_params.w > 2.5) {
-        return float4(srgb_to_bt2020_pq(c, 200.0), 1.0);
+        return float4(srgb_to_bt2020_pq(apply_image_grade(c, color_grade), 200.0), 1.0);
     }
     if (sharp_params.w > 1.5) {
         return float4(c, 1.0);
     }
     if (sharp_params.w > 0.5) {
-        return float4(pq_bt2020_to_sdr_srgb(c), 1.0);
+        return float4(apply_image_grade(pq_bt2020_to_sdr_srgb(c, color_grade.w), color_grade), 1.0);
     }
-    return float4(c, 1.0);
+    return float4(apply_image_grade(c, color_grade), 1.0);
 }
 "#;
 
@@ -606,6 +719,13 @@ struct VideoParamsKey {
     sharp_q: u32,
     mode_bits: u32,
     scale_mode: u8,
+    matrix: u8,
+    full_range: bool,
+    deband: bool,
+    vibrance_bits: u32,
+    contrast_bits: u32,
+    gamma_bits: u32,
+    exposure_bits: u32,
 }
 
 pub struct D3D11Renderer {
@@ -1034,6 +1154,8 @@ impl D3D11Renderer {
         options: VideoRenderOptions,
     ) -> Result<()> {
         let (fw, fh, tw, th, d3d_format, color_mode) = self.inspect_frame(frame);
+        let color_info = frame.color_info();
+        let image = options.image.sanitized();
         let sharp = match options.filter_mode {
             VideoFilterMode::Bilinear => 0.0,
             VideoFilterMode::Cas | VideoFilterMode::Fsr1 => options.sharpness.clamp(0.0, 1.0),
@@ -1050,6 +1172,8 @@ impl D3D11Renderer {
                     th,
                     d3d_format,
                     color_mode,
+                    color_info,
+                    image,
                     sharp,
                     options.scale_mode,
                     upscale,
@@ -1074,6 +1198,8 @@ impl D3D11Renderer {
             th,
             d3d_format,
             color_mode,
+            color_info,
+            image,
             sharp,
             options.scale_mode,
             None,
@@ -1140,6 +1266,8 @@ impl D3D11Renderer {
         th: u32,
         d3d_format: Option<DXGI_FORMAT>,
         color_mode: f32,
+        color_info: FrameColorInfo,
+        image: VideoImageAdjustments,
         sharpness: f32,
         scale_mode: ScaleMode,
         target: Option<(&ID3D11RenderTargetView, u32, u32)>,
@@ -1157,6 +1285,11 @@ impl D3D11Renderer {
 
         let sharp = sharpness.clamp(0.0, 1.0);
         let sharp_q = (sharp * 1000.0).round() as u32;
+        let matrix = match color_info.matrix {
+            YuvColorMatrix::Bt709 => 0,
+            YuvColorMatrix::Bt601 => 1,
+            YuvColorMatrix::Bt2020 => 2,
+        };
         let key = VideoParamsKey {
             fw,
             fh,
@@ -1167,10 +1300,18 @@ impl D3D11Renderer {
             sharp_q,
             mode_bits: color_mode.to_bits(),
             scale_mode: scale_mode_key(scale_mode),
+            matrix,
+            full_range: color_info.full_range,
+            deband: image.deband,
+            vibrance_bits: image.vibrance.to_bits(),
+            contrast_bits: image.contrast.to_bits(),
+            gamma_bits: image.gamma.to_bits(),
+            exposure_bits: image.hdr_sdr_exposure.to_bits(),
         };
         if self.last_video_params_key != Some(key) {
             let params = compute_video_params(
-                fw, fh, tw, th, target_w, target_h, sharp, color_mode, scale_mode,
+                fw, fh, tw, th, target_w, target_h, sharp, color_mode, scale_mode, color_info,
+                image,
             );
             unsafe {
                 self.context.UpdateSubresource(
@@ -1259,6 +1400,8 @@ impl D3D11Renderer {
         th: u32,
         d3d_format: Option<DXGI_FORMAT>,
         color_mode: f32,
+        color_info: FrameColorInfo,
+        image: VideoImageAdjustments,
         sharp: f32,
         scale_mode: ScaleMode,
         upscale: bool,
@@ -1293,6 +1436,8 @@ impl D3D11Renderer {
                 th,
                 d3d_format,
                 color_mode,
+                color_info,
+                image,
                 0.0,
                 scale_mode,
                 Some((&easu_rtv, vw, vh)),
@@ -1325,6 +1470,8 @@ impl D3D11Renderer {
             th,
             d3d_format,
             color_mode,
+            color_info,
+            image,
             0.0,
             ScaleMode::Stretch,
             Some((&src_rtv, fw, fh)),
@@ -2030,12 +2177,20 @@ pub(crate) fn compute_video_params(
     sharpness: f32,
     color_mode: f32,
     scale_mode: ScaleMode,
+    color_info: FrameColorInfo,
+    image: VideoImageAdjustments,
 ) -> VideoParams {
     let pos_scale = aspect_scale(frame_w, frame_h, view_w, view_h, scale_mode);
     let tw = tex_w.max(frame_w).max(1) as f32;
     let th = tex_h.max(frame_h).max(1) as f32;
     let fw = frame_w.max(1) as f32;
     let fh = frame_h.max(1) as f32;
+    let clean = image.sanitized();
+    let matrix_id = match color_info.matrix {
+        YuvColorMatrix::Bt709 => 0.0,
+        YuvColorMatrix::Bt601 => 1.0,
+        YuvColorMatrix::Bt2020 => 2.0,
+    };
     VideoParams {
         pos_scale,
         uv_rect: [fw / tw, fh / th, 0.0, 0.0],
@@ -2046,6 +2201,18 @@ pub(crate) fn compute_video_params(
             (fh - 1.0).max(0.0) / th,
         ],
         sharp_params: [sharpness.clamp(0.0, 1.0), 1.0 / tw, 1.0 / th, color_mode],
+        color_grade: [
+            clean.vibrance,
+            clean.contrast,
+            clean.gamma,
+            clean.hdr_sdr_exposure,
+        ],
+        signal_params: [
+            matrix_id,
+            if color_info.full_range { 1.0 } else { 0.0 },
+            if clean.deband { 1.0 } else { 0.0 },
+            0.5 / tw,
+        ],
     }
 }
 
@@ -2161,8 +2328,28 @@ mod tests {
 
     #[test]
     fn computes_padded_surface_uv_crop_and_sharp_params() {
-        let hevc =
-            compute_video_params(1920, 1080, 1920, 1152, 1920, 1080, 1.4, 1.0, ScaleMode::Fit);
+        let hevc = compute_video_params(
+            1920,
+            1080,
+            1920,
+            1152,
+            1920,
+            1080,
+            1.4,
+            1.0,
+            ScaleMode::Fit,
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt601,
+                full_range: true,
+            },
+            VideoImageAdjustments {
+                deband: true,
+                vibrance: 0.35,
+                contrast: 1.1,
+                gamma: 0.95,
+                hdr_sdr_exposure: 1.25,
+            },
+        );
         assert!((hevc.uv_rect[0] - 1.0).abs() < 1e-6);
         assert!((hevc.uv_rect[1] - (1080.0 / 1152.0)).abs() < 1e-6);
         assert!(hevc.uv_clamp[1] < hevc.uv_rect[1]);
@@ -2171,6 +2358,14 @@ mod tests {
         assert!((hevc.sharp_params[1] - (1.0 / 1920.0)).abs() < 1e-6);
         assert!((hevc.sharp_params[2] - (1.0 / 1152.0)).abs() < 1e-6);
         assert!((hevc.sharp_params[3] - 1.0).abs() < 1e-6);
+        assert!((hevc.color_grade[0] - 0.35).abs() < 1e-6);
+        assert!((hevc.color_grade[1] - 1.1).abs() < 1e-6);
+        assert!((hevc.color_grade[2] - 0.95).abs() < 1e-6);
+        assert!((hevc.color_grade[3] - 1.25).abs() < 1e-6);
+        assert_eq!(hevc.signal_params[0], 1.0);
+        assert_eq!(hevc.signal_params[1], 1.0);
+        assert_eq!(hevc.signal_params[2], 1.0);
+        assert!((hevc.signal_params[3] - (0.5 / 1920.0)).abs() < 1e-7);
 
         let h264 = compute_video_params(
             1920,
@@ -2182,8 +2377,13 @@ mod tests {
             -0.2,
             0.0,
             ScaleMode::Stretch,
+            FrameColorInfo::default(),
+            VideoImageAdjustments::default(),
         );
         assert!((h264.uv_rect[1] - (1080.0 / 1088.0)).abs() < 1e-6);
         assert!((h264.sharp_params[0] - 0.0).abs() < 1e-6);
+        assert_eq!(h264.signal_params[0], 0.0);
+        assert_eq!(h264.signal_params[1], 0.0);
+        assert_eq!(h264.signal_params[2], 0.0);
     }
 }

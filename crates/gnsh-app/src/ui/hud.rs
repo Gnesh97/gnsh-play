@@ -51,6 +51,7 @@ pub(crate) fn render_streaming_ui(
                             settings,
                             audio_devices,
                             mic_devices,
+                            hdr_output_active,
                             gamepad_name.is_some(),
                             focus_row,
                             open_keybinds,
@@ -130,24 +131,33 @@ fn render_hud_top_pill(
     mouse_locked: bool,
     focus_row: Option<usize>,
 ) {
-    let (decode_ms_text, decoder_badge) = match &stream.current_frame {
-        Some(info) => (
-            format!("{:.2} ms", info.decode_ms),
-            match &info.frame {
-                gnsh_media::DecodedFrame::D3D12(_) => "D3D12VA",
-                gnsh_media::DecodedFrame::D3D11(_) => "D3D11VA",
-                gnsh_media::DecodedFrame::Vulkan(_) => "VulkanVA",
-                gnsh_media::DecodedFrame::SoftwareNv12 { .. }
-                | gnsh_media::DecodedFrame::SoftwareP010 { .. }
-                    if info.is_hw =>
-                {
-                    "D3D11VA"
-                }
-                _ => "SW",
-            },
-        ),
-        None => ("-- ms".to_string(), "Pending"),
+    let (decode_ms_text, decoder_badge, frame_dims, frame_sig_label) = match &stream.current_frame {
+        Some(info) => {
+            let (fw, fh) = info.frame.dimensions();
+            let bits = info.frame.bit_depth();
+            let color = info.frame.color_info();
+            (
+                format!("{:.2} ms", info.decode_ms),
+                match &info.frame {
+                    gnsh_media::DecodedFrame::D3D12(_) => "D3D12VA",
+                    gnsh_media::DecodedFrame::D3D11(_) => "D3D11VA",
+                    gnsh_media::DecodedFrame::Vulkan(_) => "VulkanVA",
+                    gnsh_media::DecodedFrame::SoftwareNv12 { .. }
+                    | gnsh_media::DecodedFrame::SoftwareP010 { .. }
+                        if info.is_hw =>
+                    {
+                        "D3D11VA"
+                    }
+                    _ => "SW",
+                },
+                Some((fw, fh)),
+                format!("{fw}x{fh} ({bits}-bit {})", color.label()),
+            )
+        }
+        None => ("-- ms".to_string(), "Pending", None, "--".to_string()),
     };
+    let res_text = frame_dims.map_or_else(|| "--".to_string(), |(w, h)| format!("{w}x{h}"));
+    let res_downgraded = frame_dims.is_some_and(|(_, h)| h > 0 && h < stream.expected_height);
     let render_ms_text = if stream.render_ms > 0.0 {
         format!("{:.2} ms", stream.render_ms)
     } else {
@@ -192,7 +202,7 @@ fn render_hud_top_pill(
     } else {
         ""
     };
-    let filter_badge = match settings.filter_mode {
+    let mut filter_badge = match settings.filter_mode {
         VideoFilterMode::Bilinear => String::new(),
         VideoFilterMode::Cas if settings.sharpness_pct > 0 => {
             format!(" · CAS {}%", settings.sharpness_pct)
@@ -203,6 +213,9 @@ fn render_hud_top_pill(
         }
         VideoFilterMode::Fsr1 => " · FSR 1.0".to_string(),
     };
+    if settings.deband {
+        filter_badge.push_str(" · Deband");
+    }
 
     ui.horizontal_wrapped(|ui| {
         ui.label(
@@ -228,7 +241,7 @@ fn render_hud_top_pill(
         }
 
         let summary = format!(
-            "{:.1} FPS · {:.1} Mbps · RTT {:.1} ms · Loss {:.1}% · Pipe {} [{} · {}{}{}]",
+            "{res_text} · {:.1} FPS · {:.1} Mbps · RTT {:.1} ms · Loss {:.1}% · Pipe {} [{} · {}{}{}]",
             stream.fps,
             stream.measured_mbps,
             stream.rtt_ms,
@@ -239,8 +252,12 @@ fn render_hud_top_pill(
             hdr_badge,
             filter_badge
         );
+        let deband_label = if settings.deband { "On" } else { "Off" };
         let mut hover = format!(
-            "Renderer: {active_renderer_short}\nPipe: {pipe_full}\nDecode: {decode_ms_text} ({decoder_badge})\nRender: {render_ms_text}\nUDP Buf: {udp_buf_text}\nGamepad: {pad_label}\nHaptics: {haptics_label}"
+            "Renderer: {active_renderer_short}\nFrame: {frame_sig_label}\nImage: Deband {deband_label} · Vib {:+}% · Con {}% · Gam {:.2}\nPipe: {pipe_full}\nDecode: {decode_ms_text} ({decoder_badge})\nRender: {render_ms_text}\nUDP Buf: {udp_buf_text}\nGamepad: {pad_label}\nHaptics: {haptics_label}",
+            settings.vibrance_pct,
+            settings.contrast_pct,
+            f32::from(settings.gamma_pct) / 100.0,
         );
         if let Ok(guard) = stream.haptics_device_label.lock()
             && let Some(ref dev_name) = *guard
@@ -254,6 +271,15 @@ fn render_hud_top_pill(
                 .color(theme::TEXT_SECONDARY),
         )
         .on_hover_text(hover);
+
+        if res_downgraded {
+            theme::status_pill(
+                ui,
+                theme::WARN_BG,
+                theme::WARN_FG,
+                &format!("Res {res_text}!"),
+            );
+        }
 
         if lost_total > 0 {
             let recent_loss = stream
@@ -291,7 +317,7 @@ fn render_hud_top_pill(
                     mic_label,
                     mic_bg,
                     mic_fg,
-                    hud_focus_border(mic_border, focus_row, 5),
+                    hud_focus_border(mic_border, focus_row, 9),
                 ),
             )
             .on_hover_text(
@@ -312,7 +338,7 @@ fn render_hud_top_pill(
                     "PS Home",
                     theme::SURFACE_RAISED,
                     theme::TEXT_PRIMARY,
-                    hud_focus_border(Some(theme::BORDER_SUBTLE), focus_row, 6),
+                    hud_focus_border(Some(theme::BORDER_SUBTLE), focus_row, 10),
                 ),
             )
             .on_hover_text("Open PS5 Home screen (Home key)")
@@ -363,7 +389,7 @@ fn render_hud_top_pill(
                 "Disconnect",
                 theme::DANGER_SOLID_BG,
                 egui::Color32::WHITE,
-                hud_focus_border(None, focus_row, 8),
+                hud_focus_border(None, focus_row, 12),
             ))
             .clicked()
         {
@@ -379,6 +405,7 @@ fn render_hud_quick_drawer(
     settings: &mut StreamSettings,
     audio_devices: &[String],
     mic_devices: &[String],
+    hdr_output_active: bool,
     gamepad_connected: bool,
     focus_row: Option<usize>,
     open_keybinds: &mut bool,
@@ -399,7 +426,78 @@ fn render_hud_quick_drawer(
 
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        hud_label(ui, "Vol:", focus_row, 3);
+        let deband_label = if focus_row == Some(3) {
+            egui::RichText::new("> Deband")
+                .strong()
+                .color(theme::FOCUS_RING)
+        } else {
+            egui::RichText::new("Deband").color(theme::TEXT_PRIMARY)
+        };
+        ui.checkbox(&mut settings.deband, deband_label)
+            .on_hover_text("Light GPU deband filter to reduce 8-bit compression banding");
+
+        ui.separator();
+        hud_label(ui, "Vib:", focus_row, 4);
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = 72.0;
+            ui.add(
+                egui::Slider::new(&mut settings.vibrance_pct, -50..=100)
+                    .clamping(egui::SliderClamping::Always)
+                    .suffix("%"),
+            )
+            .on_hover_text("Smart vibrance saturation boost (-50% to +100%)");
+        });
+
+        hud_label(ui, "Con:", focus_row, 5);
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = 72.0;
+            ui.add(
+                egui::Slider::new(&mut settings.contrast_pct, 50..=150)
+                    .clamping(egui::SliderClamping::Always)
+                    .suffix("%"),
+            )
+            .on_hover_text("Contrast multiplier (50-150%, default 100%)");
+        });
+
+        hud_label(ui, "Gam:", focus_row, 6);
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = 72.0;
+            ui.add(
+                egui::Slider::new(&mut settings.gamma_pct, 70..=140)
+                    .clamping(egui::SliderClamping::Always)
+                    .custom_formatter(|v, _| format!("{:.2}", v / 100.0)),
+            )
+            .on_hover_text("Gamma response curve (0.70-1.40, default 1.00)");
+        });
+
+        if stream.codec == VideoCodec::HevcHdr && !hdr_output_active {
+            ui.scope(|ui| {
+                ui.spacing_mut().slider_width = 72.0;
+                ui.add(
+                    egui::Slider::new(&mut settings.hdr_sdr_exposure_pct, 50..=200)
+                        .clamping(egui::SliderClamping::Always)
+                        .suffix("%")
+                        .text("Exp"),
+                )
+                .on_hover_text("HDR->SDR tone-mapping exposure (50-200%)");
+            });
+        }
+
+        if ui
+            .add_enabled(
+                settings.has_custom_image_adjustments(),
+                theme::secondary_button("Reset"),
+            )
+            .on_hover_text("Reset Deband, Vibrance, Contrast, Gamma, and Exposure to defaults")
+            .clicked()
+        {
+            settings.reset_image_adjustments();
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        hud_label(ui, "Vol:", focus_row, 7);
         ui.scope(|ui| {
             ui.spacing_mut().slider_width = 76.0;
             ui.add(
@@ -435,7 +533,7 @@ fn render_hud_quick_drawer(
         );
 
         ui.separator();
-        let vsync_label = if focus_row == Some(4) {
+        let vsync_label = if focus_row == Some(8) {
             egui::RichText::new("> VSync")
                 .strong()
                 .color(theme::FOCUS_RING)
@@ -459,7 +557,7 @@ fn render_hud_quick_drawer(
         if ui.add(theme::secondary_button("Keybinds...")).clicked() {
             *open_keybinds = true;
         }
-        let all_settings_btn = if focus_row == Some(7) {
+        let all_settings_btn = if focus_row == Some(11) {
             theme::secondary_button("> All Settings...")
                 .stroke(egui::Stroke::new(1.5, theme::FOCUS_RING))
         } else {

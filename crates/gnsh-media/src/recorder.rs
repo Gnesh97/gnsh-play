@@ -42,8 +42,10 @@ impl MkvMuxer {
         if width == 0 || height == 0 {
             bail!("MkvMuxer requires non-zero video dimensions");
         }
-        if audio_sample_rate == 0 || audio_channels == 0 {
-            bail!("MkvMuxer requires non-zero audio parameters");
+        if !(8_000..=192_000).contains(&audio_sample_rate) || !(1..=8).contains(&audio_channels) {
+            bail!(
+                "MkvMuxer received out-of-range audio parameters ({audio_sample_rate} Hz, {audio_channels} ch)"
+            );
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -284,12 +286,16 @@ impl MkvMuxer {
         let computed_pts_us = if self.audio_samples_written == 0 {
             pts_us.max(0)
         } else {
-            let calc = (self.audio_samples_written * 1_000_000) / i64::from(self.audio_sample_rate);
+            let calc = self.audio_samples_written.saturating_mul(1_000_000)
+                / i64::from(self.audio_sample_rate);
             calc.max(0)
         };
         self.audio_samples_written = self.audio_samples_written.saturating_add(frames);
 
-        let byte_len = samples.len() * 2;
+        let byte_len = samples
+            .len()
+            .checked_mul(2)
+            .context("audio packet size overflow")?;
         let pkt_len = i32::try_from(byte_len).context("audio packet exceeds i32")?;
         let mut pkt = unsafe { ffi::av_packet_alloc() };
         if pkt.is_null() {

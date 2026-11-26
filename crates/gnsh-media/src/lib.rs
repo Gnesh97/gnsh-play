@@ -35,12 +35,13 @@ pub use recorder::{
 };
 pub use renderer::{
     RendererBackend, ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode,
-    VideoRenderOptions, VideoRenderer,
+    VideoImageAdjustments, VideoRenderOptions, VideoRenderer,
 };
 pub use screenshot::{
     ScreenshotPixelFormat, ScreenshotPixels, extract_screenshot_pixels, save_screenshot_png,
 };
 pub use video_decoder::{
-    D3D11Frame, D3D12Frame, DecodedFrame, DecoderHardware, MediaCodec, VideoDecoder, VulkanFrame,
+    D3D11Frame, D3D12Frame, DecodedFrame, DecoderHardware, FrameColorInfo, MediaCodec,
+    VideoDecoder, VulkanFrame, YuvColorMatrix,
 };
 pub use vulkan_renderer::{VulkanPlaceboRenderer, VulkanVideoDevice, compute_placebo_target_rect};

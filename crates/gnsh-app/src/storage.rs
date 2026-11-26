@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 use gnsh_input::KbmBindings;
 use gnsh_media::{
     MAX_REPLAY_BUFFER_SECS, MIN_REPLAY_BUFFER_SECS, RendererBackend, ScaleMode, VideoFilterMode,
+    VideoImageAdjustments,
 };
 use gnsh_proto::{VideoCodec, VideoPreset, clamp_bitrate_kbps};
 use serde::{Deserialize, Serialize};
@@ -369,6 +370,11 @@ mod tests {
             touchpad_touch: true,
             filter_mode: VideoFilterMode::Fsr1,
             sharpness_pct: 250,
+            deband: true,
+            vibrance_pct: 120,
+            contrast_pct: 200,
+            gamma_pct: 200,
+            hdr_sdr_exposure_pct: 250,
             scale_mode: ScaleMode::Zoom,
             renderer_backend: RendererBackend::Vulkan,
             replay_buffer_enabled: true,
@@ -398,6 +404,11 @@ mod tests {
         assert!(loaded.touchpad_touch);
         assert_eq!(loaded.filter_mode, VideoFilterMode::Fsr1);
         assert_eq!(loaded.sharpness_pct, 100);
+        assert!(loaded.deband);
+        assert_eq!(loaded.vibrance_pct, 100);
+        assert_eq!(loaded.contrast_pct, 150);
+        assert_eq!(loaded.gamma_pct, 140);
+        assert_eq!(loaded.hdr_sdr_exposure_pct, 200);
         assert_eq!(loaded.scale_mode, ScaleMode::Zoom);
         assert_eq!(loaded.renderer_backend, RendererBackend::Vulkan);
         assert!(loaded.replay_buffer_enabled);
@@ -441,6 +452,12 @@ mod tests {
         std::fs::write(&path, r#"{"kbm_enabled": true}"#).expect("write missing curve json");
         let defaulted = store.load().expect("load missing curve");
         assert_eq!(defaulted.filter_mode, VideoFilterMode::Bilinear);
+        assert!(!defaulted.deband);
+        assert_eq!(defaulted.vibrance_pct, 0);
+        assert_eq!(defaulted.contrast_pct, 100);
+        assert_eq!(defaulted.gamma_pct, 100);
+        assert_eq!(defaulted.hdr_sdr_exposure_pct, 100);
+        assert!(!defaulted.has_custom_image_adjustments());
         assert!(defaulted.auto_reconnect);
         assert!(!defaulted.wan_profile_enabled);
         assert_eq!(defaulted.renderer_backend, RendererBackend::Auto);
@@ -504,6 +521,11 @@ pub struct StoredSettings {
     pub touchpad_touch: bool,
     pub filter_mode: VideoFilterMode,
     pub sharpness_pct: u8,
+    pub deband: bool,
+    pub vibrance_pct: i8,
+    pub contrast_pct: u8,
+    pub gamma_pct: u8,
+    pub hdr_sdr_exposure_pct: u8,
     pub scale_mode: ScaleMode,
     pub renderer_backend: RendererBackend,
     pub replay_buffer_enabled: bool,
@@ -535,6 +557,11 @@ impl Default for StoredSettings {
             touchpad_touch: false,
             filter_mode: VideoFilterMode::Bilinear,
             sharpness_pct: 0,
+            deband: false,
+            vibrance_pct: 0,
+            contrast_pct: 100,
+            gamma_pct: 100,
+            hdr_sdr_exposure_pct: 100,
             scale_mode: ScaleMode::Fit,
             renderer_backend: RendererBackend::Auto,
             replay_buffer_enabled: false,
@@ -554,6 +581,51 @@ impl Default for StoredSettings {
 }
 
 impl StoredSettings {
+    /// Returns normalized per-frame GPU image adjustments from persisted UI percentages.
+    pub fn image_adjustments(&self) -> VideoImageAdjustments {
+        let contrast_pct = if self.contrast_pct == 0 {
+            100
+        } else {
+            self.contrast_pct
+        };
+        let gamma_pct = if self.gamma_pct == 0 {
+            100
+        } else {
+            self.gamma_pct
+        };
+        let exposure_pct = if self.hdr_sdr_exposure_pct == 0 {
+            100
+        } else {
+            self.hdr_sdr_exposure_pct
+        };
+        VideoImageAdjustments {
+            deband: self.deband,
+            vibrance: f32::from(self.vibrance_pct.clamp(-50, 100)) / 100.0,
+            contrast: f32::from(contrast_pct.clamp(50, 150)) / 100.0,
+            gamma: f32::from(gamma_pct.clamp(70, 140)) / 100.0,
+            hdr_sdr_exposure: f32::from(exposure_pct.clamp(50, 200)) / 100.0,
+        }
+        .sanitized()
+    }
+
+    /// Returns `true` when any deband/color/exposure option differs from its neutral default.
+    pub fn has_custom_image_adjustments(&self) -> bool {
+        self.deband
+            || self.vibrance_pct != 0
+            || self.contrast_pct != 100
+            || self.gamma_pct != 100
+            || self.hdr_sdr_exposure_pct != 100
+    }
+
+    /// Restores deband, vibrance, contrast, gamma, and HDR->SDR exposure to neutral defaults.
+    pub fn reset_image_adjustments(&mut self) {
+        self.deband = false;
+        self.vibrance_pct = 0;
+        self.contrast_pct = 100;
+        self.gamma_pct = 100;
+        self.hdr_sdr_exposure_pct = 100;
+    }
+
     /// Returns the active `(preset, codec, bitrate_kbps)` for LAN or WAN/VPN streaming.
     pub fn effective_stream_profile(&self, use_wan: bool) -> (VideoPreset, VideoCodec, u32) {
         if use_wan && self.wan_profile_enabled {
@@ -583,6 +655,19 @@ fn normalize_settings(settings: &mut StoredSettings) {
     settings.bitrate_kbps = clamp_bitrate_kbps(settings.bitrate_kbps);
     settings.wan_bitrate_kbps = clamp_bitrate_kbps(settings.wan_bitrate_kbps);
     settings.sharpness_pct = settings.sharpness_pct.min(100);
+    settings.vibrance_pct = settings.vibrance_pct.clamp(-50, 100);
+    if settings.contrast_pct == 0 {
+        settings.contrast_pct = 100;
+    }
+    settings.contrast_pct = settings.contrast_pct.clamp(50, 150);
+    if settings.gamma_pct == 0 {
+        settings.gamma_pct = 100;
+    }
+    settings.gamma_pct = settings.gamma_pct.clamp(70, 140);
+    if settings.hdr_sdr_exposure_pct == 0 {
+        settings.hdr_sdr_exposure_pct = 100;
+    }
+    settings.hdr_sdr_exposure_pct = settings.hdr_sdr_exposure_pct.clamp(50, 200);
     if settings.replay_buffer_secs == 0 {
         settings.replay_buffer_secs = 30;
     }
@@ -590,6 +675,15 @@ fn normalize_settings(settings: &mut StoredSettings) {
         .replay_buffer_secs
         .clamp(MIN_REPLAY_BUFFER_SECS, MAX_REPLAY_BUFFER_SECS);
     normalize_device_opt(&mut settings.capture_dir);
+    if settings.capture_dir.as_deref().is_some_and(|s| {
+        let trimmed = s.trim();
+        trimmed.is_empty()
+            || trimmed.chars().any(char::is_control)
+            || trimmed.starts_with("\\\\")
+            || trimmed.starts_with("//")
+    }) {
+        settings.capture_dir = None;
+    }
     settings.volume_pct = settings.volume_pct.min(100);
     settings.kbm_sensitivity_pct = settings.kbm_sensitivity_pct.clamp(1, 100);
     settings.kbm_deadzone_pct = settings.kbm_deadzone_pct.min(40);

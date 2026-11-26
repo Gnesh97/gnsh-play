@@ -290,13 +290,15 @@ impl AppState {
                 ui.separator();
                 ui.add_space(10.0);
 
-                match self.settings_tab {
-                    SettingsTab::Video => {
-                        self.render_settings_video_tab(ui, is_streaming, focus_row)
-                    }
-                    SettingsTab::Audio => self.render_settings_audio_tab(ui, focus_row),
-                    SettingsTab::Input => self.render_settings_input_tab(ui, focus_row),
-                }
+                egui::ScrollArea::vertical()
+                    .max_height(500.0)
+                    .show(ui, |ui| match self.settings_tab {
+                        SettingsTab::Video => {
+                            self.render_settings_video_tab(ui, is_streaming, focus_row)
+                        }
+                        SettingsTab::Audio => self.render_settings_audio_tab(ui, focus_row),
+                        SettingsTab::Input => self.render_settings_input_tab(ui, focus_row),
+                    });
 
                 ui.add_space(14.0);
                 ui.separator();
@@ -373,7 +375,62 @@ impl AppState {
                 render_sharpness_slider(ui, self.settings.filter_mode, &mut self.settings.sharpness_pct);
                 ui.end_row();
 
-                settings_row_label(ui, "Presentation", focus_row, 6);
+                settings_row_label(ui, "Deband", focus_row, 6);
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.settings.deband,
+                        "Reduce 8-bit compression banding",
+                    )
+                    .on_hover_text("Applies a light GPU deband pass before sharpening to clean dark/sky macroblock banding.");
+                    if ui
+                        .add_enabled(
+                            self.settings.has_custom_image_adjustments(),
+                            theme::secondary_button("Reset Image"),
+                        )
+                        .clicked()
+                    {
+                        self.settings.reset_image_adjustments();
+                    }
+                });
+                ui.end_row();
+
+                settings_row_label(ui, "Vibrance", focus_row, 7);
+                ui.add(
+                    egui::Slider::new(&mut self.settings.vibrance_pct, -50..=100)
+                        .clamping(egui::SliderClamping::Always)
+                        .suffix("%"),
+                )
+                .on_hover_text("Smart color saturation boost without oversaturating already-vivid hues (-50% to +100%)");
+                ui.end_row();
+
+                settings_row_label(ui, "Contrast", focus_row, 8);
+                ui.add(
+                    egui::Slider::new(&mut self.settings.contrast_pct, 50..=150)
+                        .clamping(egui::SliderClamping::Always)
+                        .suffix("%"),
+                )
+                .on_hover_text("Midtone contrast multiplier (50-150%, default 100%)");
+                ui.end_row();
+
+                settings_row_label(ui, "Gamma", focus_row, 9);
+                ui.add(
+                    egui::Slider::new(&mut self.settings.gamma_pct, 70..=140)
+                        .clamping(egui::SliderClamping::Always)
+                        .custom_formatter(|v, _| format!("{:.2}", v / 100.0)),
+                )
+                .on_hover_text("Display gamma curve adjustment (0.70-1.40, default 1.00)");
+                ui.end_row();
+
+                settings_row_label(ui, "HDR->SDR Exposure", focus_row, 10);
+                ui.add(
+                    egui::Slider::new(&mut self.settings.hdr_sdr_exposure_pct, 50..=200)
+                        .clamping(egui::SliderClamping::Always)
+                        .suffix("%"),
+                )
+                .on_hover_text("Brightness multiplier when tone-mapping 10-bit HEVC HDR10 streams onto SDR monitors (50-200%)");
+                ui.end_row();
+
+                settings_row_label(ui, "Presentation", focus_row, 11);
                 ui.checkbox(
                     &mut self.settings.vsync,
                     "VSync (tear-free, 1-frame DXGI wait)",
@@ -383,7 +440,7 @@ impl AppState {
                 );
                 ui.end_row();
 
-                settings_row_label(ui, "Auto-Reconnect", focus_row, 7);
+                settings_row_label(ui, "Auto-Reconnect", focus_row, 12);
                 ui.checkbox(
                     &mut self.settings.auto_reconnect,
                     "Retry drops (2s/4s/8s) with LAN -> WAN fallback",
@@ -393,7 +450,7 @@ impl AppState {
                 );
                 ui.end_row();
 
-                settings_row_label(ui, "Renderer", focus_row, 8);
+                settings_row_label(ui, "Renderer", focus_row, 13);
                 ui.horizontal(|ui| {
                     render_renderer_backend_selector(ui, &mut self.settings.renderer_backend);
                     ui.label(
@@ -404,7 +461,7 @@ impl AppState {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, "Replay Buffer", focus_row, 9);
+                settings_row_label(ui, "Replay Buffer", focus_row, 14);
                 ui.horizontal(|ui| {
                     ui.checkbox(
                         &mut self.settings.replay_buffer_enabled,
@@ -426,7 +483,7 @@ impl AppState {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, "Capture Folder", focus_row, 10);
+                settings_row_label(ui, "Capture Folder", focus_row, 15);
                 ui.horizontal(|ui| {
                     let mut custom_dir = self.settings.capture_dir.clone().unwrap_or_default();
                     let edit = egui::TextEdit::singleline(&mut custom_dir)
@@ -451,7 +508,7 @@ impl AppState {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, "WAN Profile", focus_row, 11);
+                settings_row_label(ui, "WAN Profile", focus_row, 16);
                 ui.checkbox(
                     &mut self.settings.wan_profile_enabled,
                     "Use separate stream profile for WAN / VPN connections",
@@ -462,19 +519,19 @@ impl AppState {
                 ui.end_row();
 
                 if self.settings.wan_profile_enabled {
-                    settings_row_label(ui, "WAN Preset", focus_row, 12);
+                    settings_row_label(ui, "WAN Preset", focus_row, 17);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         render_preset_controls(ui, &mut self.settings.wan_preset);
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, "WAN Codec", focus_row, 13);
+                    settings_row_label(ui, "WAN Codec", focus_row, 18);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         render_codec_controls(ui, &mut self.settings.wan_codec);
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, "WAN Bitrate", focus_row, 14);
+                    settings_row_label(ui, "WAN Bitrate", focus_row, 19);
                     ui.add_enabled_ui(!is_streaming, |ui| {
                         ui.add(
                             egui::Slider::new(

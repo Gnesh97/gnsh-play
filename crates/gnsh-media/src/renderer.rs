@@ -41,12 +41,67 @@ pub enum VideoFilterMode {
     Fsr1,
 }
 
+/// Non-destructive color, deband, and tone-mapping adjustments applied during video presentation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoImageAdjustments {
+    pub deband: bool,
+    /// Smart saturation boost (`-0.5..=1.0`, `0.0` = neutral).
+    pub vibrance: f32,
+    /// Contrast multiplier (`0.5..=1.5`, `1.0` = neutral).
+    pub contrast: f32,
+    /// Gamma exponent (`0.7..=1.4`, `1.0` = neutral).
+    pub gamma: f32,
+    /// Exposure multiplier when tone-mapping 10-bit HDR10 onto SDR displays (`0.5..=2.0`, `1.0` = neutral).
+    pub hdr_sdr_exposure: f32,
+}
+
+impl Default for VideoImageAdjustments {
+    fn default() -> Self {
+        Self {
+            deband: false,
+            vibrance: 0.0,
+            contrast: 1.0,
+            gamma: 1.0,
+            hdr_sdr_exposure: 1.0,
+        }
+    }
+}
+
+impl VideoImageAdjustments {
+    /// Clamps every parameter to safe shader bounds and replaces non-finite inputs with defaults.
+    pub fn sanitized(self) -> Self {
+        let clamp_finite = |val: f32, min: f32, max: f32, fallback: f32| -> f32 {
+            if val.is_finite() {
+                val.clamp(min, max)
+            } else {
+                fallback
+            }
+        };
+        Self {
+            deband: self.deband,
+            vibrance: clamp_finite(self.vibrance, -0.5, 1.0, 0.0),
+            contrast: clamp_finite(self.contrast, 0.5, 1.5, 1.0),
+            gamma: clamp_finite(self.gamma, 0.7, 1.4, 1.0),
+            hdr_sdr_exposure: clamp_finite(self.hdr_sdr_exposure, 0.5, 2.0, 1.0),
+        }
+    }
+
+    /// Returns `true` when vibrance, contrast, and gamma are effectively identity.
+    pub fn is_grade_neutral(self) -> bool {
+        let s = self.sanitized();
+        s.vibrance.abs() <= 1e-4
+            && (s.contrast - 1.0).abs() <= 1e-4
+            && (s.gamma - 1.0).abs() <= 1e-4
+    }
+}
+
 /// Per-frame rendering parameters passed to any `VideoRenderer` backend.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoRenderOptions {
     pub filter_mode: VideoFilterMode,
     pub sharpness: f32,
     pub scale_mode: ScaleMode,
+    pub image: VideoImageAdjustments,
 }
 
 impl Default for VideoRenderOptions {
@@ -55,6 +110,7 @@ impl Default for VideoRenderOptions {
             filter_mode: VideoFilterMode::Bilinear,
             sharpness: 0.0,
             scale_mode: ScaleMode::Fit,
+            image: VideoImageAdjustments::default(),
         }
     }
 }
@@ -108,4 +164,31 @@ pub trait VideoRenderer {
     fn draw_video_frame(&mut self, frame: &DecodedFrame, options: VideoRenderOptions)
     -> Result<()>;
     fn present(&self, vsync: bool) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_adjustments_sanitize_and_detect_neutral() {
+        let def = VideoImageAdjustments::default();
+        assert!(def.is_grade_neutral());
+        assert!(!def.deband);
+
+        let dirty = VideoImageAdjustments {
+            deband: true,
+            vibrance: f32::NAN,
+            contrast: 3.0,
+            gamma: 0.1,
+            hdr_sdr_exposure: f32::INFINITY,
+        }
+        .sanitized();
+        assert!(dirty.deband);
+        assert_eq!(dirty.vibrance, 0.0);
+        assert_eq!(dirty.contrast, 1.5);
+        assert_eq!(dirty.gamma, 0.7);
+        assert_eq!(dirty.hdr_sdr_exposure, 1.0);
+        assert!(!dirty.is_grade_neutral());
+    }
 }

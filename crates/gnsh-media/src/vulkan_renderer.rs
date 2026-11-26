@@ -3,7 +3,7 @@ use crate::renderer::{
     ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode, VideoRenderOptions,
     VideoRenderer,
 };
-use crate::video_decoder::{DecodedFrame, VulkanFrame};
+use crate::video_decoder::{DecodedFrame, FrameColorInfo, VulkanFrame, YuvColorMatrix};
 use anyhow::{Context, Result, bail};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -102,23 +102,65 @@ const CAS_HOOK_GLSL: &str = "\
 //!MAXIMUM 1.0
 0.0
 
+//!PARAM vibrance
+//!TYPE DYNAMIC float
+//!MINIMUM -0.5
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM contrast
+//!TYPE DYNAMIC float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM gamma
+//!TYPE DYNAMIC float
+//!MINIMUM 0.7
+//!MAXIMUM 1.4
+1.0
+
+//!PARAM exposure
+//!TYPE DYNAMIC float
+//!MINIMUM 0.5
+//!MAXIMUM 2.0
+1.0
+
 //!HOOK PRE_OUTPUT
 //!BIND HOOKED
-//!DESC gnsh-play CAS
+//!DESC gnsh-play CAS and Image Grade
 vec4 hook() {
     vec4 c0 = HOOKED_tex(HOOKED_pos);
-    vec3 cas_c = c0.rgb;
-    vec3 cas_n = HOOKED_tex(HOOKED_pos + vec2(0.0, -HOOKED_pt.y)).rgb;
-    vec3 cas_s = HOOKED_tex(HOOKED_pos + vec2(0.0,  HOOKED_pt.y)).rgb;
-    vec3 cas_w = HOOKED_tex(HOOKED_pos + vec2(-HOOKED_pt.x, 0.0)).rgb;
-    vec3 cas_e = HOOKED_tex(HOOKED_pos + vec2( HOOKED_pt.x, 0.0)).rgb;
-    vec3 mn = min(cas_c, min(min(cas_n, cas_s), min(cas_w, cas_e)));
-    vec3 mx = max(cas_c, max(max(cas_n, cas_s), max(cas_w, cas_e)));
-    vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
-    float peak = -1.0 / mix(8.0, 5.0, clamp(sharpness, 0.0, 1.0));
-    vec3 weight = amp * peak;
-    vec3 sharp = clamp((cas_c + (cas_n + cas_s + cas_w + cas_e) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);
-    return vec4(mix(cas_c, sharp, clamp(sharpness, 0.0, 1.0)), c0.a);
+    vec3 c = c0.rgb;
+    if (sharpness > 0.001) {
+        vec3 cas_n = HOOKED_tex(HOOKED_pos + vec2(0.0, -HOOKED_pt.y)).rgb;
+        vec3 cas_s = HOOKED_tex(HOOKED_pos + vec2(0.0,  HOOKED_pt.y)).rgb;
+        vec3 cas_w = HOOKED_tex(HOOKED_pos + vec2(-HOOKED_pt.x, 0.0)).rgb;
+        vec3 cas_e = HOOKED_tex(HOOKED_pos + vec2( HOOKED_pt.x, 0.0)).rgb;
+        vec3 mn = min(c, min(min(cas_n, cas_s), min(cas_w, cas_e)));
+        vec3 mx = max(c, max(max(cas_n, cas_s), max(cas_w, cas_e)));
+        vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+        float peak = -1.0 / mix(8.0, 5.0, clamp(sharpness, 0.0, 1.0));
+        vec3 weight = amp * peak;
+        vec3 sharp = clamp((c + (cas_n + cas_s + cas_w + cas_e) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);
+        c = mix(c, sharp, clamp(sharpness, 0.0, 1.0));
+    }
+    if (abs(exposure - 1.0) > 1e-4) {
+        vec3 lin = pow(max(c, vec3(0.0)), vec3(2.2)) * max(exposure, 0.1);
+        c = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
+    }
+    if (abs(gamma - 1.0) > 1e-4) {
+        c = pow(max(c, vec3(0.0)), vec3(1.0 / gamma));
+    }
+    if (abs(contrast - 1.0) > 1e-4) {
+        c = clamp((c - 0.5) * contrast + 0.5, 0.0, 1.0);
+    }
+    if (abs(vibrance) > 1e-4) {
+        float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+        c = clamp(mix(vec3(luma), c, 1.0 + vibrance * (1.0 - sat)), 0.0, 1.0);
+    }
+    return vec4(clamp(c, 0.0, 1.0), c0.a);
 }
 ";
 
@@ -232,8 +274,16 @@ unsafe fn create_pl_vulkan_with_video(
     surface: ffi::VkSurfaceKHR,
     allow_software: bool,
 ) -> ffi::pl_vulkan {
-    let mut opt_count: c_int = 0;
-    let opt_exts = unsafe { ffi::av_vk_get_optional_device_extensions(&mut opt_count) };
+    // Request only Vulkan Video decode extensions; forwarding FFmpeg's full list enables
+    // VK_EXT_shader_object, which breaks libplacebo's pl_pass_run raster pass on AMD Windows.
+    let video_opt_exts: [*const c_char; 6] = [
+        c"VK_KHR_video_queue".as_ptr(),
+        c"VK_KHR_video_decode_queue".as_ptr(),
+        c"VK_KHR_video_decode_h264".as_ptr(),
+        c"VK_KHR_video_decode_h265".as_ptr(),
+        c"VK_KHR_video_maintenance1".as_ptr(),
+        c"VK_KHR_video_maintenance2".as_ptr(),
+    ];
     let mut vk_params = unsafe { ffi::pl_vulkan_default_params };
     unsafe {
         vk_params.instance = (*vk_inst).instance;
@@ -246,17 +296,9 @@ unsafe fn create_pl_vulkan_with_video(
         vk_params.extra_queues =
             ffi::VkQueueFlagBits_VK_QUEUE_VIDEO_DECODE_BIT_KHR as ffi::VkQueueFlags;
     }
-    if !opt_exts.is_null() && opt_count > 0 {
-        vk_params.opt_extensions = opt_exts.cast_const();
-        vk_params.num_opt_extensions = opt_count;
-    }
-    let vk = unsafe { ffi::pl_vulkan_create(log, &vk_params) };
-    if !opt_exts.is_null() {
-        unsafe {
-            ffi::av_free(opt_exts.cast());
-        }
-    }
-    vk
+    vk_params.opt_extensions = video_opt_exts.as_ptr();
+    vk_params.num_opt_extensions = video_opt_exts.len() as c_int;
+    unsafe { ffi::pl_vulkan_create(log, &vk_params) }
 }
 
 unsafe fn probe_vulkan_video_device(
@@ -1298,6 +1340,7 @@ impl VideoRenderer for VulkanPlaceboRenderer {
         }
 
         src_frame.num_planes = used_planes as c_int;
+        apply_frame_color_info(&mut src_frame.repr, frame.color_info());
         src_frame.color = if is_hdr {
             unsafe { ffi::pl_color_space_hdr10 }
         } else {
@@ -1320,7 +1363,16 @@ impl VideoRenderer for VulkanPlaceboRenderer {
             compute_placebo_target_rect(fw, fh, target_w, target_h, options.scale_mode);
         target.crop = ffi::pl_rect2df { x0, y0, x1, y1 };
 
-        render_pl_frame(self.renderer, self.cas_hook, &src_frame, &target, options)
+        let target_is_hdr = unsafe { ffi::pl_color_space_is_hdr(&target.color) };
+        render_pl_frame(
+            self.renderer,
+            self.cas_hook,
+            &src_frame,
+            &target,
+            options,
+            is_hdr,
+            target_is_hdr,
+        )
     }
 
     fn present(&self, _vsync: bool) -> Result<()> {
@@ -1407,12 +1459,27 @@ impl Drop for VulkanPlaceboRenderer {
     }
 }
 
+fn apply_frame_color_info(repr: &mut ffi::pl_color_repr, info: FrameColorInfo) {
+    repr.sys = match info.matrix {
+        YuvColorMatrix::Bt601 => ffi::pl_color_system_PL_COLOR_SYSTEM_BT_601,
+        YuvColorMatrix::Bt709 => ffi::pl_color_system_PL_COLOR_SYSTEM_BT_709,
+        YuvColorMatrix::Bt2020 => ffi::pl_color_system_PL_COLOR_SYSTEM_BT_2020_NC,
+    };
+    repr.levels = if info.full_range {
+        ffi::pl_color_levels_PL_COLOR_LEVELS_FULL
+    } else {
+        ffi::pl_color_levels_PL_COLOR_LEVELS_LIMITED
+    };
+}
+
 fn render_pl_frame(
     renderer: ffi::pl_renderer,
     cas_hook: *const ffi::pl_hook,
     src_frame: &ffi::pl_frame,
     target: &ffi::pl_frame,
     options: VideoRenderOptions,
+    is_hdr: bool,
+    target_is_hdr: bool,
 ) -> Result<()> {
     let mut params = unsafe { ffi::pl_render_fast_params };
     params.skip_caching_single_frame = true;
@@ -1421,19 +1488,62 @@ fn render_pl_frame(
         VideoFilterMode::Bilinear => &raw const ffi::pl_filter_bilinear,
         VideoFilterMode::Cas | VideoFilterMode::Fsr1 => &raw const ffi::pl_filter_spline36,
     };
+    let image = options.image.sanitized();
+    let mut deband_params = unsafe { ffi::pl_deband_default_params };
+    if image.deband {
+        deband_params.iterations = 1;
+        deband_params.threshold = 3.0;
+        deband_params.radius = 12.0;
+        deband_params.grain = 0.0;
+        params.deband_params = &raw const deband_params;
+    }
+
     let hook_ptrs = [cas_hook];
-    let sharp = options.sharpness.clamp(0.0, 1.0);
-    if !matches!(options.filter_mode, VideoFilterMode::Bilinear)
-        && sharp > 0.001
-        && !cas_hook.is_null()
-    {
+    let sharp = if matches!(options.filter_mode, VideoFilterMode::Bilinear) {
+        0.0
+    } else {
+        options.sharpness.clamp(0.0, 1.0)
+    };
+    let is_hdr_to_sdr = is_hdr && !target_is_hdr;
+    let is_hdr_passthrough = is_hdr && target_is_hdr;
+    let exposure = if is_hdr_to_sdr {
+        image.hdr_sdr_exposure
+    } else {
+        1.0
+    };
+    let (vibrance, contrast, gamma) = if is_hdr_passthrough {
+        (0.0, 1.0, 1.0)
+    } else {
+        (image.vibrance, image.contrast, image.gamma)
+    };
+    let need_hook = !cas_hook.is_null()
+        && (sharp > 0.001
+            || (!is_hdr_passthrough && !image.is_grade_neutral())
+            || (exposure - 1.0).abs() > 1e-4);
+    if need_hook {
         unsafe {
             let hook_ref = &*cas_hook;
-            if hook_ref.num_parameters > 0
-                && !hook_ref.parameters.is_null()
-                && !(*hook_ref.parameters).data.is_null()
-            {
-                (*(*hook_ref.parameters).data).f = sharp;
+            if hook_ref.num_parameters > 0 && !hook_ref.parameters.is_null() {
+                let param_slice = std::slice::from_raw_parts(
+                    hook_ref.parameters,
+                    hook_ref.num_parameters as usize,
+                );
+                for p in param_slice {
+                    if p.name.is_null() || p.data.is_null() {
+                        continue;
+                    }
+                    let val = match CStr::from_ptr(p.name).to_bytes() {
+                        b"sharpness" => Some(sharp),
+                        b"vibrance" => Some(vibrance),
+                        b"contrast" => Some(contrast),
+                        b"gamma" => Some(gamma),
+                        b"exposure" => Some(exposure),
+                        _ => None,
+                    };
+                    if let Some(v) = val {
+                        (*p.data).f = v;
+                    }
+                }
             }
         }
         params.hooks = hook_ptrs.as_ptr();
@@ -1643,9 +1753,14 @@ unsafe fn render_vulkan_zero_copy_frame(
     }
 
     if !src_frame.planes[0].texture.is_null() {
-        repr.bits.sample_depth =
+        let sample_depth =
             unsafe { (*(*src_frame.planes[0].texture).params.format).component_depth[0] };
+        repr.bits.sample_depth = sample_depth;
+        if repr.bits.color_depth == 0 {
+            repr.bits.color_depth = sample_depth;
+        }
     }
+    apply_frame_color_info(&mut repr, vk_frame.color_info);
     src_frame.repr = repr;
     src_frame.color = if vk_frame.is_hdr {
         unsafe { ffi::pl_color_space_hdr10 }
@@ -1701,7 +1816,16 @@ unsafe fn render_vulkan_zero_copy_frame(
         }
     }
 
-    let render_res = render_pl_frame(renderer, cas_hook, &src_frame, target, options);
+    let target_is_hdr = unsafe { ffi::pl_color_space_is_hdr(&target.color) };
+    let render_res = render_pl_frame(
+        renderer,
+        cas_hook,
+        &src_frame,
+        target,
+        options,
+        vk_frame.is_hdr,
+        target_is_hdr,
+    );
 
     for (n, wrapped) in wrapped_planes.iter().copied().enumerate().take(sem_count) {
         let tex = if !planar_tex.is_null() {
@@ -1833,6 +1957,7 @@ unsafe extern "C" fn placebo_log_cb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::renderer::VideoImageAdjustments;
 
     #[test]
     fn computes_placebo_target_rects_for_all_scale_modes() {
@@ -1903,7 +2028,10 @@ mod tests {
                 (ffi::pl_fmt_caps_PL_FMT_CAP_RENDERABLE
                     | ffi::pl_fmt_caps_PL_FMT_CAP_BLENDABLE
                     | ffi::pl_fmt_caps_PL_FMT_CAP_SAMPLEABLE
-                    | ffi::pl_fmt_caps_PL_FMT_CAP_LINEAR) as ffi::pl_fmt_caps,
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_LINEAR
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_BLITTABLE
+                    | ffi::pl_fmt_caps_PL_FMT_CAP_HOST_READABLE)
+                    as ffi::pl_fmt_caps,
             )
         };
         let vert_pos_fmt =
@@ -1978,16 +2106,38 @@ mod tests {
         );
         unsafe {
             assert!(
-                (*cas_hook).num_parameters >= 1 && !(*cas_hook).parameters.is_null(),
-                "CAS hook should expose dynamic sharpness parameter"
+                (*cas_hook).num_parameters >= 5 && !(*cas_hook).parameters.is_null(),
+                "CAS hook should expose sharpness, vibrance, contrast, gamma, exposure parameters"
             );
-            let data = (*(*cas_hook).parameters).data;
+            let params = std::slice::from_raw_parts(
+                (*cas_hook).parameters,
+                (*cas_hook).num_parameters as usize,
+            );
+            for p in params {
+                assert!(!p.name.is_null() && !p.data.is_null());
+                match CStr::from_ptr(p.name).to_bytes() {
+                    b"sharpness" => (*p.data).f = 0.5,
+                    b"vibrance" => (*p.data).f = 0.25,
+                    b"contrast" => (*p.data).f = 1.1,
+                    b"gamma" => (*p.data).f = 0.95,
+                    b"exposure" => (*p.data).f = 1.15,
+                    _ => {}
+                }
+            }
             assert!(
-                !data.is_null(),
-                "CAS parameter data pointer should be valid"
+                ((*(*cas_hook).parameters).data.as_ref().unwrap().f - 0.5).abs() < f32::EPSILON
             );
-            (*data).f = 0.5;
-            assert!(((*data).f - 0.5).abs() < f32::EPSILON);
+
+            let mut repr = ffi::pl_color_repr_hdtv;
+            apply_frame_color_info(
+                &mut repr,
+                FrameColorInfo {
+                    matrix: YuvColorMatrix::Bt601,
+                    full_range: true,
+                },
+            );
+            assert_eq!(repr.sys, ffi::pl_color_system_PL_COLOR_SYSTEM_BT_601);
+            assert_eq!(repr.levels, ffi::pl_color_levels_PL_COLOR_LEVELS_FULL);
 
             let mut src_tex_params: ffi::pl_tex_params = std::mem::zeroed();
             src_tex_params.w = 4;
@@ -2037,7 +2187,96 @@ mod tests {
             let ok = ffi::pl_render_image(renderer, &src_frame, &dst_frame, &render_params);
             assert!(ok, "pl_render_image with CAS_HOOK_GLSL should succeed");
 
+            // Render a textured triangle via the egui GLSL raster pass and read back to ensure pixels are drawn.
+            let mut ui_src_params: ffi::pl_tex_params = std::mem::zeroed();
+            ui_src_params.w = 16;
+            ui_src_params.h = 16;
+            ui_src_params.format = target_fmt;
+            ui_src_params.sampleable = true;
+            ui_src_params.host_writable = true;
+            let mut ui_src_tex = ffi::pl_tex_create(gpu, &ui_src_params);
+            assert!(!ui_src_tex.is_null(), "headless egui src_tex create");
+            let white = [255u8; 16 * 16 * 4];
+            let mut up: ffi::pl_tex_transfer_params = std::mem::zeroed();
+            up.tex = ui_src_tex;
+            up.row_pitch = 16 * 4;
+            up.ptr = white.as_ptr().cast_mut().cast();
+            assert!(ffi::pl_tex_upload(gpu, &up), "headless egui src upload");
+
+            let mut ui_dst_params: ffi::pl_tex_params = std::mem::zeroed();
+            ui_dst_params.w = 16;
+            ui_dst_params.h = 16;
+            ui_dst_params.format = target_fmt;
+            ui_dst_params.renderable = true;
+            ui_dst_params.blit_dst = true;
+            ui_dst_params.host_readable = true;
+            let mut ui_dst_tex = ffi::pl_tex_create(gpu, &ui_dst_params);
+            assert!(!ui_dst_tex.is_null(), "headless egui dst_tex create");
+            ffi::pl_tex_clear_ex(
+                gpu,
+                ui_dst_tex,
+                ffi::pl_clear_color {
+                    f: [0.0, 0.0, 0.0, 1.0],
+                },
+            );
+
+            let mut verts = Vec::with_capacity(60);
+            for (x, y, u, v) in [
+                (0.0f32, 0.0f32, 0.0f32, 0.0f32),
+                (32.0, 0.0, 1.0, 0.0),
+                (0.0, 32.0, 0.0, 1.0),
+            ] {
+                verts.extend_from_slice(&x.to_ne_bytes());
+                verts.extend_from_slice(&y.to_ne_bytes());
+                verts.extend_from_slice(&u.to_ne_bytes());
+                verts.extend_from_slice(&v.to_ne_bytes());
+                verts.extend_from_slice(&[0u8, 255, 0, 255]);
+            }
+            let indices: [u32; 3] = [0, 1, 2];
+            let mut push = UiPushConstants {
+                screen_size: [16.0, 16.0],
+                hdr_paper_white_nits: 0.0,
+                flipped: 0.0,
+            };
+            let mut binding = ffi::pl_desc_binding {
+                object: ui_src_tex.cast(),
+                address_mode: ffi::pl_tex_address_mode_PL_TEX_ADDRESS_CLAMP,
+                sample_mode: ffi::pl_tex_sample_mode_PL_TEX_SAMPLE_LINEAR,
+            };
+            let mut run: ffi::pl_pass_run_params = std::mem::zeroed();
+            run.pass = pass;
+            run.desc_bindings = &raw mut binding;
+            run.push_constants = (&raw mut push).cast();
+            run.target = ui_dst_tex;
+            run.viewport = ffi::pl_rect2d {
+                x0: 0,
+                y0: 0,
+                x1: 16,
+                y1: 16,
+            };
+            run.scissors = run.viewport;
+            run.vertex_count = 3;
+            run.vertex_data = verts.as_ptr().cast();
+            run.index_data = indices.as_ptr().cast();
+            run.index_fmt = ffi::pl_index_format_PL_INDEX_UINT32;
+            ffi::pl_pass_run(gpu, &run);
             ffi::pl_gpu_finish(gpu);
+
+            let mut out = [0u8; 16 * 16 * 4];
+            let mut dl: ffi::pl_tex_transfer_params = std::mem::zeroed();
+            dl.tex = ui_dst_tex;
+            dl.row_pitch = 16 * 4;
+            dl.ptr = out.as_mut_ptr().cast();
+            assert!(ffi::pl_tex_download(gpu, &dl), "headless egui readback");
+            let center = (8 * 16 + 8) * 4;
+            assert!(
+                out[center + 1] > 200,
+                "egui raster pass must produce visible green pixel, got {:?}",
+                &out[center..center + 4]
+            );
+
+            ffi::pl_tex_destroy(gpu, &mut ui_src_tex);
+            ffi::pl_tex_destroy(gpu, &mut ui_dst_tex);
             ffi::pl_tex_destroy(gpu, &mut src_tex);
             ffi::pl_tex_destroy(gpu, &mut dst_tex);
             ffi::pl_mpv_user_shader_destroy(&mut cas_hook);
@@ -2256,6 +2495,7 @@ mod tests {
                         filter_mode: VideoFilterMode::Cas,
                         sharpness: 0.5,
                         scale_mode: ScaleMode::Fit,
+                        image: VideoImageAdjustments::default(),
                     },
                 )
                 .expect("zero-copy Vulkan Video render succeeds");

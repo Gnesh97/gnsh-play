@@ -4,10 +4,10 @@ use crate::d3d11_renderer::{
     compile_hlsl, compute_rcas_bounds, compute_video_params, should_run_fsr_easu,
 };
 use crate::renderer::{
-    ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode, VideoRenderOptions,
-    VideoRenderer,
+    ScaleMode, UiMeshDraw, UiOverlayRenderer, UiTextureWrap, VideoFilterMode,
+    VideoImageAdjustments, VideoRenderOptions, VideoRenderer,
 };
-use crate::video_decoder::{AvFrameGuard, D3D12Frame, DecodedFrame};
+use crate::video_decoder::{AvFrameGuard, D3D12Frame, DecodedFrame, FrameColorInfo};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -833,6 +833,8 @@ impl D3D12Renderer {
         }
         let (fw, fh, tw, th, d3d_format, color_mode) =
             inspect_frame(frame, state.hdr_output_active);
+        let color_info = frame.color_info();
+        let image = options.image.sanitized();
         let sharp = match options.filter_mode {
             VideoFilterMode::Bilinear => 0.0,
             VideoFilterMode::Cas | VideoFilterMode::Fsr1 => options.sharpness.clamp(0.0, 1.0),
@@ -850,6 +852,8 @@ impl D3D12Renderer {
                     th,
                     d3d_format,
                     color_mode,
+                    color_info,
+                    image,
                     sharp,
                     options.scale_mode,
                     upscale,
@@ -871,6 +875,8 @@ impl D3D12Renderer {
             th,
             d3d_format,
             color_mode,
+            color_info,
+            image,
             sharp,
             options.scale_mode,
             None,
@@ -887,6 +893,8 @@ impl D3D12Renderer {
         th: u32,
         d3d_format: Option<DXGI_FORMAT>,
         color_mode: f32,
+        color_info: FrameColorInfo,
+        image: VideoImageAdjustments,
         sharp: f32,
         scale_mode: ScaleMode,
         upscale: bool,
@@ -947,6 +955,8 @@ impl D3D12Renderer {
                 th,
                 d3d_format,
                 color_mode,
+                color_info,
+                image,
                 0.0,
                 scale_mode,
                 Some(easu_meta),
@@ -1017,6 +1027,8 @@ impl D3D12Renderer {
             th,
             d3d_format,
             color_mode,
+            color_info,
+            image,
             0.0,
             ScaleMode::Stretch,
             Some(src_meta),
@@ -1144,6 +1156,8 @@ impl D3D12Renderer {
         th: u32,
         d3d_format: Option<DXGI_FORMAT>,
         color_mode: f32,
+        color_info: FrameColorInfo,
+        image: VideoImageAdjustments,
         sharpness: f32,
         scale_mode: ScaleMode,
         target: Option<RenderTargetTex>,
@@ -1177,6 +1191,8 @@ impl D3D12Renderer {
             sharpness.clamp(0.0, 1.0),
             color_mode,
             scale_mode,
+            color_info,
+            image,
         );
         let cb_gpu =
             upload_constant_struct(&self.device, &mut state.frames[state.active_slot], &params)?;
@@ -3193,6 +3209,7 @@ fn gpu_handle_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video_decoder::YuvColorMatrix;
 
     #[test]
     fn align_up_256_and_512_math() {
@@ -3409,7 +3426,19 @@ mod tests {
             cmd_list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
         }
 
-        let params = compute_video_params(16, 16, 16, 16, 16, 16, 0.0, 0.0, ScaleMode::Stretch);
+        let params = compute_video_params(
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            0.0,
+            0.0,
+            ScaleMode::Stretch,
+            FrameColorInfo::default(),
+            VideoImageAdjustments::default(),
+        );
         let cb_gpu = upload_constant_struct(&device, &mut state.frames[0], &params).expect("cb");
         unsafe {
             cmd_list.SetGraphicsRootSignature(&video_sig);
@@ -3478,10 +3507,117 @@ mod tests {
             let off = 8 * row_pitch + 8 * 4;
             let (b, g, r) = (bytes[off], bytes[off + 1], bytes[off + 2]);
             readback.Unmap(0, None);
-            let _ = CloseHandle(fence_event);
             assert!(
                 b > 170 && g > 170 && r > 170,
                 "expected bright neutral pixel from NV12 Y=200 UV=128, got BGRA=({b}, {g}, {r})"
+            );
+        }
+
+        // Second pass on same RT verifying Deband + BT.601 + Contrast/Vibrance/Gamma execute cleanly.
+        prepare_frame_slot(
+            &fence,
+            fence_event,
+            &cmd_list,
+            &srv_heap,
+            &sampler_heap,
+            &mut state,
+            1,
+        )
+        .expect("prepare_frame_slot 1 ok");
+        bind_rt_target(&cmd_list, rtv, 16, 16);
+        let graded_params = compute_video_params(
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            0.4,
+            0.0,
+            ScaleMode::Stretch,
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt601,
+                full_range: true,
+            },
+            VideoImageAdjustments {
+                deband: true,
+                vibrance: 0.4,
+                contrast: 1.15,
+                gamma: 1.1,
+                hdr_sdr_exposure: 1.0,
+            },
+        );
+        let graded_cb =
+            upload_constant_struct(&device, &mut state.frames[1], &graded_params).expect("cb 1");
+        unsafe {
+            cmd_list.SetGraphicsRootSignature(&video_sig);
+            cmd_list.IASetVertexBuffers(0, None);
+            cmd_list.IASetIndexBuffer(None);
+            cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            cmd_list.SetGraphicsRootConstantBufferView(0, graded_cb);
+            cmd_list.SetGraphicsRootConstantBufferView(1, graded_cb);
+        }
+        let graded_uv = [90u8; 8 * 8 * 2];
+        draw_sw_semiplanar(
+            &device, &cmd_list, &pso_sdr, &srv_heap, srv_inc, &mut state, &y_plane, &graded_uv, 16,
+            16, 16, 16, false,
+        )
+        .expect("draw_sw_semiplanar graded ok");
+        transition_subresources(
+            &cmd_list,
+            &[(
+                &rt,
+                0,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )],
+        );
+        let mut dst_loc2 = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        Width: 16,
+                        Height: 16,
+                        Depth: 1,
+                        RowPitch: row_pitch as u32,
+                    },
+                },
+            },
+        };
+        let mut src_loc2 = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(rt.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        unsafe {
+            cmd_list.CopyTextureRegion(&dst_loc2, 0, 0, 0, &src_loc2, None);
+            ManuallyDrop::drop(&mut dst_loc2.pResource);
+            ManuallyDrop::drop(&mut src_loc2.pResource);
+            cmd_list.Close().expect("cmd_list close 2");
+            let cmd: ID3D12CommandList = cmd_list.cast().expect("cmd cast 2");
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            queue.Signal(&fence, 2).expect("queue signal 2");
+        }
+        wait_for_fence_value(&fence, fence_event, 2).expect("fence wait 2");
+        unsafe {
+            let mut ptr2 = std::ptr::null_mut();
+            readback
+                .Map(0, None, Some(&mut ptr2))
+                .expect("readback map 2");
+            let bytes = std::slice::from_raw_parts(ptr2.cast::<u8>(), readback_bytes);
+            let off = 8 * row_pitch + 8 * 4;
+            let (b, g, r) = (bytes[off], bytes[off + 1], bytes[off + 2]);
+            readback.Unmap(0, None);
+            let _ = CloseHandle(fence_event);
+            assert!(
+                g > r + 40 && g > b + 40,
+                "expected vivid green from graded BT.601 UV=90 NV12, got BGRA=({b}, {g}, {r})"
             );
         }
     }

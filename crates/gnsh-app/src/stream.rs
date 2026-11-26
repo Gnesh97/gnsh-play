@@ -10,7 +10,7 @@ use gnsh_media::{
 };
 use gnsh_proto::{Ps5Session, Ps5SessionConfig, SessionEvent, VideoCodec, VideoPreset};
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -29,9 +29,32 @@ const CAPTURE_TOAST_DURATION: Duration = Duration::from_secs(4);
 const RECORDER_PKT_CHANNEL_CAP: usize = 256;
 const RECORDER_CMD_CHANNEL_CAP: usize = 32;
 
+/// Validates that a custom capture folder is an absolute local drive path without UNC or `..`.
+pub(crate) fn validate_capture_dir(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(char::is_control)
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with("//")
+    {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    let mut comps = path.components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Prefix(prefix)), Some(Component::RootDir))
+            if matches!(prefix.kind(), Prefix::Disk(_)) => {}
+        _ => return None,
+    }
+    if comps.any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
 pub(crate) fn resolve_capture_dir(override_dir: Option<&str>, is_video: bool) -> PathBuf {
-    if let Some(custom) = override_dir.map(str::trim).filter(|s| !s.is_empty()) {
-        return PathBuf::from(custom);
+    if let Some(valid) = override_dir.and_then(validate_capture_dir) {
+        return valid;
     }
     if is_video {
         default_video_dir()
@@ -44,17 +67,6 @@ fn preset_dimensions(preset: VideoPreset) -> (u32, u32) {
     match preset {
         VideoPreset::P720Fps30 | VideoPreset::P720Fps60 => (1280, 720),
         VideoPreset::P1080Fps30 | VideoPreset::P1080Fps60 => (1920, 1080),
-    }
-}
-
-fn frame_dimensions(frame: &DecodedFrame) -> (u32, u32) {
-    match frame {
-        DecodedFrame::D3D11(f) => (f.width, f.height),
-        DecodedFrame::D3D12(f) => (f.width, f.height),
-        DecodedFrame::Vulkan(f) => (f.width, f.height),
-        DecodedFrame::SoftwareNv12 { width, height, .. }
-        | DecodedFrame::SoftwareP010 { width, height, .. }
-        | DecodedFrame::SoftwareYuv420 { width, height, .. } => (*width, *height),
     }
 }
 
@@ -183,6 +195,7 @@ pub(crate) struct ActiveStream {
     pub(crate) console_name: String,
     pub(crate) console_host: String,
     pub(crate) codec: VideoCodec,
+    pub(crate) expected_height: u32,
     pub(crate) session: Option<Ps5Session>,
     pub(crate) events_rx: Receiver<SessionEvent>,
     pub(crate) frame_sync: Arc<(Mutex<Option<LatestFrame>>, Condvar)>,
@@ -379,6 +392,7 @@ impl ActiveStream {
             console_name: console.name.clone(),
             console_host: target_host.to_string(),
             codec,
+            expected_height: init_h,
             session: Some(session),
             events_rx: channels.events_rx,
             frame_sync,
@@ -903,7 +917,7 @@ fn run_video_decode_loop(args: VideoWorkerArgs) {
                             consecutive_errors = 0;
                         }
                         if let Some(frame) = frames.into_iter().last() {
-                            let dims = frame_dimensions(&frame);
+                            let dims = frame.dimensions();
                             if dims.0 > 0 && dims.1 > 0 && dims != last_reported_dims {
                                 last_reported_dims = dims;
                                 let _ =
@@ -1523,5 +1537,24 @@ mod tests {
         let (p50, p95) = compute_p50_p95(&samples);
         assert!((p50 - 11.0).abs() < 1e-5, "unexpected p50: {p50}");
         assert!((p95 - 20.0).abs() < 1e-5, "unexpected p95: {p95}");
+    }
+
+    #[test]
+    fn validates_custom_capture_directory_paths() {
+        assert_eq!(
+            validate_capture_dir("  C:\\Captures  "),
+            Some(PathBuf::from("C:\\Captures"))
+        );
+        assert_eq!(
+            validate_capture_dir("D:\\PS5\\Clips"),
+            Some(PathBuf::from("D:\\PS5\\Clips"))
+        );
+        assert_eq!(validate_capture_dir(""), None);
+        assert_eq!(validate_capture_dir("\\\\attacker\\share"), None);
+        assert_eq!(validate_capture_dir("//attacker/share"), None);
+        assert_eq!(validate_capture_dir("\\\\?\\C:\\Captures"), None);
+        assert_eq!(validate_capture_dir("C:\\Captures\\..\\Windows"), None);
+        assert_eq!(validate_capture_dir("captures\\relative"), None);
+        assert_eq!(validate_capture_dir("C:\\Captures\0bad"), None);
     }
 }

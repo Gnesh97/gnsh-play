@@ -854,6 +854,7 @@ fn run_gui(launch: LaunchOptions) -> Result<()> {
                     filter_mode: app.settings.filter_mode,
                     sharpness,
                     scale_mode: app.settings.scale_mode,
+                    image: app.settings.image_adjustments(),
                 },
             )
         {
@@ -1074,6 +1075,13 @@ fn open_url(url: &str) {
 }
 
 pub(crate) fn open_capture_folder(override_dir: Option<&str>) -> Result<()> {
+    if let Some(raw) = override_dir.map(str::trim).filter(|s| !s.is_empty())
+        && stream::validate_capture_dir(raw).is_none()
+    {
+        anyhow::bail!(
+            "custom capture folder must be an absolute local drive path without UNC or '..' segments"
+        );
+    }
     let dir = stream::resolve_capture_dir(override_dir, true);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed creating capture folder {}", dir.display()))?;

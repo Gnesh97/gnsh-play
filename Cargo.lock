@@ -335,7 +335,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gnsh-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -353,14 +353,14 @@ dependencies = [
 
 [[package]]
 name = "gnsh-chiaki-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "gnsh-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "gnsh-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "gnsh-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "crossbeam-channel",

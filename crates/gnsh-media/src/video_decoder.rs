@@ -44,6 +44,66 @@ impl Drop for AvFrameGuard {
     }
 }
 
+/// Color matrix standard signalled by FFmpeg for a decoded YUV frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum YuvColorMatrix {
+    Bt601,
+    #[default]
+    Bt709,
+    Bt2020,
+}
+
+/// Decoded frame color space & range metadata preserved from FFmpeg `AVFrame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameColorInfo {
+    pub matrix: YuvColorMatrix,
+    pub full_range: bool,
+}
+
+impl Default for FrameColorInfo {
+    fn default() -> Self {
+        Self {
+            matrix: YuvColorMatrix::Bt709,
+            full_range: false,
+        }
+    }
+}
+
+impl FrameColorInfo {
+    /// Maps FFmpeg `AVColorSpace` and `AVColorRange` values with stream SDR/HDR fallback.
+    pub fn from_av_values(
+        colorspace: ffi::AVColorSpace,
+        color_range: ffi::AVColorRange,
+        is_hdr: bool,
+    ) -> Self {
+        let matrix = match colorspace {
+            ffi::AVColorSpace_AVCOL_SPC_BT470BG
+            | ffi::AVColorSpace_AVCOL_SPC_SMPTE170M
+            | ffi::AVColorSpace_AVCOL_SPC_SMPTE240M => YuvColorMatrix::Bt601,
+            ffi::AVColorSpace_AVCOL_SPC_BT2020_NCL | ffi::AVColorSpace_AVCOL_SPC_BT2020_CL => {
+                YuvColorMatrix::Bt2020
+            }
+            ffi::AVColorSpace_AVCOL_SPC_BT709 => YuvColorMatrix::Bt709,
+            _ if is_hdr => YuvColorMatrix::Bt2020,
+            _ => YuvColorMatrix::Bt709,
+        };
+        let full_range = color_range == ffi::AVColorRange_AVCOL_RANGE_JPEG;
+        Self { matrix, full_range }
+    }
+
+    /// Compact HUD tooltip label describing matrix and quantization range.
+    pub fn label(self) -> &'static str {
+        match (self.matrix, self.full_range) {
+            (YuvColorMatrix::Bt601, false) => "BT.601 Lim",
+            (YuvColorMatrix::Bt601, true) => "BT.601 Full",
+            (YuvColorMatrix::Bt709, false) => "BT.709 Lim",
+            (YuvColorMatrix::Bt709, true) => "BT.709 Full",
+            (YuvColorMatrix::Bt2020, false) => "BT.2020 Lim",
+            (YuvColorMatrix::Bt2020, true) => "BT.2020 Full",
+        }
+    }
+}
+
 pub struct D3D11Frame {
     pub texture: ID3D11Texture2D,
     pub slice_index: u32,
@@ -51,6 +111,7 @@ pub struct D3D11Frame {
     pub height: u32,
     pub pts: i64,
     pub is_hdr: bool,
+    pub color_info: FrameColorInfo,
     // Retains FFmpeg's AVBufferRef until the texture slice is finished rendering.
     pub(crate) av_frame: Arc<AvFrameGuard>,
 }
@@ -64,6 +125,7 @@ pub struct D3D12Frame {
     pub height: u32,
     pub pts: i64,
     pub is_hdr: bool,
+    pub color_info: FrameColorInfo,
     // Keeps FFmpeg's D3D12VA resource pool slot alive until the graphics queue finishes reading it.
     pub(crate) _av_frame: Arc<AvFrameGuard>,
 }
@@ -79,6 +141,7 @@ pub struct VulkanFrame {
     pub height: u32,
     pub pts: i64,
     pub is_hdr: bool,
+    pub color_info: FrameColorInfo,
     // Retains FFmpeg's AVVkFrame pool slot until libplacebo signals timeline semaphore completion.
     pub(crate) av_frame: Arc<AvFrameGuard>,
 }
@@ -108,6 +171,7 @@ pub enum DecodedFrame {
         height: u32,
         pts: i64,
         is_hdr: bool,
+        color_info: FrameColorInfo,
     },
     SoftwareNv12 {
         y: Vec<u8>,
@@ -118,6 +182,7 @@ pub enum DecodedFrame {
         height: u32,
         pts: i64,
         is_hdr: bool,
+        color_info: FrameColorInfo,
     },
     SoftwareP010 {
         y: Vec<u8>,
@@ -128,10 +193,44 @@ pub enum DecodedFrame {
         height: u32,
         pts: i64,
         is_hdr: bool,
+        color_info: FrameColorInfo,
     },
 }
 
 impl DecodedFrame {
+    /// Returns the active coded video dimensions `(width, height)` in pixels.
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::D3D11(frame) => (frame.width, frame.height),
+            Self::D3D12(frame) => (frame.width, frame.height),
+            Self::Vulkan(frame) => (frame.width, frame.height),
+            Self::SoftwareYuv420 { width, height, .. }
+            | Self::SoftwareNv12 { width, height, .. }
+            | Self::SoftwareP010 { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// Returns color matrix and quantization range reported by FFmpeg for this frame.
+    pub fn color_info(&self) -> FrameColorInfo {
+        match self {
+            Self::D3D11(frame) => frame.color_info,
+            Self::D3D12(frame) => frame.color_info,
+            Self::Vulkan(frame) => frame.color_info,
+            Self::SoftwareYuv420 { color_info, .. }
+            | Self::SoftwareNv12 { color_info, .. }
+            | Self::SoftwareP010 { color_info, .. } => *color_info,
+        }
+    }
+
+    /// Returns bit depth per channel (`10` for HDR10/P010 streams, `8` for SDR).
+    pub fn bit_depth(&self) -> u8 {
+        if self.is_hdr() || matches!(self, Self::SoftwareP010 { .. }) {
+            10
+        } else {
+            8
+        }
+    }
+
     /// Returns the FFmpeg presentation timestamp carried through decoding.
     pub fn pts(&self) -> i64 {
         match self {
@@ -437,6 +536,8 @@ impl VideoDecoder {
                 }
                 unsafe {
                     (*self.sw_frame).pts = (*self.frame).pts;
+                    (*self.sw_frame).colorspace = (*self.frame).colorspace;
+                    (*self.sw_frame).color_range = (*self.frame).color_range;
                 }
                 let out = unsafe { extract_frame(self.sw_frame, is_hdr_codec, true)? };
                 unsafe {
@@ -904,6 +1005,8 @@ unsafe fn extract_frame(
     if width == 0 || height == 0 || width > MAX_VIDEO_DIMENSION || height > MAX_VIDEO_DIMENSION {
         return Ok(None);
     }
+    let color_info =
+        unsafe { FrameColorInfo::from_av_values((*src).colorspace, (*src).color_range, is_hdr) };
 
     if fmt == ffi::AVPixelFormat_AV_PIX_FMT_D3D11 {
         let cloned = unsafe { ffi::av_frame_clone(src) };
@@ -923,6 +1026,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr,
+            color_info,
             av_frame: guard,
         })));
     }
@@ -938,6 +1042,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr,
+            color_info,
             av_frame: guard,
         })));
     }
@@ -974,6 +1079,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr,
+            color_info,
             _av_frame: guard,
         })));
     }
@@ -1010,6 +1116,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr,
+            color_info,
         }));
     }
 
@@ -1040,6 +1147,7 @@ unsafe fn extract_frame(
                 height,
                 pts,
                 is_hdr,
+                color_info,
             }));
         }
         let mut u = Vec::with_capacity(cw * ch);
@@ -1062,6 +1170,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr,
+            color_info,
         }));
     }
 
@@ -1097,6 +1206,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr: true,
+            color_info,
         }));
     }
 
@@ -1127,6 +1237,7 @@ unsafe fn extract_frame(
                 height,
                 pts,
                 is_hdr: true,
+                color_info,
             }));
         }
         let y = copy_plane_10le_to_u8(y_ptr, ys, w, h, 8);
@@ -1150,6 +1261,7 @@ unsafe fn extract_frame(
             height,
             pts,
             is_hdr: true,
+            color_info,
         }));
     }
 
@@ -1359,10 +1471,11 @@ mod tests {
                 height,
                 pts,
                 is_hdr,
+                color_info,
             } => {
                 assert_eq!(
-                    (width, height, y_stride, uv_stride, pts, is_hdr),
-                    (4, 2, 4, 4, 42, false)
+                    (width, height, y_stride, uv_stride, pts, is_hdr, color_info),
+                    (4, 2, 4, 4, 42, false, FrameColorInfo::default())
                 );
                 assert_eq!(y, nv12_y);
                 assert_eq!(uv, nv12_uv);
@@ -1383,6 +1496,8 @@ mod tests {
             (*av_frame).width = 2;
             (*av_frame).height = 2;
             (*av_frame).pts = 99;
+            (*av_frame).colorspace = ffi::AVColorSpace_AVCOL_SPC_BT2020_NCL;
+            (*av_frame).color_range = ffi::AVColorRange_AVCOL_RANGE_MPEG;
             (*av_frame).data[0] = p010_y.as_mut_ptr();
             (*av_frame).data[1] = p010_uv.as_mut_ptr();
             (*av_frame).linesize[0] = 4;
@@ -1391,6 +1506,15 @@ mod tests {
         let p010_frame = unsafe { extract_frame(av_frame, true, true) }
             .expect("P010 extract ok")
             .expect("P010 frame produced");
+        assert_eq!(p010_frame.dimensions(), (2, 2));
+        assert_eq!(p010_frame.bit_depth(), 10);
+        assert_eq!(
+            p010_frame.color_info(),
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt2020,
+                full_range: false,
+            }
+        );
         match p010_frame {
             DecodedFrame::SoftwareP010 {
                 y,
@@ -1401,10 +1525,19 @@ mod tests {
                 height,
                 pts,
                 is_hdr,
+                color_info,
             } => {
                 assert_eq!(
-                    (width, height, y_stride, uv_stride, pts, is_hdr),
-                    (2, 2, 4, 4, 99, true)
+                    (
+                        width,
+                        height,
+                        y_stride,
+                        uv_stride,
+                        pts,
+                        is_hdr,
+                        color_info.matrix
+                    ),
+                    (2, 2, 4, 4, 99, true, YuvColorMatrix::Bt2020)
                 );
                 assert_eq!(y, p010_y);
                 assert_eq!(uv, p010_uv);
@@ -1414,6 +1547,51 @@ mod tests {
         unsafe {
             ffi::av_frame_free(&mut av_frame);
         }
+    }
+
+    #[test]
+    fn maps_av_color_space_and_range_with_hdr_fallback() {
+        assert_eq!(
+            FrameColorInfo::from_av_values(
+                ffi::AVColorSpace_AVCOL_SPC_SMPTE170M,
+                ffi::AVColorRange_AVCOL_RANGE_JPEG,
+                false,
+            ),
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt601,
+                full_range: true,
+            }
+        );
+        assert_eq!(
+            FrameColorInfo::from_av_values(
+                ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED,
+                ffi::AVColorRange_AVCOL_RANGE_UNSPECIFIED,
+                false,
+            ),
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt709,
+                full_range: false,
+            }
+        );
+        assert_eq!(
+            FrameColorInfo::from_av_values(
+                ffi::AVColorSpace_AVCOL_SPC_UNSPECIFIED,
+                ffi::AVColorRange_AVCOL_RANGE_UNSPECIFIED,
+                true,
+            ),
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt2020,
+                full_range: false,
+            }
+        );
+        assert_eq!(
+            FrameColorInfo {
+                matrix: YuvColorMatrix::Bt709,
+                full_range: false,
+            }
+            .label(),
+            "BT.709 Lim"
+        );
     }
 
     #[test]

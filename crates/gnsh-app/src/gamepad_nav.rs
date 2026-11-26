@@ -8,7 +8,7 @@ const STICK_THRESHOLD: i16 = 16_000;
 const REPEAT_DELAY: Duration = Duration::from_millis(220);
 const HUD_CHORD_MASK: u32 = buttons::L1 | buttons::R1 | buttons::OPTIONS;
 
-pub(crate) const HUD_QUICK_ROWS: usize = 9;
+pub(crate) const HUD_QUICK_ROWS: usize = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HomeNavEvent {
@@ -191,9 +191,9 @@ pub(crate) fn settings_row_count(
     match tab {
         SettingsTab::Video => {
             if wan_profile_enabled {
-                15
+                20
             } else {
-                12
+                17
             }
         }
         SettingsTab::Audio => 3,
@@ -279,6 +279,16 @@ fn cycle_device_opt(selected: &mut Option<String>, devices: &[String], dir: isiz
 
 fn step_u8(val: &mut u8, delta: i16, min: u8, max: u8) -> bool {
     let next = (i16::from(*val) + delta).clamp(i16::from(min), i16::from(max)) as u8;
+    if next != *val {
+        *val = next;
+        true
+    } else {
+        false
+    }
+}
+
+fn step_i8(val: &mut i8, delta: i16, min: i8, max: i8) -> bool {
+    let next = (i16::from(*val) + delta).clamp(i16::from(min), i16::from(max)) as i8;
     if next != *val {
         *val = next;
         true
@@ -400,28 +410,46 @@ pub(crate) fn apply_settings_nav(
                 adjust_sharpness(settings.filter_mode, &mut settings.sharpness_pct, dir)
             }),
             6 if nav_dir(event).is_some() => {
+                settings.deband = !settings.deband;
+                true
+            }
+            7 => slider_dir(event)
+                .is_some_and(|dir| step_i8(&mut settings.vibrance_pct, (dir as i16) * 5, -50, 100)),
+            8 => slider_dir(event)
+                .is_some_and(|dir| step_u8(&mut settings.contrast_pct, (dir as i16) * 5, 50, 150)),
+            9 => slider_dir(event)
+                .is_some_and(|dir| step_u8(&mut settings.gamma_pct, (dir as i16) * 5, 70, 140)),
+            10 => slider_dir(event).is_some_and(|dir| {
+                step_u8(
+                    &mut settings.hdr_sdr_exposure_pct,
+                    (dir as i16) * 5,
+                    50,
+                    200,
+                )
+            }),
+            11 if nav_dir(event).is_some() => {
                 settings.vsync = !settings.vsync;
                 true
             }
-            7 if nav_dir(event).is_some() => {
+            12 if nav_dir(event).is_some() => {
                 settings.auto_reconnect = !settings.auto_reconnect;
                 true
             }
-            8 => nav_dir(event)
+            13 => nav_dir(event)
                 .is_some_and(|dir| adjust_renderer_backend(&mut settings.renderer_backend, dir)),
-            9 => adjust_replay_buffer(settings, event),
-            10 => false,
-            11 if nav_dir(event).is_some() => {
+            14 => adjust_replay_buffer(settings, event),
+            15 => false,
+            16 if nav_dir(event).is_some() => {
                 settings.wan_profile_enabled = !settings.wan_profile_enabled;
                 true
             }
-            12 if !is_streaming && settings.wan_profile_enabled => {
+            17 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_preset(&mut settings.wan_preset, event)
             }
-            13 if !is_streaming && settings.wan_profile_enabled => {
+            18 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_codec(&mut settings.wan_codec, event)
             }
-            14 if !is_streaming && settings.wan_profile_enabled => {
+            19 if !is_streaming && settings.wan_profile_enabled => {
                 adjust_bitrate(&mut settings.wan_bitrate_kbps, event, 2_000)
             }
             _ => false,
@@ -483,12 +511,35 @@ pub(crate) fn apply_hud_nav(
             }),
             HudNavAction::None,
         ),
-        3 => (
+        3 => {
+            if nav_dir(event).is_some() {
+                settings.deband = !settings.deband;
+                (true, HudNavAction::None)
+            } else {
+                (false, HudNavAction::None)
+            }
+        }
+        4 => (
+            slider_dir(event)
+                .is_some_and(|dir| step_i8(&mut settings.vibrance_pct, (dir as i16) * 5, -50, 100)),
+            HudNavAction::None,
+        ),
+        5 => (
+            slider_dir(event)
+                .is_some_and(|dir| step_u8(&mut settings.contrast_pct, (dir as i16) * 5, 50, 150)),
+            HudNavAction::None,
+        ),
+        6 => (
+            slider_dir(event)
+                .is_some_and(|dir| step_u8(&mut settings.gamma_pct, (dir as i16) * 5, 70, 140)),
+            HudNavAction::None,
+        ),
+        7 => (
             slider_dir(event)
                 .is_some_and(|dir| step_u8(&mut settings.volume_pct, (dir as i16) * 5, 0, 100)),
             HudNavAction::None,
         ),
-        4 => {
+        8 => {
             if nav_dir(event).is_some() {
                 settings.vsync = !settings.vsync;
                 (true, HudNavAction::None)
@@ -496,10 +547,10 @@ pub(crate) fn apply_hud_nav(
                 (false, HudNavAction::None)
             }
         }
-        5 if event == HomeNavEvent::Connect => (false, HudNavAction::ToggleMic),
-        6 if event == HomeNavEvent::Connect => (false, HudNavAction::GoHome),
-        7 if event == HomeNavEvent::Connect => (false, HudNavAction::OpenSettings),
-        8 if event == HomeNavEvent::Connect => (false, HudNavAction::Disconnect),
+        9 if event == HomeNavEvent::Connect => (false, HudNavAction::ToggleMic),
+        10 if event == HomeNavEvent::Connect => (false, HudNavAction::GoHome),
+        11 if event == HomeNavEvent::Connect => (false, HudNavAction::OpenSettings),
+        12 if event == HomeNavEvent::Connect => (false, HudNavAction::Disconnect),
         _ => (false, HudNavAction::None),
     }
 }
@@ -658,8 +709,8 @@ mod tests {
         let audio = vec!["Speakers".to_string(), "Headset".to_string()];
         let mic = vec!["USB Mic".to_string()];
 
-        assert_eq!(settings_row_count(SettingsTab::Video, false, false), 12);
-        assert_eq!(settings_row_count(SettingsTab::Video, false, true), 15);
+        assert_eq!(settings_row_count(SettingsTab::Video, false, false), 17);
+        assert_eq!(settings_row_count(SettingsTab::Video, false, true), 20);
         assert_eq!(settings_row_count(SettingsTab::Audio, false, false), 3);
         assert_eq!(settings_row_count(SettingsTab::Input, false, false), 2);
         assert_eq!(settings_row_count(SettingsTab::Input, true, false), 6);
@@ -737,7 +788,57 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
+            6,
+            HomeNavEvent::Connect,
+            true,
+            &audio,
+            &mic
+        ));
+        assert!(s.deband);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
             7,
+            HomeNavEvent::Right,
+            true,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.vibrance_pct, 5);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            8,
+            HomeNavEvent::Right,
+            true,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.contrast_pct, 105);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            9,
+            HomeNavEvent::Left,
+            true,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.gamma_pct, 95);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            10,
+            HomeNavEvent::Right,
+            true,
+            &audio,
+            &mic
+        ));
+        assert_eq!(s.hdr_sdr_exposure_pct, 105);
+        assert!(apply_settings_nav(
+            &mut s,
+            SettingsTab::Video,
+            12,
             HomeNavEvent::Connect,
             true,
             &audio,
@@ -745,11 +846,11 @@ mod tests {
         ));
         assert!(!s.auto_reconnect);
 
-        // Renderer selector at row 8, replay buffer at row 9, and WAN profile rows 11..=14 gate adjustments cleanly.
+        // Renderer selector at row 13, replay buffer at row 14, and WAN profile rows 16..=19 gate adjustments cleanly.
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            8,
+            13,
             HomeNavEvent::Right,
             false,
             &audio,
@@ -759,7 +860,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            8,
+            13,
             HomeNavEvent::Right,
             false,
             &audio,
@@ -769,7 +870,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            9,
+            14,
             HomeNavEvent::Connect,
             true,
             &audio,
@@ -779,7 +880,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            9,
+            14,
             HomeNavEvent::Right,
             true,
             &audio,
@@ -789,7 +890,7 @@ mod tests {
         assert!(!apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            10,
+            15,
             HomeNavEvent::Right,
             false,
             &audio,
@@ -798,7 +899,7 @@ mod tests {
         assert!(!apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            12,
+            17,
             HomeNavEvent::Right,
             false,
             &audio,
@@ -807,7 +908,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            11,
+            16,
             HomeNavEvent::Connect,
             true,
             &audio,
@@ -817,7 +918,7 @@ mod tests {
         assert!(!apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            12,
+            17,
             HomeNavEvent::Right,
             true,
             &audio,
@@ -826,7 +927,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            12,
+            17,
             HomeNavEvent::Left,
             false,
             &audio,
@@ -836,7 +937,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            13,
+            18,
             HomeNavEvent::Left,
             false,
             &audio,
@@ -846,7 +947,7 @@ mod tests {
         assert!(apply_settings_nav(
             &mut s,
             SettingsTab::Video,
-            14,
+            19,
             HomeNavEvent::Right,
             false,
             &audio,
@@ -957,35 +1058,55 @@ mod tests {
         );
         assert_eq!(s.sharpness_pct, 5);
         assert_eq!(
-            apply_hud_nav(&mut s, 3, HomeNavEvent::Left),
+            apply_hud_nav(&mut s, 3, HomeNavEvent::Connect),
+            (true, HudNavAction::None)
+        );
+        assert!(s.deband);
+        assert_eq!(
+            apply_hud_nav(&mut s, 4, HomeNavEvent::Right),
+            (true, HudNavAction::None)
+        );
+        assert_eq!(s.vibrance_pct, 5);
+        assert_eq!(
+            apply_hud_nav(&mut s, 5, HomeNavEvent::Right),
+            (true, HudNavAction::None)
+        );
+        assert_eq!(s.contrast_pct, 105);
+        assert_eq!(
+            apply_hud_nav(&mut s, 6, HomeNavEvent::Left),
+            (true, HudNavAction::None)
+        );
+        assert_eq!(s.gamma_pct, 95);
+        assert_eq!(
+            apply_hud_nav(&mut s, 7, HomeNavEvent::Left),
             (true, HudNavAction::None)
         );
         assert_eq!(s.volume_pct, 95);
         assert_eq!(
-            apply_hud_nav(&mut s, 4, HomeNavEvent::Connect),
+            apply_hud_nav(&mut s, 8, HomeNavEvent::Connect),
             (true, HudNavAction::None)
         );
         assert!(!s.vsync);
 
         // Action rows only fire on Cross (`Connect`), never Left/Right.
         assert_eq!(
-            apply_hud_nav(&mut s, 8, HomeNavEvent::Left),
+            apply_hud_nav(&mut s, 12, HomeNavEvent::Left),
             (false, HudNavAction::None)
         );
         assert_eq!(
-            apply_hud_nav(&mut s, 5, HomeNavEvent::Connect),
+            apply_hud_nav(&mut s, 9, HomeNavEvent::Connect),
             (false, HudNavAction::ToggleMic)
         );
         assert_eq!(
-            apply_hud_nav(&mut s, 6, HomeNavEvent::Connect),
+            apply_hud_nav(&mut s, 10, HomeNavEvent::Connect),
             (false, HudNavAction::GoHome)
         );
         assert_eq!(
-            apply_hud_nav(&mut s, 7, HomeNavEvent::Connect),
+            apply_hud_nav(&mut s, 11, HomeNavEvent::Connect),
             (false, HudNavAction::OpenSettings)
         );
         assert_eq!(
-            apply_hud_nav(&mut s, 8, HomeNavEvent::Connect),
+            apply_hud_nav(&mut s, 12, HomeNavEvent::Connect),
             (false, HudNavAction::Disconnect)
         );
     }

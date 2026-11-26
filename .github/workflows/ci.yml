@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  fmt-and-audit:
+    name: Format & Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Security audit (Cargo.lock)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  windows-unit-checks:
+    name: Clippy & Unit Tests (Windows MINGW64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-opus
+            mingw-w64-x86_64-json-c
+            mingw-w64-x86_64-miniupnpc
+            mingw-w64-x86_64-libevent
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-sdl3
+            mingw-w64-x86_64-vulkan-headers
+            mingw-w64-x86_64-vulkan-loader
+            mingw-w64-x86_64-libplacebo
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+          components: clippy
+
+      - name: Build third_party/chiaki-ng
+        run: |
+          cmake -S third_party/chiaki-ng -B third_party/build/chiaki-ng -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCHIAKI_ENABLE_TESTS=OFF \
+            -DCHIAKI_ENABLE_CLI=OFF \
+            -DCHIAKI_ENABLE_GUI=OFF \
+            -DCHIAKI_ENABLE_ANDROID=OFF \
+            -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF
+          cmake --build third_party/build/chiaki-ng
+
+      - name: Run Clippy
+        env:
+          LIBCLANG_PATH: /mingw64/bin
+          MINGW_PREFIX: /mingw64
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run non-GPU crate test suites
+        env:
+          LIBCLANG_PATH: /mingw64/bin
+          MINGW_PREFIX: /mingw64
+        run: cargo test -p gnsh-proto -p gnsh-input -p gnsh-app -p gnsh-chiaki-sys
