@@ -14,6 +14,9 @@ Thank you for helping improve `gnsh-play`. By contributing, you agree that your 
      mingw-w64-x86_64-ninja \
      mingw-w64-x86_64-clang \
      mingw-w64-x86_64-pkgconf \
+     mingw-w64-x86_64-protobuf \
+     mingw-w64-x86_64-python \
+     mingw-w64-x86_64-python-protobuf \
      mingw-w64-x86_64-openssl \
      mingw-w64-x86_64-opus \
      mingw-w64-x86_64-json-c \
@@ -40,7 +43,9 @@ Thank you for helping improve `gnsh-play`. By contributing, you agree that your 
      -DCHIAKI_ENABLE_CLI=OFF `
      -DCHIAKI_ENABLE_GUI=OFF `
      -DCHIAKI_ENABLE_ANDROID=OFF `
-     -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF
+     -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF `
+     -DCHIAKI_ENABLE_FFMPEG_DECODER=OFF `
+     -DCHIAKI_USE_SYSTEM_CURL=ON
    cmake --build third_party/build/chiaki-ng
    ```
 

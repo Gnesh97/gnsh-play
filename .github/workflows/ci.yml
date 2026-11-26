@@ -39,12 +39,16 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          suppress-deprecation-warnings: msystem-mingw64
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-clang
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-protobuf
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-protobuf
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-opus
             mingw-w64-x86_64-json-c
@@ -64,23 +68,34 @@ jobs:
 
       - name: Build third_party/chiaki-ng
         run: |
+          PYTHON_WIN="$(cygpath -m /mingw64/bin/python3.exe)"
           cmake -S third_party/chiaki-ng -B third_party/build/chiaki-ng -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCHIAKI_ENABLE_TESTS=OFF \
             -DCHIAKI_ENABLE_CLI=OFF \
             -DCHIAKI_ENABLE_GUI=OFF \
             -DCHIAKI_ENABLE_ANDROID=OFF \
-            -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF
+            -DCHIAKI_ENABLE_BOREALIS=OFF \
+            -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF \
+            -DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF \
+            -DCHIAKI_ENABLE_FFMPEG_DECODER=OFF \
+            -DCHIAKI_ENABLE_PI_DECODER=OFF \
+            -DCHIAKI_ENABLE_SETSU=OFF \
+            -DCHIAKI_ENABLE_SPEEX=OFF \
+            -DCHIAKI_USE_SYSTEM_CURL=ON \
+            -DPYTHON_EXECUTABLE="$PYTHON_WIN"
           cmake --build third_party/build/chiaki-ng
 
       - name: Run Clippy
-        env:
-          LIBCLANG_PATH: /mingw64/bin
-          MINGW_PREFIX: /mingw64
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          MINGW_WIN="$(cygpath -m /mingw64)"
+          export MINGW_PREFIX="$MINGW_WIN"
+          export LIBCLANG_PATH="$MINGW_WIN/bin"
+          cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run non-GPU crate test suites
-        env:
-          LIBCLANG_PATH: /mingw64/bin
-          MINGW_PREFIX: /mingw64
-        run: cargo test -p gnsh-proto -p gnsh-input -p gnsh-app -p gnsh-chiaki-sys
+        run: |
+          MINGW_WIN="$(cygpath -m /mingw64)"
+          export MINGW_PREFIX="$MINGW_WIN"
+          export LIBCLANG_PATH="$MINGW_WIN/bin"
+          cargo test -p gnsh-proto -p gnsh-input -p gnsh-app -p gnsh-chiaki-sys
