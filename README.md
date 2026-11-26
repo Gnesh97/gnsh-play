@@ -2,6 +2,41 @@
 
 Native Windows x64 PlayStation 5 Remote Play client built in Rust (`AGPL-3.0-only`), powered by `streetpea/chiaki-ng` (`libchiaki`), FFmpeg (`D3D11VA` / `D3D12VA` / `Vulkan Video` + software fallback), native Direct3D 11 / Direct3D 12, Vulkan (`libplacebo`), SDL3, and `egui`.
 
+![gnsh-play Home UI](docs/assets/home-ui.png)
+
+## Quick Start (Portable Windows Binary)
+
+1. Download **`gnsh-play-v0.2.0-win64.zip`** (and optionally `.sha256`) from [GitHub Releases](https://github.com/Gnesh97/gnsh-play/releases).
+2. *(Optional)* Verify the archive checksum in PowerShell:
+   ```powershell
+   Get-FileHash .\gnsh-play-v0.2.0-win64.zip -Algorithm SHA256
+   ```
+3. Extract the folder and launch **`gnsh-play.exe`** (no MSYS2 or Rust installation needed).
+   > **Note:** Binaries are currently unsigned, so Windows SmartScreen may show an *"Unknown publisher"* prompt on first launch (`More info` -> `Run anyway`).
+4. Link your PS5 in under 2 minutes:
+   - Click **Discover LAN** (or **+ Register PS5** if connecting across subnets/VPN).
+   - Sign in with your **PSN Account ID** using the built-in browser OAuth helper (or paste Base64 ID directly).
+   - Enter the 8-digit PIN from **PS5 Settings -> System -> Remote Play -> Link Device**, then click **Connect**.
+
+## Why gnsh-play?
+
+| Capability | `gnsh-play` (`v0.2.0`) | `chiaki-ng` | Official PS Remote Play |
+| :--- | :--- | :--- | :--- |
+| **Supported Platforms** | Windows x64 only | Windows, Linux, macOS, Steam Deck, handhelds | Windows, macOS, iOS, Android |
+| **Consoles** | PS5 only | PS4 & PS5 | PS4 & PS5 |
+| **GPU Renderers** | Direct3D 11, Direct3D 12 (`D3D12VA`), Vulkan (`libplacebo`) | OpenGL / Vulkan (`libplacebo`) / D3D11 | Direct3D (closed source) |
+| **Post-Processing & Diagnostics** | CAS, AMD FSR 1.0, GPU Deband, live Vibrance/Contrast/Gamma/HDR->SDR Exposure, `{w}x{h}` resize warning & `Pipe` ms HUD | `libplacebo` shaders & basic stats | None |
+| **USB DualSense Haptics & Triggers** | 4ch USB audio haptics + DS5 triggers + mute LED | Yes (cross-platform) | Yes |
+| **KB+M Emulation & Capture** | Built-in virtual DualSense + remapper, zero-reencode `.mkv` record & Replay Buffer, HDR->SDR PNG screenshots | Configurable KBM; no built-in replay buffer | None |
+| **WAN Discovery** | Direct IP/DDNS/VPN host + port forwarding | PSN cloud push + direct IP | Automatic Sony cloud relay |
+| **Maturity** | Early release (`v0.2.0`) | Established, multi-year community project | Official first-party app |
+
+### Known Limitations
+
+- **Windows x64 & PS5 only:** There are no Linux, macOS, or PS4 builds at this stage.
+- **Direct WAN requires port forwarding or VPN:** There is no Sony PSN Push cloud auto-discovery relay; remote play uses a saved static IP, DDNS hostname, or Tailscale/WireGuard tunnel.
+- **Vulkan headless GPU test caveat:** On AMD Windows Adrenalin drivers, the automated headless Vulkan Video zero-copy readback test currently hits a driver-specific black-readback quirk while live D3D11, D3D12, and Vulkan (`libplacebo`) UI/video paths run normally.
+
 ## Features (LAN & Direct WAN/VPN, PS5 Only)
 
 - **LAN Broadcast + Remote / WAN / VPN Discovery & Wake-Up**: DDP subnet broadcast + unicast remote host probing (`discover_ps5_hosts` via `libchiaki` in `gnsh-proto`), configurable LAN + optional `Remote / WAN / VPN Host` per saved console (`Edit`, `Connect WAN`, dual LAN/WAN `Wake`), `normalize_console_host` (`:port` & `http(s)://` stripping), and `4 MiB` runtime `SO_RCVBUF` socket tuning (`UDP_RECV_BUF_BYTES`).
